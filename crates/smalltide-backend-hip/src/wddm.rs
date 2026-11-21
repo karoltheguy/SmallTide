@@ -58,6 +58,7 @@ pub struct Adapter {
     _lib: libloading::Library,
     a3: *mut c_void,
     pub dedicated_bytes: usize,
+    luid: u64,
 }
 
 unsafe impl Send for Adapter {}
@@ -80,7 +81,7 @@ impl Adapter {
             }
             let enum1: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> Hresult =
                 std::mem::transmute(vtbl(fac, 12));
-            let mut best: Option<(*mut c_void, usize)> = None;
+            let mut best: Option<(*mut c_void, usize, u64)> = None;
             let mut i = 0u32;
             loop {
                 let mut ad: *mut c_void = std::ptr::null_mut();
@@ -91,18 +92,18 @@ impl Adapter {
                     std::mem::transmute(vtbl(ad, 10));
                 let mut d: AdapterDesc1 = std::mem::zeroed();
                 let ok = get_desc1(ad, &mut d) == 0 && d.vendor_id == 0x1002;
-                if ok && best.map_or(true, |(_, m)| d.dedicated_video_memory > m) {
-                    if let Some((old, _)) = best.take() {
+                if ok && best.map_or(true, |(_, m, _)| d.dedicated_video_memory > m) {
+                    if let Some((old, _, _)) = best.take() {
                         release(old);
                     }
-                    best = Some((ad, d.dedicated_video_memory));
+                    best = Some((ad, d.dedicated_video_memory, d.adapter_luid));
                 } else {
                     release(ad);
                 }
                 i += 1;
             }
             release(fac);
-            let (ad, dedicated) = best?;
+            let (ad, dedicated, luid) = best?;
             let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> Hresult =
                 std::mem::transmute(vtbl(ad, 0));
             let mut a3: *mut c_void = std::ptr::null_mut();
@@ -111,7 +112,7 @@ impl Adapter {
             if hr != 0 || a3.is_null() {
                 return None;
             }
-            Some(Self { _lib: lib, a3, dedicated_bytes: dedicated })
+            Some(Self { _lib: lib, a3, dedicated_bytes: dedicated, luid })
         }
     }
 
@@ -122,6 +123,38 @@ impl Adapter {
                 std::mem::transmute(vtbl(self.a3, 14));
             let mut info = VideoMemoryInfo::default();
             (q(self.a3, 0, 0, &mut info) == 0).then_some(info)
+        }
+    }
+
+    /// Bytes resident in the adapter's dedicated-memory segment across *all* processes
+    /// (`D3DKMTQueryStatistics`, segment whose commit limit equals the dedicated size).
+    pub fn adapter_resident_bytes(&self) -> Option<u64> {
+        // D3DKMT_QUERYSTATISTICS: Type @0, AdapterLuid @4, hProcess @16, QueryResult @24
+        // (segment info: CommitLimit, BytesCommitted, BytesResident), query SegmentId @0x320.
+        const SIZE: usize = 0x328;
+        const SEG_OFF: usize = 0x320;
+        unsafe {
+            let lib = libloading::Library::new("gdi32.dll").ok()?;
+            let q: libloading::Symbol<unsafe extern "system" fn(*mut u8) -> i32> = lib.get(b"D3DKMTQueryStatistics\0").ok()?;
+            let run = |ty: u32, seg: u32| -> Option<[u8; SIZE]> {
+                let mut b = [0u8; SIZE];
+                b[0..4].copy_from_slice(&ty.to_le_bytes());
+                b[4..12].copy_from_slice(&self.luid.to_le_bytes());
+                b[SEG_OFF..SEG_OFF + 4].copy_from_slice(&seg.to_le_bytes());
+                (q(b.as_mut_ptr()) == 0).then_some(b)
+            };
+            let u64_at = |b: &[u8; SIZE], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+            let adapter = run(0, 0)?;
+            let n_seg = u32::from_le_bytes(adapter[24..28].try_into().unwrap()).min(16);
+            let ded = self.dedicated_bytes as u64;
+            for sid in 0..n_seg {
+                let r = run(3, sid)?;
+                let limit = u64_at(&r, 24);
+                if limit.abs_diff(ded) < (256 << 20) {
+                    return Some(u64_at(&r, 40));
+                }
+            }
+            None
         }
     }
 

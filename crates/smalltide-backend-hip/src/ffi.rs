@@ -387,6 +387,41 @@ impl HipRuntime {
         }
     }
 
+    /// The HIP device to use: `SMALLTIDE_HIP_DEVICE` if set, otherwise the discrete GPU with the
+    /// most memory. Device order is not stable across driver versions (an integrated Radeon can
+    /// enumerate first), so never assume device 0.
+    pub fn select_device(&self) -> Result<i32> {
+        if let Some(v) = std::env::var("SMALLTIDE_HIP_DEVICE").ok().filter(|v| !v.trim().is_empty()) {
+            return v.trim().parse::<i32>().map_err(|_| SmallTideError::Backend {
+                backend: "hip",
+                message: format!("SMALLTIDE_HIP_DEVICE={v} is not a device index"),
+            });
+        }
+        let mut count = 0;
+        unsafe { check_hip((self.hip_get_device_count)(&mut count), "hipGetDeviceCount")? };
+        let mut best: Option<(bool, usize, i32)> = None;
+        for d in 0..count {
+            let mut name_buf = [0 as c_char; 256];
+            let (mut free, mut total) = (0usize, 0usize);
+            unsafe {
+                if (self.hip_set_device)(d) != 0
+                    || (self.hip_device_get_name)(name_buf.as_mut_ptr(), name_buf.len() as c_int, d) != 0
+                    || (self.hip_mem_get_info)(&mut free, &mut total) != 0
+                {
+                    continue;
+                }
+            }
+            let name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }.to_string_lossy().into_owned();
+            // Integrated Radeon parts report "AMD Radeon(TM) Graphics" (memory = shared system RAM).
+            let discrete = !name.contains("(TM) Graphics");
+            let key = (discrete, total, d);
+            if best.map_or(true, |b| (key.0, key.1) > (b.0, b.1)) {
+                best = Some(key);
+            }
+        }
+        best.map(|b| b.2).ok_or_else(|| SmallTideError::Backend { backend: "hip", message: "no usable HIP device".into() })
+    }
+
     pub fn probe_device(&self, device_id: i32) -> Result<HipProbeReport> {
         let mut device_count = 0;
         let mut runtime_version = 0;

@@ -141,6 +141,14 @@ impl HipBackend {
         Ok(DeviceBuf { id: did, offset_bytes: 0, size_bytes })
     }
 
+    /// Backend on the device chosen by `HipRuntime::select_device` (env `SMALLTIDE_HIP_DEVICE`).
+    pub fn new_auto() -> Result<Self> {
+        let rt = HipRuntime::load()?;
+        let d = rt.select_device()?;
+        drop(rt);
+        Self::new(d)
+    }
+
     pub fn new(device_id: i32) -> Result<Self> {
         let rt = HipRuntime::load()?;
         let _ = rt.probe_device(device_id)?;
@@ -175,14 +183,31 @@ impl HipBackend {
         })
     }
 
-    /// Windows: `(process local usage, reservable/resident budget)` in bytes from DXGI. On this
-    /// driver, device allocations beyond roughly the reservable amount are silently backed by
-    /// system memory (GPU reads over PCIe, ~28 GB/s) although `hipMemGetInfo` counts them as VRAM.
+    /// Windows: `(process local usage, how much this process can keep resident)` in bytes.
+    ///
+    /// Allocations past the resident amount are silently backed by system memory (GPU reads over
+    /// PCIe, ~28 GB/s) although `hipMemGetInfo` counts them as VRAM. The resident amount is the
+    /// dedicated size minus what other processes hold resident (adapter-wide segment statistics),
+    /// capped by the DXGI budget. Radeon drivers 26.5.1-26.9.1 had a KMD segment bug that capped
+    /// residency near half the card (ROCm/TheRock#7221); there `SMALLTIDE_RESIDENT_CAP=reservation`
+    /// restores the old DXGI-reservation estimate.
     pub fn resident_vram_info(&self) -> Option<(u64, u64)> {
         #[cfg(windows)]
         {
-            let i = self.wddm.as_ref()?.local_info()?;
-            Some((i.current_usage, i.current_reservation.max(i.available_for_reservation)))
+            let a = self.wddm.as_ref()?;
+            let i = a.local_info()?;
+            let reservation = i.current_reservation.max(i.available_for_reservation);
+            if std::env::var("SMALLTIDE_RESIDENT_CAP").ok().as_deref() == Some("reservation") {
+                return Some((i.current_usage, reservation));
+            }
+            let resident = match a.adapter_resident_bytes() {
+                Some(all) => {
+                    let others = all.saturating_sub(i.current_usage);
+                    (a.dedicated_bytes as u64).saturating_sub(others).min(i.budget)
+                }
+                None => reservation,
+            };
+            Some((i.current_usage, resident))
         }
         #[cfg(not(windows))]
         {
@@ -340,6 +365,7 @@ impl HipBackend {
         params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> crate::ffi::HipError {
+        self.bind();
         let t0 = std::time::Instant::now();
         let mut timer = self.kernel_timer.lock().unwrap();
         let slot = timer.as_mut().map(|t| {
@@ -366,7 +392,25 @@ impl HipBackend {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// HIP's current device is per thread: make sure this thread targets our device before any
+    /// call that uses it implicitly (allocation, stream/event creation, launches).
+    #[inline]
+    fn bind(&self) {
+        thread_local! {
+            static CUR_DEVICE: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+        }
+        CUR_DEVICE.with(|c| {
+            if c.get() != self.device_id {
+                unsafe {
+                    let _ = (self.rt.hip_set_device)(self.device_id);
+                }
+                c.set(self.device_id);
+            }
+        });
+    }
+
     fn dev_ptr(&self, buf: DeviceBuf) -> Result<*mut c_void> {
+        self.bind();
         let guard = self.dev_bufs.lock().unwrap();
         let a = guard.get(&buf.id).ok_or_else(|| SmallTideError::Backend {
             backend: "hip",
@@ -458,6 +502,7 @@ impl Drop for HipBackend {
 
 impl ComputeBackend for HipBackend {
     fn device_info(&self) -> Result<DeviceInfo> {
+        self.bind();
         let r = self.rt.probe_device(self.device_id)?;
         Ok(DeviceInfo {
             backend_name: "hip",
@@ -471,6 +516,7 @@ impl ComputeBackend for HipBackend {
     }
 
     fn alloc_device(&self, size_bytes: usize) -> Result<DeviceBuf> {
+        self.bind();
         let mut ptr: *mut c_void = ptr::null_mut();
         unsafe { check_hip((self.rt.hip_malloc)(&mut ptr, size_bytes), "hipMalloc")? };
         let id = self.next_handle();
@@ -497,6 +543,7 @@ impl ComputeBackend for HipBackend {
     }
 
     fn alloc_host_mapped(&self, size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {
+        self.bind();
         const HIP_HOST_MALLOC_PORTABLE: u32 = 0x1;
         const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
         let mut hptr: *mut c_void = ptr::null_mut();
@@ -524,6 +571,7 @@ impl ComputeBackend for HipBackend {
     }
 
     fn alloc_pinned(&self, size_bytes: usize) -> Result<PinnedBuf> {
+        self.bind();
         let mut ptr: *mut c_void = ptr::null_mut();
         unsafe {
             check_hip(
@@ -552,6 +600,7 @@ impl ComputeBackend for HipBackend {
     }
 
     fn create_stream(&self, _kind: QueueKind) -> Result<Stream> {
+        self.bind();
         let mut s: HipStream = ptr::null_mut();
         unsafe {
             check_hip(
@@ -572,6 +621,7 @@ impl ComputeBackend for HipBackend {
     }
 
     fn create_event(&self) -> Result<Event> {
+        self.bind();
         let mut e: HipEvent = ptr::null_mut();
         unsafe {
             check_hip(
@@ -632,6 +682,7 @@ impl ComputeBackend for HipBackend {
     }
 
     fn sync_stream(&self, stream: Stream) -> Result<()> {
+        self.bind();
         let s = self.raw_stream(stream)?;
         let t0 = std::time::Instant::now();
         let r = unsafe { check_hip((self.rt.hip_stream_synchronize)(s), "hipStreamSynchronize") };
@@ -757,6 +808,7 @@ impl ComputeBackend for HipBackend {
     }
 
     fn begin_graph_capture(&self, stream: Stream) -> Result<()> {
+        self.bind();
         let s = self.raw_stream(stream)?;
         unsafe {
             check_hip(

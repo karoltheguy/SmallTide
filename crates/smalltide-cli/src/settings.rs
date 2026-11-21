@@ -167,7 +167,7 @@ pub fn build_engine(s: &Settings) -> Loaded {
     let dense_host = Inkling2DenseHost::load_from_safetensors(&cfg, &dir.join("model-00001-of-00001.safetensors"))
         .expect("load dense weights");
     let pack = StidePackReader::open(&dir.join("experts.stide")).expect("open experts.stide");
-    let backend = Arc::new(HipBackend::new(0).expect("init HipBackend"));
+    let backend = Arc::new(HipBackend::new_auto().expect("init HipBackend"));
     let dense_gpu = Inkling2DenseGpu::upload(backend.clone(), dense_host).expect("upload dense GPU");
     let info_after_dense = backend.device_info().expect("device_info");
 
@@ -187,7 +187,7 @@ pub fn build_engine(s: &Settings) -> Loaded {
         match backend.resident_vram_info() {
             Some((usage, resident)) => {
                 // Engine buffers (~KV + scratch + 256 MiB margin) still have to fit after this.
-                let margin = 256usize << 20;
+                let margin = std::env::var("SMALLTIDE_RESIDENT_MARGIN_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(768) << 20;
                 let left = (resident as usize).saturating_sub(usage as usize + est_kv_bytes + scratch_ring_bytes + margin);
                 avail = avail.min(left);
                 println!("[pools] resident budget: {:.2} GiB left for expert pools", avail as f64 / (1u64 << 30) as f64);

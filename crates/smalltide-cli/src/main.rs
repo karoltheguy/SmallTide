@@ -122,12 +122,13 @@ fn main() {
 
 fn run_probe() {
     let hip = HipRuntime::load().expect("load HIP runtime");
-    let info = hip.probe_device(0).expect("probe device 0");
+    let dev = hip.select_device().expect("select HIP device");
+    let info = hip.probe_device(dev).expect("probe HIP device");
     println!("Loaded HIP DLL : {}", info.loaded_dll);
     println!("HIP Runtime    : {}", info.runtime_version);
     println!("HIP Driver     : {}", info.driver_version);
     println!("Device Count   : {}", info.device_count);
-    println!("Device[0]      : {}", info.device_name);
+    println!("Device[{dev}]      : {}", info.device_name);
     println!("Embedded HSACO : {} bytes", info.hsaco_bytes);
     println!(
         "VRAM           : {:.2} GiB free / {:.2} GiB total",
@@ -155,7 +156,8 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 fn run_bench_gpu() {
     let hip = HipRuntime::load().expect("load HIP runtime");
-    let info = hip.probe_device(0).expect("probe device 0");
+    let dev = hip.select_device().expect("select HIP device");
+    let info = hip.probe_device(dev).expect("probe HIP device");
     println!(
         "=== SmallTide Phase 1 gfx1201 Kernel Verify & Benchmark ({}) ===",
         info.device_name
@@ -443,7 +445,7 @@ fn run_bench_nvme() {
 /// Allocates VRAM in 512 MiB chunks and measures read bandwidth of each, revealing where the
 /// driver silently backs "device" allocations with system memory (WDDM over-commit).
 fn run_vram_probe() {
-    let backend = HipBackend::new(0).expect("init HipBackend");
+    let backend = HipBackend::new_auto().expect("init HipBackend");
     let s = backend.create_stream(smalltide_core::QueueKind::Compute).expect("stream");
     let chunk = 512usize << 20;
     let scratch = backend.alloc_device(chunk).expect("scratch");
@@ -602,7 +604,7 @@ fn run_load_test(model_dir: &Path) {
     let t_tide = Instant::now();
     let stide_path = model_dir.join("experts.stide");
     let pack = StidePackReader::open(&stide_path).expect("open experts.stide");
-    let backend = Arc::new(HipBackend::new(0).expect("init HipBackend"));
+    let backend = Arc::new(HipBackend::new_auto().expect("init HipBackend"));
     let info_before = backend.device_info().expect("device_info before");
 
     let _dense_gpu = Inkling2DenseGpu::upload(backend.clone(), dense)

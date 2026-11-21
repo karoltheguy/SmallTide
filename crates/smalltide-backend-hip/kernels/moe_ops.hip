@@ -418,3 +418,124 @@ extern "C" __global__ void smalltide_moe_post_decode(
         out[h] = acc;
     }
 }
+
+// ===========================================================================
+// Decode MoE v3: one block per (expert, 32-row tile); slot + slab header resolved once per
+// block into LDS (instead of 3-4 dependent global loads per warp), each warp owns 4 rows and
+// keeps two rows' loads in flight.
+// ===========================================================================
+#define ST_MOE3_ROWS_PER_BLOCK 32u
+
+struct MoeBlockCtx {
+    const uint8_t* w;
+    const uint8_t* sc;
+    float outer;
+    uint32_t tag;
+    uint32_t valid;
+};
+
+__device__ __forceinline__ void moe3_resolve(MoeBlockCtx* ctx, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ slot_table, const uint32_t* __restrict__ topk_ids, uint32_t k,
+    uint64_t slab_stride, bool w13) {
+    if (threadIdx.x == 0u) {
+        uint32_t slot = slot_table[topk_ids[k]];
+        ctx->valid = (slot != 0xFFFFFFFFu) ? 1u : 0u;
+        if (slot != 0xFFFFFFFFu) {
+            const uint8_t* slab = pool + static_cast<size_t>(slot) * slab_stride;
+            const ExpertSlabHeaderGpu* hdr = reinterpret_cast<const ExpertSlabHeaderGpu*>(slab);
+            ctx->w = slab + (w13 ? hdr->w13_weight_offset : hdr->w2_weight_offset);
+            ctx->sc = slab + (w13 ? hdr->w13_scale_offset : hdr->w2_scale_offset);
+            ctx->tag = hdr->dtype_tag;
+            ctx->outer = (hdr->dtype_tag == 0u) ? (w13 ? hdr->w13_outer_scale : hdr->w2_outer_scale) : 1.0f;
+        }
+    }
+    __syncthreads();
+}
+
+// Two independent row dots per warp (more loads in flight).
+__device__ __forceinline__ void moe3_row_dot2(uint32_t tag, const uint8_t* __restrict__ wa,
+    const uint8_t* __restrict__ sa, const uint8_t* __restrict__ wb, const uint8_t* __restrict__ sb,
+    const float* __restrict__ x, uint32_t k_cols, uint32_t lane, float* oa, float* ob) {
+    float acc_a = 0.0f, acc_b = 0.0f;
+    const uint4* va = reinterpret_cast<const uint4*>(wa);
+    const uint4* vb = reinterpret_cast<const uint4*>(wb);
+    const float4* xv = reinterpret_cast<const float4*>(x);
+    if (tag == 0u) {
+        uint32_t n16 = k_cols >> 5;
+        for (uint32_t c = lane; c < n16; c += 32u) {
+            uint4 a = va[c], b = vb[c];
+            float a0 = decode_fp8_e4m3fn(sa[2u * c]), a1 = decode_fp8_e4m3fn(sa[2u * c + 1u]);
+            float b0 = decode_fp8_e4m3fn(sb[2u * c]), b1 = decode_fp8_e4m3fn(sb[2u * c + 1u]);
+            acc_a += nvfp4_chunk_dot(a, a0, a1, xv + 8u * c);
+            acc_b += nvfp4_chunk_dot(b, b0, b1, xv + 8u * c);
+        }
+    } else {
+        uint32_t n16 = k_cols >> 4;
+        for (uint32_t c = lane; c < n16; c += 32u) {
+            uint4 a = va[c], b = vb[c];
+            float sa_ = decode_ue8m0(sa[c >> 1]), sb_ = decode_ue8m0(sb[c >> 1]);
+            acc_a = fmaf(mxfp8_chunk_dot(a, xv + 4u * c), sa_, acc_a);
+            acc_b = fmaf(mxfp8_chunk_dot(b, xv + 4u * c), sb_, acc_b);
+        }
+    }
+    *oa = wave32_sum(acc_a);
+    *ob = wave32_sum(acc_b);
+}
+
+//   Grid: (ceil(I / 32), top_k), Block: 256 (8 warps x 4 intermediate rows)
+extern "C" __global__ void smalltide_moe_w13_decode3(
+    float* __restrict__ mid, const float* __restrict__ x, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ slot_table, const uint32_t* __restrict__ topk_ids,
+    uint64_t slab_stride, uint32_t hidden, uint32_t inter, float gate_cap, float up_cap
+) {
+    __shared__ MoeBlockCtx ctx;
+    uint32_t k = blockIdx.y;
+    moe3_resolve(&ctx, pool, slot_table, topk_ids, k, slab_stride, true);
+    if (ctx.valid == 0u) return;
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    size_t wrow = (ctx.tag == 0u) ? (hidden >> 1) : hidden;
+    size_t srow = (ctx.tag == 0u) ? (hidden >> 4) : (hidden >> 5);
+    uint32_t r0 = blockIdx.x * ST_MOE3_ROWS_PER_BLOCK + warp * 4u;
+    for (uint32_t rr = 0u; rr < 4u; ++rr) {
+        uint32_t r = r0 + rr;
+        if (r >= inter) break;
+        float g, u;
+        moe3_row_dot2(ctx.tag, ctx.w + (2u * r) * wrow, ctx.sc + (2u * r) * srow,
+                      ctx.w + (2u * r + 1u) * wrow, ctx.sc + (2u * r + 1u) * srow, x, hidden, lane, &g, &u);
+        if (lane == 0u) mid[static_cast<size_t>(k) * inter + r] = situ_f32(g * ctx.outer, u * ctx.outer, gate_cap, up_cap);
+    }
+}
+
+//   Grid: (ceil(H / 32), top_k), Block: 256 (8 warps x 4 output rows, 2 at a time)
+extern "C" __global__ void smalltide_moe_w2_decode3(
+    float* __restrict__ tmp, const float* __restrict__ mid, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ slot_table, const uint32_t* __restrict__ topk_ids,
+    uint64_t slab_stride, uint32_t hidden, uint32_t inter
+) {
+    __shared__ MoeBlockCtx ctx;
+    uint32_t k = blockIdx.y;
+    moe3_resolve(&ctx, pool, slot_table, topk_ids, k, slab_stride, false);
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t h0 = blockIdx.x * ST_MOE3_ROWS_PER_BLOCK + warp * 4u;
+    if (ctx.valid == 0u) {
+        for (uint32_t i = lane; i < 4u; i += 32u) {
+            if (h0 + i < hidden) tmp[static_cast<size_t>(k) * hidden + h0 + i] = 0.0f;
+        }
+        return;
+    }
+    size_t wrow = (ctx.tag == 0u) ? (inter >> 1) : inter;
+    size_t srow = (ctx.tag == 0u) ? (inter >> 4) : (inter >> 5);
+    const float* m = mid + static_cast<size_t>(k) * inter;
+    for (uint32_t hh = 0u; hh < 4u; hh += 2u) {
+        uint32_t h = h0 + hh;
+        if (h >= hidden) break;
+        uint32_t h2 = (h + 1u < hidden) ? h + 1u : h;
+        float a, b2;
+        moe3_row_dot2(ctx.tag, ctx.w + h * wrow, ctx.sc + h * srow, ctx.w + h2 * wrow, ctx.sc + h2 * srow,
+                      m, inter, lane, &a, &b2);
+        if (lane == 0u) {
+            tmp[static_cast<size_t>(k) * hidden + h] = a * ctx.outer;
+            if (h + 1u < hidden) tmp[static_cast<size_t>(k) * hidden + h + 1u] = b2 * ctx.outer;
+        }
+    }
+}

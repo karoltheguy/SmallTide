@@ -720,15 +720,19 @@ fn run_generate(args: &[String]) {
         let n4 = nvfp4_slots as u32;
         let m8 = mxfp8_slots as u32;
         let mut sets: Vec<(String, Vec<u32>, bool)> = Vec::new();
-        for st in (0..n4.saturating_sub(8)).step_by(128) {
+        sets.push(("all 8 missing (launch floor)".to_string(), vec![u32::MAX; 8], false));
+        sets.push(("1 expert (slot 0)".to_string(), vec![0, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX], false));
+        sets.push(("same expert x8 (slot 0)".to_string(), vec![0; 8], false));
+        for st in (0..n4.saturating_sub(8)).step_by(512) {
             sets.push((format!("nvfp4 slots {st}..{}", st + 8), (st..st + 8).collect(), false));
         }
-        for st in (0..m8.saturating_sub(8)).step_by(32) {
+        for st in (0..m8.saturating_sub(8)).step_by(160) {
             sets.push((format!("mxfp8 slots {st}..{}", st + 8), (st..st + 8).collect(), true));
         }
         for (label, slots, mx) in sets {
             let cold = engine.debug_bench_moe(&slots, mx, 10, true).expect("bench");
-            println!("[bench-moe] {label:<24} cold {cold:.3} ms");
+            let warm = engine.debug_bench_moe(&slots, mx, 10, false).expect("bench");
+            println!("[bench-moe] {label:<24} cold {cold:.3} ms | warm {warm:.3} ms");
         }
     }
     let (pre_r, core_r, coda_r) = engine.tide.scheduler.cache.count_vram_resident();

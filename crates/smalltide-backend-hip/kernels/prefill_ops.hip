@@ -54,8 +54,8 @@ extern "C" __global__ void smalltide_attn_res_mix_rows_f32(
     uint32_t total = num_blocks + 1u;
     __shared__ float s_scores[16];
     __shared__ float s_inv[16];
-    __shared__ float s_wsq[8];
-    __shared__ float s_wdot[8];
+    __shared__ float s_wsq[32];
+    __shared__ float s_wdot[32];
     uint32_t lane = threadIdx.x & 31u, wid = threadIdx.x >> 5;
     float inv_sqrt_h = rsqrtf(static_cast<float>(hidden));
     for (uint32_t s = 0u; s < total; ++s) {
@@ -361,7 +361,7 @@ extern "C" __global__ void smalltide_loop_control_prep_rows_f32(
     float* dst = out + (static_cast<size_t>(row) * 2u + blockIdx.x) * hidden;
     float sq = 0.0f;
     for (uint32_t d = threadIdx.x; d < hidden; d += blockDim.x) { float v = src[d]; sq = fmaf(v, v, sq); }
-    __shared__ float s_w[8];
+    __shared__ float s_w[32];
     __shared__ float inv;
     float ws = wave32_sum(sq);
     if ((threadIdx.x & 31u) == 0u) s_w[threadIdx.x >> 5] = ws;

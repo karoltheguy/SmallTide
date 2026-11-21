@@ -570,7 +570,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     ) -> Result<()> {
         let h = self.cfg.hidden_size;
         self.backend
-            .loop_control_prep(self.scratch.ctrl_prep, cur, msg, h, self.cfg.rms_norm_eps, s)?;
+            .loop_control_prep_rows(self.scratch.ctrl_prep, cur, msg, h, self.cfg.rms_norm_eps, 1, s)?;
         self.fp8_mm(self.scratch.ctrl_gate, self.scratch.ctrl_prep, &ctrl.down, s)?;
         self.fp8_mm(self.scratch.ctrl_gain, self.scratch.ctrl_gate, &ctrl.gain, s)?;
         self.fp8_mm(self.scratch.ctrl_forget, self.scratch.ctrl_gate, &ctrl.forget, s)?;
@@ -636,7 +636,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let blocks_view = Some(self.scratch.blocks.slice(0, (*num_blocks) * h_bytes));
             if is_local {
                 let dst0 = self.scratch.in_qkv.slice(0, h_bytes);
-                self.backend.attn_res_mix(
+                self.backend.attn_res_mix_rows(
                     dst0,
                     blocks_view,
                     self.scratch.cur,
@@ -645,12 +645,12 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     1,
                     h,
                     eps,
-                    true,
+                    1,
                     s,
                 )?;
                 (dst0, dst0, dst0)
             } else {
-                self.backend.attn_res_mix(
+                self.backend.attn_res_mix_rows(
                     self.scratch.in_qkv,
                     blocks_view,
                     self.scratch.cur,
@@ -659,7 +659,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     3,
                     h,
                     eps,
-                    true,
+                    1,
                     s,
                 )?;
                 (
@@ -915,7 +915,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
         // 9. MoE Block: Mix -> Optional Loop Controller -> RMSNorm -> Router -> Tide -> Indirect MoE -> Short Conv
         let blocks_view = Some(self.scratch.blocks.slice(0, (*num_blocks) * h_bytes));
-        self.backend.attn_res_mix(
+        self.backend.attn_res_mix_rows(
             self.scratch.moe_in,
             blocks_view,
             self.scratch.cur,
@@ -924,7 +924,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             1,
             h,
             eps,
-            true,
+            1,
             s,
         )?;
         let moe_in_final = if let Some(msgs) = messages {
@@ -1245,7 +1245,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     } else {
                         None
                     };
-                    self.backend.attn_res_mix(
+                    self.backend.attn_res_mix_rows(
                         self.scratch.messages,
                         bank_view,
                         self.scratch.bank_out,
@@ -1254,7 +1254,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                         4,
                         h,
                         eps,
-                        true,
+                        1,
                         s,
                     )?;
                     self.forward_layer(
@@ -1292,7 +1292,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.backend.seg_mark("lm_head", s);
         let t_lm = self.prof_mark(s);
         let blocks_view = Some(self.scratch.blocks.slice(0, num_blocks * h_bytes));
-        self.backend.attn_res_mix(
+        self.backend.attn_res_mix_rows(
             self.scratch.moe_in,
             blocks_view,
             self.scratch.cur,
@@ -1301,7 +1301,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             1,
             h,
             eps,
-            true,
+            1,
             s,
         )?;
         self.backend.rms_norm(

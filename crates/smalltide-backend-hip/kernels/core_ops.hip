@@ -96,7 +96,7 @@ extern "C" __global__ void smalltide_rmsnorm_f32(
         local_sq += v * v;
     }
 
-    __shared__ float warp_sums[8];
+    __shared__ float warp_sums[32];
     float wsum = wave32_sum(local_sq);
     uint32_t lane = threadIdx.x & 31u;
     uint32_t wid  = threadIdx.x >> 5;

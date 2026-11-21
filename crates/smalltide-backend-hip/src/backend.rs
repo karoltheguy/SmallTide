@@ -759,7 +759,7 @@ impl ComputeBackend for HipBackend {
         unsafe {
             check_hip(
                 self.launch_raw(
-                    self.kernels.rmsnorm_f32, rows as u32, 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                    self.kernels.rmsnorm_f32, rows as u32, 1, 1, if rows == 1 { 1024 } else { 256 }, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(rmsnorm_f32)",
             )
@@ -1572,7 +1572,8 @@ impl ComputeBackend for HipBackend {
         let (mut a, mut b, mut c, mut d) = (self.dev_ptr(out)?, self.opt_dev_ptr(blocks)?, self.dev_ptr(cur)?, self.dev_ptr(queries)?);
         let (mut nb, mut nq, mut h, mut e, mut nv, mut m) = (num_blocks as u32, num_queries as u32, hidden as u32, eps, 1u32, rows as u32);
         let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut nb), p(&mut nq), p(&mut h), p(&mut e), p(&mut nv), p(&mut m)];
-        self.launch(self.kernels.attn_res_mix_rows_f32, (nq, m, 1), 256, &mut args, stream, "launch(attn_res_mix_rows)")
+        let threads = if m == 1 { 1024 } else { 256 };
+        self.launch(self.kernels.attn_res_mix_rows_f32, (nq, m, 1), threads, &mut args, stream, "launch(attn_res_mix_rows)")
     }
 
     fn head_l2_clip_rows(&self, x: DeviceBuf, scale: Option<DeviceBuf>, total_heads: usize,
@@ -1632,7 +1633,8 @@ impl ComputeBackend for HipBackend {
         let (mut a, mut b, mut c) = (self.dev_ptr(out)?, self.dev_ptr(cur)?, self.dev_ptr(msg)?);
         let (mut h, mut e) = (hidden as u32, eps);
         let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut h), p(&mut e)];
-        self.launch(self.kernels.loop_control_prep_rows_f32, (2, rows as u32, 1), 256, &mut args, stream, "launch(loop_control_prep_rows)")
+        let threads = if rows == 1 { 1024 } else { 256 };
+        self.launch(self.kernels.loop_control_prep_rows_f32, (2, rows as u32, 1), threads, &mut args, stream, "launch(loop_control_prep_rows)")
     }
 
     fn moe_grouped(&self, out: DeviceBuf, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, route: DeviceBuf,
@@ -1664,10 +1666,19 @@ impl ComputeBackend for HipBackend {
             (mp.expert_stride_bytes as u64, mp.hidden_size as u32, mp.intermediate_size as u32, 4.0f32, 25.0f32);
         let k = mp.top_k as u32;
         let mut args = [p(&mut a), p(&mut bx), p(&mut c), p(&mut d), p(&mut e), p(&mut st), p(&mut h), p(&mut i), p(&mut gc), p(&mut uc)];
-        self.launch(self.kernels.moe_w13_decode, (i.div_ceil(8), k, 1), 256, &mut args, stream, "launch(moe_w13_decode)")?;
+        let v2 = std::env::var_os("SMALLTIDE_MOE_V2").is_some();
+        if v2 {
+            self.launch(self.kernels.moe_w13_decode, (i.div_ceil(8), k, 1), 256, &mut args, stream, "launch(moe_w13_decode)")?;
+        } else {
+            self.launch(self.kernels.moe_w13_decode3, (i.div_ceil(32), k, 1), 256, &mut args, stream, "launch(moe_w13_decode3)")?;
+        }
         let (mut a, mut bm) = (self.dev_ptr(tmp)?, self.dev_ptr(mid)?);
         let mut args = [p(&mut a), p(&mut bm), p(&mut c), p(&mut d), p(&mut e), p(&mut st), p(&mut h), p(&mut i)];
-        self.launch(self.kernels.moe_w2_decode, (h.div_ceil(8), k, 1), 256, &mut args, stream, "launch(moe_w2_decode)")
+        if v2 {
+            self.launch(self.kernels.moe_w2_decode, (h.div_ceil(8), k, 1), 256, &mut args, stream, "launch(moe_w2_decode)")
+        } else {
+            self.launch(self.kernels.moe_w2_decode3, (h.div_ceil(32), k, 1), 256, &mut args, stream, "launch(moe_w2_decode3)")
+        }
     }
 
     fn moe_decode_post(&self, out: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, topk_ids: DeviceBuf,

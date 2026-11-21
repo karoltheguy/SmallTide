@@ -132,6 +132,13 @@ pub trait ComputeBackend: Send + Sync {
     fn free_device(&self, buf: DeviceBuf) -> Result<()>;
 
     fn alloc_pinned(&self, size_bytes: usize) -> Result<PinnedBuf>;
+
+    /// Pinned host memory that kernels can read/write directly over PCIe (zero-copy): returns a
+    /// `DeviceBuf` view for kernels and the owning `PinnedBuf` for host access. Free the
+    /// `PinnedBuf` (the `DeviceBuf` view is released with `free_device`).
+    fn alloc_host_mapped(&self, _size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {
+        Err(crate::SmallTideError::Unsupported("host-mapped memory".into()))
+    }
     fn free_pinned(&self, buf: PinnedBuf) -> Result<()>;
 
     /// Obtain a mutable host slice into a pinned staging buffer.

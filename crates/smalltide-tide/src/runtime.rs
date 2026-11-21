@@ -74,6 +74,10 @@ pub struct TideExecutor<B: ComputeBackend> {
     /// Resident slots (excluding the scratch ring) the full pools are allocated with.
     pool_slots: (usize, usize),
     pools_allocated: bool,
+    /// When set, the MXFP8 pool lives in pinned, device-mapped host memory (zero-copy over
+    /// PCIe) and slabs are written by CPU copies instead of DMA.
+    mxfp8_host_mapped: bool,
+    mxfp8_host: Option<PinnedBuf>,
     /// Recorded on the compute stream after a table upload that unmaps slots about to be reused.
     compute_fence: Event,
 }
@@ -164,6 +168,8 @@ impl<B: ComputeBackend> TideExecutor<B> {
             compute_fence,
             pool_slots: (resident_nvfp4, resident_mxfp8),
             pools_allocated: false,
+            mxfp8_host_mapped: false,
+            mxfp8_host: None,
         };
         exec.upload_table_on_compute()?;
         Ok(exec)
@@ -182,11 +188,46 @@ impl<B: ComputeBackend> TideExecutor<B> {
         self.vram_pool_nvfp4 = self
             .backend
             .alloc_device((self.pool_slots.0 + scratch) * self.nvfp4_layout.aligned_slab_bytes)?;
-        self.vram_pool_mxfp8 = self
-            .backend
-            .alloc_device((self.pool_slots.1 + scratch) * self.mxfp8_layout.aligned_slab_bytes)?;
+        let mx_bytes = (self.pool_slots.1 + scratch) * self.mxfp8_layout.aligned_slab_bytes;
+        if self.mxfp8_host_mapped {
+            let (view, host) = self.backend.alloc_host_mapped(mx_bytes)?;
+            self.vram_pool_mxfp8 = view;
+            self.mxfp8_host = Some(host);
+        } else {
+            self.vram_pool_mxfp8 = self.backend.alloc_device(mx_bytes)?;
+        }
         self.pools_allocated = true;
         Ok(())
+    }
+
+    /// Places the MXFP8 expert pool in pinned, device-mapped host memory (call before
+    /// `allocate_pools`). Useful when device memory beyond the resident budget is backed by
+    /// system memory anyway: the pool can then hold every MXFP8 expert, so those layers never
+    /// miss (no per-layer host sync, no rescue copies, exact routing).
+    pub fn set_mxfp8_host_mapped(&mut self, on: bool) {
+        assert!(!self.pools_allocated, "set_mxfp8_host_mapped after allocate_pools");
+        self.mxfp8_host_mapped = on;
+    }
+
+    pub fn mxfp8_is_host_mapped(&self) -> bool {
+        self.mxfp8_host_mapped
+    }
+
+    /// Writes one slab from the staging ring into its pool slot: async DMA on the copy stream
+    /// for device pools, a CPU copy for the host-mapped MXFP8 pool.
+    fn upload_slab(&mut self, expert: ExpertId, dst_pool: DeviceBuf, dst_off: usize, src_offset: usize, len: usize) -> Result<()> {
+        if self.mxfp8_host_mapped && self.scheduler.cache.expert_class(expert) == ExpertClass::Mxfp8 {
+            let host = self.mxfp8_host.expect("mxfp8 host pool");
+            unsafe {
+                let staging = self.backend.pinned_as_mut_slice(self.pinned_staging)?;
+                let src = staging[src_offset..src_offset + len].as_ptr();
+                let dst = self.backend.pinned_as_mut_slice(host)?;
+                std::ptr::copy_nonoverlapping(src, dst[dst_off..dst_off + len].as_mut_ptr(), len);
+            }
+            Ok(())
+        } else {
+            self.backend.memcpy_h2d_async(dst_pool, dst_off, self.pinned_staging, src_offset, len, self.copy_stream)
+        }
     }
 
     /// Non-blocking drain of completed background Stage 2 NVMe -> RAM reads.
@@ -320,14 +361,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
                     let src_offset = self.reserve_staging(slab_len)?;
                     self.fill_staging_from_ram_or_disk(expert, cls, Some(src_ram_slot), src_offset, slab_len)?;
                     let (dst_pool, dst_off) = self.vram_target(expert, dst_vram_slot);
-                    self.backend.memcpy_h2d_async(
-                        dst_pool,
-                        dst_off,
-                        self.pinned_staging,
-                        src_offset,
-                        slab_len,
-                        self.copy_stream,
-                    )?;
+                    self.upload_slab(expert, dst_pool, dst_off, src_offset, slab_len)?;
                     batch.push((expert, dst_vram_slot));
                     if release_ram_after_upload {
                         self.ram_slabs.remove(&(cls, src_ram_slot));
@@ -351,14 +385,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
                         self.ram_slabs.insert((cls, rs), (expert, bytes));
                     }
                     let (dst_pool, dst_off) = self.vram_target(expert, dst_vram_slot);
-                    self.backend.memcpy_h2d_async(
-                        dst_pool,
-                        dst_off,
-                        self.pinned_staging,
-                        src_offset,
-                        slab_len,
-                        self.copy_stream,
-                    )?;
+                    self.upload_slab(expert, dst_pool, dst_off, src_offset, slab_len)?;
                     batch.push((expert, dst_vram_slot));
                 }
                 TransferOp::ScratchRescue {
@@ -371,14 +398,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
                     let src_offset = self.reserve_staging(slab_len)?;
                     self.fill_staging_from_ram_or_disk(expert, cls, src_ram_slot, src_offset, slab_len)?;
                     let (dst_pool, dst_off) = self.vram_target(expert, scratch_vram_slot);
-                    self.backend.memcpy_h2d_async(
-                        dst_pool,
-                        dst_off,
-                        self.pinned_staging,
-                        src_offset,
-                        slab_len,
-                        self.copy_stream,
-                    )?;
+                    self.upload_slab(expert, dst_pool, dst_off, src_offset, slab_len)?;
                     batch.push((expert, scratch_vram_slot));
                 }
             }
@@ -444,7 +464,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             let ram = if self.scheduler.cache.is_ram_ready(id) { Some(e.ram_slot) } else { None };
             self.fill_staging_from_ram_or_disk(id, cls, ram, src_offset, slab_len)?;
             let (dst_pool, dst_off) = self.vram_target(id, slot);
-            self.backend.memcpy_h2d_async(dst_pool, dst_off, self.pinned_staging, src_offset, slab_len, self.copy_stream)?;
+            self.upload_slab(id, dst_pool, dst_off, src_offset, slab_len)?;
             self.scheduler.telemetry.stage1_sync_rescues += 1;
             self.scheduler.telemetry.stage1_bytes_transferred += slab_len as u64;
             slots.push(slot);
@@ -595,6 +615,9 @@ impl<B: ComputeBackend> Drop for TideExecutor<B> {
         let _ = self.backend.free_pinned(self.pinned_staging);
         let _ = self.backend.free_device(self.gpu_slot_table);
         let _ = self.backend.free_device(self.vram_pool_mxfp8);
+        if let Some(h) = self.mxfp8_host.take() {
+            let _ = self.backend.free_pinned(h);
+        }
         let _ = self.backend.free_device(self.vram_pool_nvfp4);
     }
 }

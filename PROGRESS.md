@@ -69,6 +69,16 @@
     id-based BPE merges, `ignore_merges`, `Utf8Stream` incremental decoding for streaming.
   - `tools/test_tokenizer.py` (HF tokenizers 0.23.3): 20/20 adversarial cases + 59 repo files
     (268K tokens) identical.
+* **R4c — Host-mapped MXFP8 pool: every expert resident, exact routing, sync-free decode: DONE**
+  - `--mxfp8-host auto|on|off` (auto: on when the device pool cannot hold all 512 MXFP8
+    experts). The MXFP8 pool is pinned, device-mapped host memory (`alloc_host_mapped`,
+    kernels read it at 26.6 GB/s - the same as the driver's silently spilled "VRAM" at
+    28.6 GB/s), filled by CPU copies. All 3072 experts now have a slot: VRAM hit 100%,
+    0 sync rescues, 0 skipped experts (exact even in threshold mode), no per-layer host
+    syncs (2 syncs/token: routing log + argmax).
+  - Decode 27 tok/s exact (previous exact config 23.8 tok/s); long-prompt prefill 1668 tok
+    121 -> 168 tok/s (no scratch-wave staging). Reference: identical per-layer errors,
+    argmax 6/6, 0 skipped; prefix E2E 5/5 identical (default server mode), tool E2E 16/16.
 * **R4b — Decode profiling + fixes; VRAM residency finding** (decode 41.3 -> ~37 ms/tok default config)
   - **Finding (dominant):** on this desktop the process gets only ~7.6 GiB of *resident* VRAM
     (DXGI `AvailableForReservation`; other apps hold ~5 GiB). The driver silently backs every
@@ -196,6 +206,7 @@
 | **R4a prefill 1668 tok** (exact) | batched **120.9 tok/s** (13.8 s) vs token **12.2 tok/s** (137.3 s) | 9.9x; 20-tok prompt 52.6 vs 22.4 tok/s |
 | Decode host profile (64 tok) | 41.3 ms/tok: 2051 launches (1.36 ms CPU), 5 syncs **35.9 ms blocked** | GPU-bound: kernel count/shape, not CPU launch cost |
 | **R4b decode** (default auto pools, threshold 0.25, 56-64 tok) | **26.5-27.1 tok/s** (~37 ms/tok, was 41.3) | GPU segments: MoE outer 16.0 ms (PCIe-backed experts), loop MoE 6.4, router 3.6, out/mix 3.4, pre-attn 2.0, proj 1.6, lm_head 1.5, attn 1.2 |
+| **R4c decode** (default: auto pools + host-mapped MXFP8, threshold policy but nothing skipped) | **26.9-27.4 tok/s exact** (37 ms/tok), 0 rescues/skips, 2 syncs/tok | prefill 1668 tok **167.6 tok/s** |
 | VRAM residency probe (`vram-probe`) | first ~4 GiB (512 MiB chunks) / ~6.5 GiB (one 12 GiB alloc) at ~290 GB/s copy, rest **28.6 GB/s** | DXGI: budget 15.06 GiB, AvailableForReservation 7.65 GiB; other apps ~5 GiB |
 | R4b verification | reference (forced routes) identical: layer err 1.7e-3 -> 1.2e-2, argmax 6/6; stress (8.7% skipped) argmax 40/40; bench-gpu parity unchanged | |
 | **Tide stress** (`--nvfp4-slots 1600 --mxfp8-slots 96`, threshold 0.25, 68 pos) | 15.3% experts skipped, 267 sync rescues, async churn every token; layer rel-err <= 4.0e-2, cos >= 0.9995, argmax 46/48 (2 near-ties) | GPU computed exactly the CPU-published expert set (no stale-slot reads) |

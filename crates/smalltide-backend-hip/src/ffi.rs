@@ -37,6 +37,7 @@ type FnHipMalloc = unsafe extern "C" fn(*mut *mut c_void, usize) -> HipError;
 type FnHipFree = unsafe extern "C" fn(*mut c_void) -> HipError;
 type FnHipHostMalloc = unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> HipError;
 type FnHipHostFree = unsafe extern "C" fn(*mut c_void) -> HipError;
+type FnHipHostGetDevicePointer = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, c_uint) -> HipError;
 type FnHipStreamCreateWithFlags = unsafe extern "C" fn(*mut HipStream, c_uint) -> HipError;
 type FnHipStreamDestroy = unsafe extern "C" fn(HipStream) -> HipError;
 type FnHipStreamSynchronize = unsafe extern "C" fn(HipStream) -> HipError;
@@ -184,6 +185,7 @@ pub struct HipRuntime {
     pub hip_free: FnHipFree,
     pub hip_host_malloc: FnHipHostMalloc,
     pub hip_host_free: FnHipHostFree,
+    pub hip_host_get_device_pointer: FnHipHostGetDevicePointer,
     pub hip_stream_create_with_flags: FnHipStreamCreateWithFlags,
     pub hip_stream_destroy: FnHipStreamDestroy,
     pub hip_stream_synchronize: FnHipStreamSynchronize,
@@ -261,6 +263,7 @@ impl HipRuntime {
             hip_free: load_sym!(b"hipFree\0", FnHipFree),
             hip_host_malloc: load_sym!(b"hipHostMalloc\0", FnHipHostMalloc),
             hip_host_free: load_sym!(b"hipHostFree\0", FnHipHostFree),
+            hip_host_get_device_pointer: load_sym!(b"hipHostGetDevicePointer\0", FnHipHostGetDevicePointer),
             hip_stream_create_with_flags: load_sym!(
                 b"hipStreamCreateWithFlags\0",
                 FnHipStreamCreateWithFlags

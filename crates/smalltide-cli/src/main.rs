@@ -464,6 +464,23 @@ fn run_vram_probe() {
     };
     let info0 = backend.device_info().expect("info");
     println!("free before: {:.2} GiB", info0.free_vram_bytes as f64 / (1u64 << 30) as f64);
+    if let Some(hm_gb) = std::env::var("SMALLTIDE_PROBE_HOSTMAPPED_GB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let (dbuf, pbuf) = backend.alloc_host_mapped(hm_gb << 30).expect("host-mapped alloc");
+        backend.zero_f32(dbuf, (hm_gb << 30) / 4, s).expect("zero");
+        backend.sync_stream(s).expect("sync");
+        for w in 0..(hm_gb * 2) {
+            let t0 = Instant::now();
+            for _ in 0..4 {
+                backend.vec_copy(scratch, dbuf.slice(w * chunk, chunk), chunk / 4, s).expect("copy");
+            }
+            backend.sync_stream(s).expect("sync");
+            let gbs = (4 * chunk) as f64 / t0.elapsed().as_secs_f64() / 1e9;
+            println!("host-mapped window {w:2}: read {gbs:7.1} GB/s");
+        }
+        let _ = backend.free_device(dbuf);
+        let _ = backend.free_pinned(pbuf);
+        return;
+    }
     if let Some(big_gb) = std::env::var("SMALLTIDE_PROBE_BIG_GB").ok().and_then(|v| v.parse::<usize>().ok()) {
         let big = backend.alloc_device(big_gb << 30).expect("big alloc");
         backend.zero_f32(big, (big_gb << 30) / 4, s).expect("zero");
@@ -612,6 +629,7 @@ fn run_generate(args: &[String]) {
     let mut ram_gb: f64 = 10.0;
     let mut enable_profile = false;
     let mut prefill_mode = "batched".to_string();
+    let mut mxfp8_host = "auto".to_string();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -630,6 +648,7 @@ fn run_generate(args: &[String]) {
             "--ram-gb" if i + 1 < args.len() => { ram_gb = args[i + 1].parse().unwrap_or(10.0); i += 2; }
             "--profile" => { enable_profile = true; i += 1; }
             "--prefill" if i + 1 < args.len() => { prefill_mode = args[i + 1].clone(); i += 2; }
+            "--mxfp8-host" if i + 1 < args.len() => { mxfp8_host = args[i + 1].clone(); i += 2; }
             other => { eprintln!("Unknown flag: {other}"); i += 1; }
         }
     }
@@ -686,6 +705,14 @@ fn run_generate(args: &[String]) {
         }
     };
 
+    // MXFP8 pool in pinned host memory holding every MXFP8 expert ("auto": when the device pool
+    // could not hold them all). Device memory past the resident budget is system memory anyway.
+    let mxfp8_host_mapped = match mxfp8_host.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => mxfp8_slots < total_mxfp8,
+    };
+    let mxfp8_slots = if mxfp8_host_mapped { total_mxfp8 } else { mxfp8_slots };
     let rescue_policy = match rescue_mode.as_str() {
         "exact" => RescuePolicy::Exact,
         "disabled" | "none" => RescuePolicy::Disabled,
@@ -706,6 +733,8 @@ fn run_generate(args: &[String]) {
         Some(pack),
     )
     .expect("create TideExecutor");
+    let mut tide = tide;
+    tide.set_mxfp8_host_mapped(mxfp8_host_mapped);
 
     // Engine buffers (activations, KV, prefill scratch) before the expert pools: on Windows the
     // driver backs allocations beyond the resident budget with system memory, in order.

@@ -23,6 +23,8 @@ use std::sync::Mutex;
 struct DeviceAlloc {
     ptr: *mut c_void,
     size_bytes: usize,
+    /// Device view of host-mapped pinned memory (owned by a PinnedBuf; never hipFree'd).
+    borrowed: bool,
 }
 unsafe impl Send for DeviceAlloc {}
 
@@ -400,7 +402,9 @@ impl Drop for HipBackend {
             unsafe { let _ = (self.rt.hip_host_free)(p.ptr); }
         }
         for (_, d) in self.dev_bufs.get_mut().unwrap().drain() {
-            unsafe { let _ = (self.rt.hip_free)(d.ptr); }
+            if !d.borrowed {
+                unsafe { let _ = (self.rt.hip_free)(d.ptr); }
+            }
         }
         unsafe {
             let _ = (self.rt.hip_module_unload)(self.kernels.module);
@@ -429,7 +433,7 @@ impl ComputeBackend for HipBackend {
         self.dev_bufs
             .lock()
             .unwrap()
-            .insert(id, DeviceAlloc { ptr, size_bytes });
+            .insert(id, DeviceAlloc { ptr, size_bytes, borrowed: false });
         Ok(DeviceBuf { id, offset_bytes: 0, size_bytes })
     }
 
@@ -441,9 +445,38 @@ impl ComputeBackend for HipBackend {
             });
         }
         if let Some(a) = self.dev_bufs.lock().unwrap().remove(&buf.id) {
-            unsafe { check_hip((self.rt.hip_free)(a.ptr), "hipFree")? };
+            if !a.borrowed {
+                unsafe { check_hip((self.rt.hip_free)(a.ptr), "hipFree")? };
+            }
         }
         Ok(())
+    }
+
+    fn alloc_host_mapped(&self, size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {
+        const HIP_HOST_MALLOC_PORTABLE: u32 = 0x1;
+        const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
+        let mut hptr: *mut c_void = ptr::null_mut();
+        unsafe {
+            check_hip(
+                (self.rt.hip_host_malloc)(&mut hptr, size_bytes, HIP_HOST_MALLOC_PORTABLE | HIP_HOST_MALLOC_MAPPED),
+                "hipHostMalloc(mapped)",
+            )?;
+        }
+        let mut dptr: *mut c_void = ptr::null_mut();
+        let r = unsafe { (self.rt.hip_host_get_device_pointer)(&mut dptr, hptr, 0) };
+        if r != 0 || dptr.is_null() {
+            unsafe { let _ = (self.rt.hip_host_free)(hptr); }
+            check_hip(r, "hipHostGetDevicePointer")?;
+            return Err(SmallTideError::Backend { backend: "hip", message: "null device pointer for mapped host memory".into() });
+        }
+        let pid = self.next_handle();
+        self.pinned_bufs.lock().unwrap().insert(pid, PinnedAlloc { ptr: hptr, size_bytes });
+        let did = self.next_handle();
+        self.dev_bufs
+            .lock()
+            .unwrap()
+            .insert(did, DeviceAlloc { ptr: dptr, size_bytes, borrowed: true });
+        Ok((DeviceBuf { id: did, offset_bytes: 0, size_bytes }, PinnedBuf { id: pid, size_bytes }))
     }
 
     fn alloc_pinned(&self, size_bytes: usize) -> Result<PinnedBuf> {

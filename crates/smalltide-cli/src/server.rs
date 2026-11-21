@@ -224,6 +224,7 @@ pub fn run_serve(args: &[String]) {
     let mut nvfp4_slots_override: Option<usize> = None;
     let mut mxfp8_slots_override: Option<usize> = None;
     let mut ram_gb: f64 = 10.0;
+    let mut mxfp8_host = "auto".to_string();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -237,6 +238,7 @@ pub fn run_serve(args: &[String]) {
             "--nvfp4-slots" if i + 1 < args.len() => { nvfp4_slots_override = args[i + 1].parse().ok(); i += 2; }
             "--mxfp8-slots" if i + 1 < args.len() => { mxfp8_slots_override = args[i + 1].parse().ok(); i += 2; }
             "--ram-gb" if i + 1 < args.len() => { ram_gb = args[i + 1].parse().unwrap_or(10.0); i += 2; }
+            "--mxfp8-host" if i + 1 < args.len() => { mxfp8_host = args[i + 1].clone(); i += 2; }
             other => { eprintln!("Unknown serve flag: {other}"); i += 1; }
         }
     }
@@ -294,6 +296,14 @@ pub fn run_serve(args: &[String]) {
         }
     };
 
+    // MXFP8 pool in pinned host memory holding every MXFP8 expert ("auto": when the device pool
+    // could not hold them all). Device memory past the resident budget is system memory anyway.
+    let mxfp8_host_mapped = match mxfp8_host.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => mxfp8_slots < total_mxfp8,
+    };
+    let mxfp8_slots = if mxfp8_host_mapped { total_mxfp8 } else { mxfp8_slots };
     let rescue_policy = match rescue_mode.as_str() {
         "exact" => RescuePolicy::Exact,
         "disabled" | "none" => RescuePolicy::Disabled,
@@ -314,6 +324,8 @@ pub fn run_serve(args: &[String]) {
         Some(pack),
     )
     .expect("create TideExecutor");
+    let mut tide = tide;
+    tide.set_mxfp8_host_mapped(mxfp8_host_mapped);
 
     // Engine buffers before the expert pools (see TideExecutor::allocate_pools).
     let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, max_ctx).expect("create Inkling2Engine");

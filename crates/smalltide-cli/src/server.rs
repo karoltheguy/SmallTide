@@ -16,7 +16,9 @@ use smalltide_core::{ComputeBackend, DType, Inkling2Config, RescuePolicy, TideCo
 use smalltide_io::dense_loader::Inkling2DenseHost;
 use smalltide_io::stide_pack::{ExpertSlabLayout, StidePackReader};
 use smalltide_io::tokenizer::BpeTokenizer;
+use crate::chat_format::{self, AnswerEvent, AnswerParser, OJson, StopMatcher};
 use crate::prefix_cache::{PrefixCache, PrefixPlan};
+use smalltide_io::tokenizer::Utf8Stream;
 use smalltide_model_inkling2::engine::{Inkling2Engine, SamplingParams, SeqSnapshot};
 use smalltide_model_inkling2::weights::Inkling2DenseGpu;
 use smalltide_tide::TideExecutor;
@@ -32,11 +34,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub const SERVED_MODEL_NAME: &str = "inkling-2-mini";
 
 const TOK_MESSAGE_USER: u32 = 200_000;
-const TOK_MESSAGE_MODEL: u32 = 200_001;
-const TOK_CONTENT_TEXT: u32 = 200_004;
 const TOK_EOS: u32 = 200_006;
-const TOK_CONTENT_THINKING: u32 = 200_008;
-const TOK_END_MESSAGE: u32 = 200_010;
 const TOK_EOT: u32 = 199_999;
 
 static REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -60,6 +58,12 @@ enum StreamEvent {
         channel: OutputChannel,
         text: String,
     },
+    ToolCall {
+        index: usize,
+        id: String,
+        name: String,
+        arguments: String,
+    },
     Done {
         finish_reason: &'static str,
         /// Prompt tokens served from the prefix cache (not re-prefilled).
@@ -77,6 +81,10 @@ enum EngineCommand {
     Generate {
         prompt_text: String,
         is_chat: bool,
+        /// Chat only: the prompt already opens this tool's call (`tool_choice` names a function).
+        forced_tool: Option<String>,
+        /// Stop after the first completed tool call (`parallel_tool_calls: false` or forced tool).
+        single_tool_call: bool,
         max_tokens: usize,
         sampling: SamplingParams,
         stop_strings: Vec<String>,
@@ -92,18 +100,7 @@ enum EngineCommand {
 }
 
 #[derive(Deserialize)]
-struct ChatMessage {
-    role: String,
-    #[serde(default)]
-    content: Value,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct ChatCompletionReq {
-    #[serde(default)]
-    messages: Vec<ChatMessage>,
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
@@ -118,8 +115,6 @@ struct ChatCompletionReq {
     repetition_penalty: Option<f32>,
     #[serde(default)]
     stream: Option<bool>,
-    #[serde(default)]
-    reasoning_effort: Option<Value>,
     #[serde(default)]
     stop: Option<Value>,
 }
@@ -174,92 +169,49 @@ fn parse_stop_strings(v: &Option<Value>) -> Vec<String> {
     }
 }
 
-fn extract_text_content(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => {
-            let mut out = String::new();
-            for p in parts {
-                if let Some(s) = p.as_str() {
-                    out.push_str(s);
-                } else if let Some(t) = p.get("text").and_then(Value::as_str) {
-                    out.push_str(t);
-                }
-            }
-            out
-        }
-        _ => String::new(),
-    }
-}
-
-/// Formats OpenAI chat messages using Inkling-2-Mini's exact `chat_template.jinja`.
-fn format_inkling2_chat(messages: &[ChatMessage], reasoning_effort: &Option<Value>) -> String {
-    let effort_str = match reasoning_effort {
-        None | Some(Value::Null) => "0".to_string(),
-        Some(Value::String(s)) => match s.trim() {
-            "none" => "0".into(),
-            "minimal" => "0.1".into(),
-            "low" => "0.2".into(),
-            "medium" => "0.7".into(),
-            "high" => "0.9".into(),
-            "xhigh" | "max" => "0.99".into(),
-            other => other.to_string(),
+/// Renders a chat request (messages, tools, tool_choice, reasoning_effort) with the exact
+/// chat template. Returns the prompt and the forced tool name, if `tool_choice` names one.
+fn render_chat_request(body: &OJson) -> Result<(String, Option<String>, bool), String> {
+    let messages = match body.get("messages") {
+        Some(OJson::Arr(m)) if !m.is_empty() => m.clone(),
+        _ => return Err("`messages` must be a non-empty list".into()),
+    };
+    let tools = body.get("tools").filter(|t| !matches!(t, OJson::Null));
+    let mut forced = None;
+    let mut use_tools = tools;
+    match body.get("tool_choice") {
+        None | Some(OJson::Null) => {}
+        Some(OJson::Str(s)) => match s.as_str() {
+            "none" => use_tools = None,
+            // "required" cannot be forced without naming a tool; it behaves like "auto".
+            "auto" | "required" => {}
+            other => return Err(format!("unsupported tool_choice: {other}")),
         },
-        Some(Value::Number(n)) => {
-            let f = n.as_f64().unwrap_or(0.0).clamp(0.0, 0.99);
-            if f == 0.0 {
-                "0".into()
-            } else {
-                format!("{f}")
+        Some(tc) => {
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(OJson::as_str)
+                .ok_or("tool_choice must be \"none\", \"auto\", \"required\" or {\"type\":\"function\",\"function\":{\"name\":...}}")?;
+            let declared = match tools {
+                Some(OJson::Arr(list)) => list.iter().any(|t| {
+                    t.get("function").unwrap_or(t).get("name").and_then(OJson::as_str) == Some(name)
+                }),
+                _ => false,
+            };
+            if !declared {
+                return Err(format!("tool_choice names `{name}`, which is not in `tools`"));
             }
-        }
-        _ => "0".into(),
-    };
-
-    let mut out = String::new();
-    let mut effort_emitted = false;
-    let emit_effort = |buf: &mut String| {
-        buf.push_str("<|message_system|><|content_text|>Thinking effort level: ");
-        buf.push_str(&effort_str);
-        buf.push_str("<|end_message|>");
-    };
-
-    for m in messages {
-        if !effort_emitted && m.role != "system" {
-            emit_effort(&mut out);
-            effort_emitted = true;
-        }
-        let rtok = match m.role.as_str() {
-            "system" => "<|message_system|>",
-            "assistant" => "<|message_model|>",
-            "tool" => "<|message_tool|>",
-            _ => "<|message_user|>",
-        };
-        if m.role == "assistant" {
-            if let Some(rc) = &m.reasoning_content {
-                if !rc.is_empty() {
-                    out.push_str(rtok);
-                    out.push_str("<|content_thinking|>");
-                    out.push_str(rc);
-                    out.push_str("<|end_message|>");
-                }
-            }
-        }
-        let text = extract_text_content(&m.content);
-        if !text.is_empty() || m.role != "assistant" {
-            out.push_str(rtok);
-            out.push_str("<|content_text|>");
-            out.push_str(&text);
-            out.push_str("<|end_message|>");
-        }
-        if m.role == "assistant" {
-            out.push_str("<|content_model_end_sampling|>");
+            forced = Some(name.to_string());
         }
     }
-    if !effort_emitted {
-        emit_effort(&mut out);
+    let r = chat_format::render_chat(&messages, use_tools, body.get("reasoning_effort"))?;
+    let mut prompt = r.prompt;
+    if let Some(n) = &forced {
+        prompt.push_str(&format!("<|message_model|>{n}<|content_invoke_tool_json|>"));
     }
-    out
+    let single = forced.is_some() || matches!(body.get("parallel_tool_calls"), Some(OJson::Bool(false)));
+    Ok((prompt, forced, single))
 }
 
 pub fn run_serve(args: &[String]) {
@@ -476,6 +428,8 @@ fn engine_worker_loop(
             EngineCommand::Generate {
                 prompt_text,
                 is_chat,
+                forced_tool,
+                single_tool_call,
                 max_tokens,
                 sampling,
                 stop_strings,
@@ -497,6 +451,20 @@ fn engine_worker_loop(
 
                 let t_pf = Instant::now();
                 let plan = pc.plan(&prompt_ids);
+                if std::env::var_os("SMALLTIDE_PREFIX_DEBUG").is_some() {
+                    let lcp = pc.cached.iter().zip(&prompt_ids).take_while(|(a, b)| a == b).count();
+                    let show = |ids: &[u32]| -> String {
+                        let end = (lcp + 6).min(ids.len());
+                        format!("{:?}", ids[lcp.min(end)..end].iter().map(|&t| tok.decode(&[t])).collect::<Vec<_>>())
+                    };
+                    eprintln!(
+                        "[prefix] plan={plan:?} live={} prompt={} lcp={lcp} live_next={} prompt_next={}",
+                        pc.cached.len(),
+                        prompt_ids.len(),
+                        show(&pc.cached),
+                        show(&prompt_ids)
+                    );
+                }
                 let rewind = match &plan {
                     PrefixPlan::Extend { from } => Ok(*from),
                     PrefixPlan::Restore { snap_idx, pos } => {
@@ -560,9 +528,64 @@ fn engine_worker_loop(
                 let t_dec = Instant::now();
                 let mut generated: Vec<u32> = Vec::with_capacity(max_tokens.min(4096));
                 let mut pos = prompt_ids.len();
-                let mut channel = OutputChannel::Text;
-                let mut full_emitted = String::new();
                 let mut finish_reason: &'static str = "length";
+                let mut parser = match &forced_tool {
+                    Some(n) => AnswerParser::new_forced_tool(n),
+                    None => AnswerParser::new(),
+                };
+                let mut raw_utf8 = Utf8Stream::default();
+                let mut stopper = StopMatcher::new(stop_strings);
+                let req_tag = REQ_COUNTER.load(Ordering::Relaxed);
+                let mut n_tool_calls = 0usize;
+
+                // Routes parsed answer events to the client. Returns false to stop generating.
+                let mut emit = |evs: Vec<AnswerEvent>, finish: &mut &'static str| -> bool {
+                    for ev in evs {
+                        let sent = match ev {
+                            AnswerEvent::Text(t) => {
+                                let (out, stopped) = stopper.push(&t);
+                                let ok = out.is_empty()
+                                    || event_tx.send(StreamEvent::Delta { channel: OutputChannel::Text, text: out }).is_ok();
+                                if stopped {
+                                    *finish = "stop";
+                                    return false;
+                                }
+                                ok
+                            }
+                            AnswerEvent::Thinking(t) => event_tx
+                                .send(StreamEvent::Delta { channel: OutputChannel::Thinking, text: t })
+                                .is_ok(),
+                            AnswerEvent::ToolCall { name, arguments } => {
+                                let index = n_tool_calls;
+                                n_tool_calls += 1;
+                                let ok = event_tx
+                                    .send(StreamEvent::ToolCall {
+                                        index,
+                                        id: format!("call_{req_tag:x}_{index}"),
+                                        name,
+                                        arguments,
+                                    })
+                                    .is_ok();
+                                if ok && single_tool_call {
+                                    // A single call was requested: the answer ends here.
+                                    *finish = "stop";
+                                    return false;
+                                }
+                                ok
+                            }
+                            AnswerEvent::EndOfAnswer => {
+                                *finish = "stop";
+                                return false;
+                            }
+                        };
+                        if !sent {
+                            // Client disconnected: abort generation.
+                            *finish = "stop";
+                            return false;
+                        }
+                    }
+                    true
+                };
 
                 let mut next_tok = match engine.sample_next_token(&sampling, &generated) {
                     Ok(t) => t,
@@ -578,48 +601,15 @@ fn engine_worker_loop(
                         break;
                     }
                     generated.push(next_tok);
-
-                    let mut emit_piece = true;
-                    if is_chat {
-                        match next_tok {
-                            TOK_MESSAGE_MODEL | TOK_END_MESSAGE => emit_piece = false,
-                            TOK_CONTENT_THINKING => {
-                                channel = OutputChannel::Thinking;
-                                emit_piece = false;
-                            }
-                            TOK_CONTENT_TEXT => {
-                                channel = OutputChannel::Text;
-                                emit_piece = false;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if emit_piece {
-                        let piece = tok.decode(&[next_tok]);
-                        full_emitted.push_str(&piece);
-                        let mut hit_stop = false;
-                        for s in &stop_strings {
-                            if full_emitted.ends_with(s) {
-                                hit_stop = true;
-                                break;
-                            }
-                        }
-                        if hit_stop {
-                            finish_reason = "stop";
-                            break;
-                        }
-                        if event_tx
-                            .send(StreamEvent::Delta {
-                                channel,
-                                text: piece,
-                            })
-                            .is_err()
-                        {
-                            // Client disconnected — abort generation immediately!
-                            finish_reason = "stop";
-                            break;
-                        }
+                    let bytes = tok.token_bytes(next_tok);
+                    let evs = if is_chat {
+                        parser.feed(next_tok, bytes, tok.is_special(next_tok))
+                    } else {
+                        let t = raw_utf8.push(bytes);
+                        if t.is_empty() { Vec::new() } else { vec![AnswerEvent::Text(t)] }
+                    };
+                    if !emit(evs, &mut finish_reason) {
+                        break;
                     }
 
                     if step + 1 >= max_tokens || pos >= engine.global_max_seq {
@@ -640,6 +630,26 @@ fn engine_worker_loop(
                             break;
                         }
                     };
+                }
+                // Flush held-back UTF-8, partial stop-string prefixes and an unterminated call.
+                let tail = if is_chat {
+                    parser.finish()
+                } else {
+                    let t = raw_utf8.finish();
+                    if t.is_empty() { Vec::new() } else { vec![AnswerEvent::Text(t)] }
+                };
+                let mut fr = finish_reason;
+                let tail_ok = emit(tail, &mut fr);
+                drop(emit);
+                if tail_ok && fr != "stop" {
+                    let held = stopper.finish();
+                    if !held.is_empty() {
+                        let _ = event_tx.send(StreamEvent::Delta { channel: OutputChannel::Text, text: held });
+                    }
+                }
+                finish_reason = fr;
+                if n_tool_calls > 0 && finish_reason == "stop" {
+                    finish_reason = "tool_calls";
                 }
 
                 let dec_secs = t_dec.elapsed().as_secs_f64();
@@ -809,7 +819,21 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     return;
                 }
             };
-            let prompt_text = format_inkling2_chat(&req.messages, &req.reasoning_effort);
+            let rendered = std::str::from_utf8(&body)
+                .map_err(|e| e.to_string())
+                .and_then(chat_format::parse_json)
+                .and_then(|b| render_chat_request(&b));
+            let (prompt_text, forced_tool, single_tool_call) = match rendered {
+                Ok(r) => r,
+                Err(e) => {
+                    write_json_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        &json!({"error": {"message": e, "type": "invalid_request_error"}}),
+                    );
+                    return;
+                }
+            };
             let max_tokens = req.max_completion_tokens.or(req.max_tokens).unwrap_or(512);
             let sampling = SamplingParams {
                 temperature: req.temperature.unwrap_or(0.6),
@@ -828,6 +852,8 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 .send(EngineCommand::Generate {
                     prompt_text,
                     is_chat: true,
+                    forced_tool,
+                    single_tool_call,
                     max_tokens,
                     sampling,
                     stop_strings,
@@ -879,6 +905,27 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                                 return;
                             }
                         }
+                        StreamEvent::ToolCall { index, id, name, arguments } => {
+                            let chunk = json!({
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": SERVED_MODEL_NAME,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": { "tool_calls": [{
+                                        "index": index,
+                                        "id": id,
+                                        "type": "function",
+                                        "function": { "name": name, "arguments": arguments }
+                                    }]},
+                                    "finish_reason": Value::Null
+                                }]
+                            });
+                            if write!(stream, "data: {}\n\n", chunk).is_err() || stream.flush().is_err() {
+                                return;
+                            }
+                        }
                         StreamEvent::Done {
                             finish_reason,
                             prompt_tokens,
@@ -917,6 +964,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
             } else {
                 let mut content = String::new();
                 let mut reasoning = String::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
                 let mut finish_reason = "length";
                 let (mut pt, mut ct, mut pf_s, mut dec_s, mut hit) = (0usize, 0usize, 0.0, 0.0, 1.0);
                 let mut cached = 0usize;
@@ -926,6 +974,11 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             OutputChannel::Thinking => reasoning.push_str(&text),
                             OutputChannel::Text => content.push_str(&text),
                         },
+                        StreamEvent::ToolCall { id, name, arguments, .. } => tool_calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": arguments }
+                        })),
                         StreamEvent::Done {
                             finish_reason: fr,
                             prompt_tokens,
@@ -952,10 +1005,13 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 }
                 let mut message = json!({
                     "role": "assistant",
-                    "content": content,
+                    "content": if content.is_empty() && !tool_calls.is_empty() { Value::Null } else { Value::String(content) },
                 });
                 if !reasoning.is_empty() {
                     message["reasoning_content"] = Value::String(reasoning);
+                }
+                if !tool_calls.is_empty() {
+                    message["tool_calls"] = Value::Array(tool_calls);
                 }
                 let resp = json!({
                     "id": req_id,
@@ -1022,6 +1078,8 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 .send(EngineCommand::Generate {
                     prompt_text,
                     is_chat: false,
+                    forced_tool: None,
+                    single_tool_call: false,
                     max_tokens,
                     sampling,
                     stop_strings,
@@ -1039,6 +1097,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 }
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
+                        StreamEvent::ToolCall { .. } => {}
                         StreamEvent::Delta { text, .. } => {
                             let chunk = json!({
                                 "id": req_id,
@@ -1098,6 +1157,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
                         StreamEvent::Delta { text: piece, .. } => text.push_str(&piece),
+                        StreamEvent::ToolCall { .. } => {}
                         StreamEvent::Done {
                             finish_reason: fr,
                             prompt_tokens,

@@ -69,6 +69,24 @@
     id-based BPE merges, `ignore_merges`, `Utf8Stream` incremental decoding for streaming.
   - `tools/test_tokenizer.py` (HF tokenizers 0.23.3): 20/20 adversarial cases + 59 repo files
     (268K tokens) identical.
+* **R3 — OpenAI tool calling: DONE**
+  - `crates/smalltide-cli/src/chat_format.rs`: byte-exact port of `chat_template.jinja`
+    (tool_declare with recursively sorted specs, assistant `tool_calls` as
+    `<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>`,
+    tool-role headers incl. `tool_call_id` lookup, one block per content part, effort default
+    **0.9** when unspecified, template refusals -> HTTP 400). Order-preserving JSON with Python
+    `json.dumps` output (float repr, escapes, separators, sort_keys). String `arguments` from
+    OpenAI clients are parsed first ("canonicalize upstream").
+  - `AnswerParser`: streams reasoning/content, parses tool-call bodies; `StopMatcher` holds back
+    partial stop strings; incremental UTF-8 (fixes `Bras�lia`).
+  - Server: `tools`, `tool_choice` (`auto`/`required`=auto, `none`, named function forced by
+    ending the prompt with `<|message_model|>NAME<|content_invoke_tool_json|>`),
+    `parallel_tool_calls:false`, `tool_calls` in non-streaming + streaming deltas,
+    `finish_reason:"tool_calls"`. `SMALLTIDE_PREFIX_DEBUG=1` logs prefix-cache decisions.
+  - `tools/test_chat_template.py`: **27/27** cases byte-identical to transformers'
+    `apply_chat_template` environment (incl. refusals). `tools/test_tool_calls.py` (real model,
+    threshold mode): **16/16** pass — auto call, tool-result turn (prefix cache extends the
+    re-templated history fully: 305/343 cached), streaming call, forced call, none, utf-8.
 * **R2 — Server prompt prefix cache: DONE**
   - `Inkling2Engine::{snapshot_state, restore_state}`: rewindable state = 40 local KV rings + scales
     and all 48x4 short-conv histories (86 MiB), copied stream-ordered to pinned host RAM. Global KV

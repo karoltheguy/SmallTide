@@ -1,3 +1,4 @@
+mod chat_format;
 mod prefix_cache;
 mod server;
 
@@ -53,6 +54,29 @@ fn main() {
             )
             .expect("pack .stide");
             println!("Packed all 3,072 experts in {:.2}s!", t0.elapsed().as_secs_f64());
+        }
+        Some("render-chat") => {
+            // Dev tool: `render-chat <cases.json>`; each case {messages, tools?, reasoning_effort?}.
+            let Some(input) = args.get(2) else {
+                eprintln!("Usage: smalltide-cli render-chat <cases.json>");
+                std::process::exit(1);
+            };
+            let text = std::fs::read_to_string(input).expect("read input");
+            let cases = chat_format::parse_json(&text).expect("parse cases");
+            let chat_format::OJson::Arr(cases) = cases else { panic!("cases must be a list") };
+            let mut out = Vec::new();
+            for c in &cases {
+                let msgs = match c.get("messages") {
+                    Some(chat_format::OJson::Arr(m)) => m.clone(),
+                    _ => Vec::new(),
+                };
+                let r = chat_format::render_chat(&msgs, c.get("tools"), c.get("reasoning_effort"));
+                out.push(match r {
+                    Ok(r) => serde_json::json!({ "ok": r.prompt }),
+                    Err(e) => serde_json::json!({ "err": e }),
+                });
+            }
+            println!("{}", serde_json::to_string(&out).unwrap());
         }
         Some("tokenize") => {
             // Dev tool: `tokenize <tokenizer.json> <in.txt>` -> JSON token ids of the whole file.

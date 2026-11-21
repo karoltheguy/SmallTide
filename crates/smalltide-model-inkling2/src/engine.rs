@@ -10,7 +10,7 @@
 //!   for 100%-VRAM-resident layers (e.g., all 36 Loop Core layers on RX 9070 XT).
 
 use crate::weights::{DenseLayerGpu, Fp8MatrixGpu, Inkling2DenseGpu, LoopControllerGpu};
-use smalltide_core::backend::{FlashDecodeParams, GemvSegment, MoeDispatchParams};
+use smalltide_core::backend::{AttnPrepParams, FlashDecodeParams, GemvSegment, MoeDispatchParams};
 use smalltide_core::{
     ComputeBackend, DType, DeviceBuf, Inkling2Config, PhysicalLayerId, PinnedBuf, Result, Stream,
     TideTelemetry,
@@ -643,7 +643,6 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let h = self.cfg.hidden_size;
         let h_bytes = h * 4;
         let q_dim = self.cfg.num_attention_heads * self.cfg.head_dim;
-        let kv_dim = self.cfg.num_key_value_heads * self.cfg.head_dim;
         let eps = self.cfg.rms_norm_eps;
 
         self.backend.seg_mark("pre_attn(mix,ctrl,norm)", s);
@@ -779,93 +778,45 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let t_sc = self.prof_mark(s);
         let layer = &self.dense.layers[ip];
         let st = &self.layer_states[il];
-        let k_dyn = layer.k_sconv_dyn_proj.map(|_| self.scratch.k_dyn);
-        self.backend.sconv_k4_decode(
-            self.scratch.k,
-            st.sconv_k,
-            self.scratch.k_raw,
-            layer.k_sconv_static,
-            k_dyn,
-            kv_dim,
-            self.cfg.head_dim,
-            s,
-        )?;
-        let v_dyn = layer.v_sconv_dyn_proj.map(|_| self.scratch.v_dyn);
-        self.backend.sconv_k4_decode(
-            self.scratch.v,
-            st.sconv_v,
-            self.scratch.v_raw,
-            layer.v_sconv_static,
-            v_dyn,
-            kv_dim,
-            self.cfg.head_dim,
-            s,
-        )?;
-
-        // 5. QK / Rel L2 Clip + Value RMSNorm (no gamma) + Global log-scaled `tau`
-        self.backend.head_l2_clip(
-            self.scratch.q,
-            Some(layer.q_l2_clip_scale),
-            self.cfg.num_attention_heads,
-            self.cfg.head_dim,
-            self.cfg.qk_l2_clip_threshold,
-            s,
-        )?;
-        self.backend.head_l2_clip(
-            self.scratch.k,
-            None,
-            self.cfg.num_key_value_heads,
-            self.cfg.head_dim,
-            self.cfg.qk_l2_clip_threshold,
-            s,
-        )?;
-        self.backend.value_norm_no_gamma(
-            self.scratch.v,
-            self.cfg.num_key_value_heads,
-            self.cfg.head_dim,
-            eps,
-            s,
-        )?;
-        self.backend.head_l2_clip(
-            self.scratch.r,
-            Some(layer.rel_l2_clip_scale),
-            self.cfg.num_attention_heads,
-            self.cfg.d_rel,
-            self.cfg.rel_l2_clip_threshold,
-            s,
-        )?;
-
-        if !is_local {
+        // 5./6. One fused launch: K/V short convs, K clip, V norm, FP8 KV store, Q/R clip + tau,
+        // relative-bias table.
+        let tau = if is_local {
+            1.0
+        } else {
             let ratio = ((pos as f32 + 1.0) / (self.cfg.log_scaling_n_floor as f32)).max(1.0);
-            let tau = 1.0 + self.cfg.log_scaling_alpha * ratio.ln();
-            if tau != 1.0 {
-                self.backend.vec_scale(self.scratch.q, tau, q_dim, s)?;
-                self.backend
-                    .vec_scale(self.scratch.r, tau, self.cfg.num_attention_heads * self.cfg.d_rel, s)?;
-            }
-        }
-
-        // 6. Attention Sinks + Relative Bias Table + FP8 KV Store + Split-K FlashDecoding
-        self.backend.rel_table(
-            self.scratch.rel_table,
-            self.scratch.r,
-            layer.rel_logits_proj,
-            self.cfg.num_attention_heads,
-            self.cfg.rel_extent,
-            s,
-        )?;
+            1.0 + self.cfg.log_scaling_alpha * ratio.ln()
+        };
         let slot_pos = if is_local { pos % st.max_seq } else { pos };
-        self.backend.kv_store_fp8_decode(
-            st.k_cache,
-            st.k_scales,
-            st.v_cache,
-            st.v_scales,
-            self.scratch.k,
-            self.scratch.v,
-            self.cfg.num_key_value_heads,
-            st.max_seq,
-            self.cfg.head_dim,
-            slot_pos,
+        self.backend.attn_prep_decode(
+            AttnPrepParams {
+                q: self.scratch.q,
+                r: self.scratch.r,
+                k_raw: self.scratch.k_raw,
+                v_raw: self.scratch.v_raw,
+                k_dyn: layer.k_sconv_dyn_proj.map(|_| self.scratch.k_dyn),
+                v_dyn: layer.v_sconv_dyn_proj.map(|_| self.scratch.v_dyn),
+                sconv_k: st.sconv_k,
+                sconv_v: st.sconv_v,
+                k_w: layer.k_sconv_static,
+                v_w: layer.v_sconv_static,
+                q_scale: layer.q_l2_clip_scale,
+                r_scale: layer.rel_l2_clip_scale,
+                rel_proj: layer.rel_logits_proj,
+                rel_table: self.scratch.rel_table,
+                k_cache: st.k_cache,
+                k_scales: st.k_scales,
+                v_cache: st.v_cache,
+                v_scales: st.v_scales,
+                n_q_heads: self.cfg.num_attention_heads,
+                n_kv_heads: self.cfg.num_key_value_heads,
+                max_seq: st.max_seq,
+                slot: slot_pos,
+                rel_extent: self.cfg.rel_extent,
+                qk_threshold: self.cfg.qk_l2_clip_threshold,
+                rel_threshold: self.cfg.rel_l2_clip_threshold,
+                tau,
+                eps,
+            },
             s,
         )?;
         let dt_sc = self.prof_end(t_sc, s);

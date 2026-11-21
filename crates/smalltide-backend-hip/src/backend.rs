@@ -9,7 +9,7 @@ use crate::ffi::{
     HIP_MEMCPY_DEVICE_TO_DEVICE, HIP_MEMCPY_DEVICE_TO_HOST,
     HIP_MEMCPY_HOST_TO_DEVICE, HIP_STREAM_CAPTURE_MODE_GLOBAL, HIP_STREAM_NON_BLOCKING,
 };
-use smalltide_core::backend::{FlashDecodeParams, GemvSegment, GroupedMoeParams, MoeDispatchParams, PrefillAttnParams};
+use smalltide_core::backend::{AttnPrepParams, FlashDecodeParams, GemvSegment, GroupedMoeParams, MoeDispatchParams, PrefillAttnParams};
 use smalltide_core::{
     ComputeBackend, DType, DeviceBuf, DeviceInfo, Event, Graph, PinnedBuf, QueueKind, Result,
     SmallTideError, Stream,
@@ -1726,6 +1726,74 @@ impl ComputeBackend for HipBackend {
         let (mut k, mut h) = (top_k as u32, hidden as u32);
         let mut args = [p(&mut a), p(&mut bt), p(&mut c), p(&mut d), p(&mut e), p(&mut k), p(&mut f), p(&mut g), p(&mut r), p(&mut h)];
         self.launch(self.kernels.moe_post_decode, (h.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(moe_post_decode)")
+    }
+
+    fn attn_prep_decode(&self, pp: AttnPrepParams, stream: Stream) -> Result<()> {
+        #[repr(C)]
+        struct ArgsC {
+            q: *mut c_void,
+            r: *mut c_void,
+            k_raw: *mut c_void,
+            v_raw: *mut c_void,
+            k_dyn: *mut c_void,
+            v_dyn: *mut c_void,
+            sconv_k: *mut c_void,
+            sconv_v: *mut c_void,
+            k_w: *mut c_void,
+            v_w: *mut c_void,
+            q_scale: *mut c_void,
+            r_scale: *mut c_void,
+            rel_proj: *mut c_void,
+            rel_table: *mut c_void,
+            k_cache: *mut c_void,
+            k_scales: *mut c_void,
+            v_cache: *mut c_void,
+            v_scales: *mut c_void,
+            n_q: u32,
+            n_kv: u32,
+            max_seq: u32,
+            slot: u32,
+            rel_extent: u32,
+            qk_thr: f32,
+            rel_thr: f32,
+            tau: f32,
+            eps: f32,
+        }
+        if pp.n_q_heads == 0 || pp.n_kv_heads == 0 {
+            return Err(SmallTideError::Backend { backend: "hip", message: "attn_prep_decode: bad head counts".into() });
+        }
+        let mut a = ArgsC {
+            q: self.dev_ptr(pp.q)?,
+            r: self.dev_ptr(pp.r)?,
+            k_raw: self.dev_ptr(pp.k_raw)?,
+            v_raw: self.dev_ptr(pp.v_raw)?,
+            k_dyn: self.opt_dev_ptr(pp.k_dyn)?,
+            v_dyn: self.opt_dev_ptr(pp.v_dyn)?,
+            sconv_k: self.dev_ptr(pp.sconv_k)?,
+            sconv_v: self.dev_ptr(pp.sconv_v)?,
+            k_w: self.dev_ptr(pp.k_w)?,
+            v_w: self.dev_ptr(pp.v_w)?,
+            q_scale: self.dev_ptr(pp.q_scale)?,
+            r_scale: self.dev_ptr(pp.r_scale)?,
+            rel_proj: self.dev_ptr(pp.rel_proj)?,
+            rel_table: self.dev_ptr(pp.rel_table)?,
+            k_cache: self.dev_ptr(pp.k_cache)?,
+            k_scales: self.dev_ptr(pp.k_scales)?,
+            v_cache: self.dev_ptr(pp.v_cache)?,
+            v_scales: self.dev_ptr(pp.v_scales)?,
+            n_q: pp.n_q_heads as u32,
+            n_kv: pp.n_kv_heads as u32,
+            max_seq: pp.max_seq as u32,
+            slot: pp.slot as u32,
+            rel_extent: pp.rel_extent as u32,
+            qk_thr: pp.qk_threshold,
+            rel_thr: pp.rel_threshold,
+            tau: pp.tau,
+            eps: pp.eps,
+        };
+        let blocks = (pp.n_kv_heads + 2 * pp.n_q_heads) as u32;
+        let mut args = [p(&mut a)];
+        self.launch(self.kernels.attn_prep_decode, (blocks, 1, 1), 128, &mut args, stream, "launch(attn_prep_decode)")
     }
 
     fn gemv_multi(&self, segs: &[GemvSegment], stream: Stream) -> Result<()> {

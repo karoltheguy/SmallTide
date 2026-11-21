@@ -365,3 +365,126 @@ extern "C" __global__ void smalltide_gemv_multi(GemvMultiArgs a) {
     float s = wave32_sum((a0 + a1) + (a2 + a3));
     if (lane == 0u) sg.y[row] = s * sg.scale[row];
 }
+
+// ---------------------------------------------------------------------------
+// Fused decode attention prep (one launch instead of ~10):
+//   blocks [0, n_kv)           : K and V of one KV head: causal sconv (static + optional dynamic
+//                                taps, state update), K L2 clip, V unit RMS norm, FP8 KV store
+//   blocks [n_kv, n_kv+n_q)    : Q head: scaled L2 clip, then tau (global layers)
+//   blocks [n_kv+n_q, +n_q)    : R head (d_rel=16): scaled L2 clip, tau, relative bias table row
+//   Block: 128 threads (= head_dim)
+// ---------------------------------------------------------------------------
+struct AttnPrepArgs {
+    float* q;               // [n_q, 128] in place
+    float* r;               // [n_q, 16] in place
+    const float* k_raw;     // [n_kv*128]
+    const float* v_raw;
+    const float* k_dyn;     // nullable [n_kv*4]
+    const float* v_dyn;
+    float* sconv_k;         // [3][n_kv*128]
+    float* sconv_v;
+    const float* k_w;       // [n_kv*128][4]
+    const float* v_w;
+    const float* q_scale;   // [n_q][128]
+    const float* r_scale;   // [n_q][16]
+    const float* rel_proj;  // [rel_extent][16]
+    float* rel_table;       // [n_q][rel_extent]
+    uint8_t* k_cache;
+    float* k_scales;
+    uint8_t* v_cache;
+    float* v_scales;
+    uint32_t n_q;
+    uint32_t n_kv;
+    uint32_t max_seq;
+    uint32_t slot;
+    uint32_t rel_extent;
+    float qk_thr;
+    float rel_thr;
+    float tau;
+    float eps;
+};
+
+__device__ __forceinline__ float block128_sum(float v, float* sh) {
+    v = wave32_sum(v);
+    __syncthreads();
+    if ((threadIdx.x & 31u) == 0u) sh[threadIdx.x >> 5] = v;
+    __syncthreads();
+    return sh[0] + sh[1] + sh[2] + sh[3];
+}
+
+__device__ __forceinline__ float block128_max(float v, float* sh) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o, 32));
+    __syncthreads();
+    if ((threadIdx.x & 31u) == 0u) sh[threadIdx.x >> 5] = v;
+    __syncthreads();
+    return fmaxf(fmaxf(sh[0], sh[1]), fmaxf(sh[2], sh[3]));
+}
+
+__device__ __forceinline__ float sconv_step(float* st, const float* w4, const float* dyn, uint32_t c, uint32_t dim,
+                                            float cur, uint32_t head) {
+    float s0 = st[c], s1 = st[dim + c], s2 = st[2u * dim + c];
+    const float4 w = reinterpret_cast<const float4*>(w4)[c];
+    float y = fmaf(s0, w.x, fmaf(s1, w.y, fmaf(s2, w.z, cur * w.w)));
+    if (dyn != nullptr) {
+        const float4 d = reinterpret_cast<const float4*>(dyn)[head];
+        y = fmaf(cur, d.x, fmaf(s2, d.y, fmaf(s1, d.z, fmaf(s0, d.w, y))));
+        y = (cur + y) * (1.0f / 3.0f);
+    } else {
+        y = (cur + y) * 0.4472135954999579f;
+    }
+    st[c] = s1; st[dim + c] = s2; st[2u * dim + c] = cur;
+    return y;
+}
+
+extern "C" __global__ void smalltide_attn_prep_decode(AttnPrepArgs a) {
+    __shared__ float sh[4];
+    uint32_t b = blockIdx.x, t = threadIdx.x;
+    if (b < a.n_kv) {
+        uint32_t h = b, dim = a.n_kv * 128u, c = h * 128u + t;
+        float k = sconv_step(a.sconv_k, a.k_w, a.k_dyn, c, dim, a.k_raw[c], h);
+        float v = sconv_step(a.sconv_v, a.v_w, a.v_dyn, c, dim, a.v_raw[c], h);
+        // K: L2 clip
+        float kn = sqrtf(block128_sum(k * k, sh)) + 1e-6f;
+        k *= fminf(a.qk_thr / kn, 1.0f);
+        // V: unit RMS norm (no gamma)
+        float vs = block128_sum(v * v, sh);
+        v *= rsqrtf(vs / 128.0f + a.eps);
+        // FP8 store with per-(head, token) absmax scales
+        float km = block128_max(fabsf(k), sh);
+        float vm = block128_max(fabsf(v), sh);
+        float ks = (km > 0.0f) ? km / 448.0f : 1.0f;
+        float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
+        size_t si = static_cast<size_t>(h) * a.max_seq + a.slot;
+        if (t == 0u) { a.k_scales[si] = ks; a.v_scales[si] = vsc; }
+        a.k_cache[si * 128u + t] = encode_fp8_e4m3fn(k / ks);
+        a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);
+        return;
+    }
+    b -= a.n_kv;
+    if (b < a.n_q) {
+        float* row = a.q + b * 128u;
+        float x = row[t] * a.q_scale[b * 128u + t];
+        float n = sqrtf(block128_sum(x * x, sh)) + 1e-6f;
+        row[t] = x * fminf(a.qk_thr / n, 1.0f) * a.tau;
+        return;
+    }
+    b -= a.n_q;
+    if (b < a.n_q) {
+        __shared__ float rr[16];
+        float x = (t < 16u) ? a.r[b * 16u + t] * a.r_scale[b * 16u + t] : 0.0f;
+        float n = sqrtf(block128_sum(x * x, sh)) + 1e-6f;
+        float y = x * fminf(a.rel_thr / n, 1.0f) * a.tau;
+        if (t < 16u) { a.r[b * 16u + t] = y; rr[t] = y; }
+        __syncthreads();
+        for (uint32_t d = t; d < a.rel_extent; d += 128u) {
+            const float4* pr = reinterpret_cast<const float4*>(a.rel_proj + static_cast<size_t>(d) * 16u);
+            float acc = 0.0f;
+            #pragma unroll
+            for (uint32_t i = 0u; i < 4u; ++i) {
+                float4 pv = pr[i];
+                acc = fmaf(pv.x, rr[4u * i], fmaf(pv.y, rr[4u * i + 1u], fmaf(pv.z, rr[4u * i + 2u], fmaf(pv.w, rr[4u * i + 3u], acc))));
+            }
+            a.rel_table[static_cast<size_t>(b) * a.rel_extent + d] = acc;
+        }
+    }
+}

@@ -135,6 +135,38 @@ pub struct GemvSegment {
     pub k_cols: usize,
 }
 
+/// Inputs/outputs of the fused decode attention prep (see `ComputeBackend::attn_prep_decode`).
+#[derive(Debug, Clone, Copy)]
+pub struct AttnPrepParams {
+    pub q: DeviceBuf,
+    pub r: DeviceBuf,
+    pub k_raw: DeviceBuf,
+    pub v_raw: DeviceBuf,
+    pub k_dyn: Option<DeviceBuf>,
+    pub v_dyn: Option<DeviceBuf>,
+    pub sconv_k: DeviceBuf,
+    pub sconv_v: DeviceBuf,
+    pub k_w: DeviceBuf,
+    pub v_w: DeviceBuf,
+    pub q_scale: DeviceBuf,
+    pub r_scale: DeviceBuf,
+    pub rel_proj: DeviceBuf,
+    pub rel_table: DeviceBuf,
+    pub k_cache: DeviceBuf,
+    pub k_scales: DeviceBuf,
+    pub v_cache: DeviceBuf,
+    pub v_scales: DeviceBuf,
+    pub n_q_heads: usize,
+    pub n_kv_heads: usize,
+    pub max_seq: usize,
+    pub slot: usize,
+    pub rel_extent: usize,
+    pub qk_threshold: f32,
+    pub rel_threshold: f32,
+    pub tau: f32,
+    pub eps: f32,
+}
+
 /// Minimal backend-agnostic compute & async-transfer abstraction.
 pub trait ComputeBackend: Send + Sync {
     fn device_info(&self) -> Result<DeviceInfo>;
@@ -565,6 +597,10 @@ pub trait ComputeBackend: Send + Sync {
     fn moe_decode_post(&self, out: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, topk_ids: DeviceBuf,
         topk_weights: DeviceBuf, top_k: usize, sconv: Option<(DeviceBuf, DeviceBuf, DeviceBuf)>,
         hidden: usize, stream: Stream) -> Result<()>;
+
+    /// One decode token's attention prep: K/V short convs (+dynamic taps), K L2 clip, V unit
+    /// RMS norm, FP8 KV store at `slot`, Q/R scaled L2 clip (+tau) and the relative-bias table.
+    fn attn_prep_decode(&self, p: AttnPrepParams, stream: Stream) -> Result<()>;
 
     /// Several independent GEMVs in as few launches as possible (8 segments per launch).
     fn gemv_multi(&self, segs: &[GemvSegment], stream: Stream) -> Result<()>;

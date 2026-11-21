@@ -1,0 +1,1225 @@
+//! `HipBackend` implementing the backend-agnostic `smalltide_core::ComputeBackend` trait.
+//!
+//! All ROCm/HIP handles (`*mut c_void`, `HipStream`, `HipEvent`, `HipGraphExec`) remain strictly
+//! internal to this crate behind opaque integer handles (`DeviceBuf`, `PinnedBuf`, `Stream`, `Event`, `Graph`).
+
+use crate::ffi::{
+    check_hip, CoreKernels, HipEvent, HipGraph, HipGraphExec, HipRuntime, HipStream,
+    HIP_EVENT_DISABLE_TIMING, HIP_HOST_MALLOC_DEFAULT, HIP_MEMCPY_DEVICE_TO_HOST,
+    HIP_MEMCPY_HOST_TO_DEVICE, HIP_STREAM_CAPTURE_MODE_GLOBAL, HIP_STREAM_NON_BLOCKING,
+};
+use smalltide_core::backend::{FlashDecodeParams, MoeDispatchParams};
+use smalltide_core::{
+    ComputeBackend, DType, DeviceBuf, DeviceInfo, Event, Graph, PinnedBuf, QueueKind, Result,
+    SmallTideError, Stream,
+};
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+struct DeviceAlloc {
+    ptr: *mut c_void,
+    size_bytes: usize,
+}
+unsafe impl Send for DeviceAlloc {}
+
+struct PinnedAlloc {
+    ptr: *mut c_void,
+    size_bytes: usize,
+}
+unsafe impl Send for PinnedAlloc {}
+
+struct GraphEntry {
+    graph: HipGraph,
+    exec: HipGraphExec,
+}
+unsafe impl Send for GraphEntry {}
+
+struct StreamEntry(HipStream);
+unsafe impl Send for StreamEntry {}
+
+struct EventEntry(HipEvent);
+unsafe impl Send for EventEntry {}
+
+pub struct HipBackend {
+    rt: HipRuntime,
+    kernels: CoreKernels,
+    device_id: i32,
+    next_id: AtomicU64,
+    dev_bufs: Mutex<HashMap<u64, DeviceAlloc>>,
+    pinned_bufs: Mutex<HashMap<u64, PinnedAlloc>>,
+    streams: Mutex<HashMap<u64, StreamEntry>>,
+    events: Mutex<HashMap<u64, EventEntry>>,
+    graphs: Mutex<HashMap<u64, GraphEntry>>,
+}
+
+unsafe impl Send for HipBackend {}
+unsafe impl Sync for HipBackend {}
+
+impl HipBackend {
+    pub fn new(device_id: i32) -> Result<Self> {
+        let rt = HipRuntime::load()?;
+        let _ = rt.probe_device(device_id)?;
+        let kernels = rt.load_core_kernels()?;
+        Ok(Self {
+            rt,
+            kernels,
+            device_id,
+            next_id: AtomicU64::new(1),
+            dev_bufs: Mutex::new(HashMap::new()),
+            pinned_bufs: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
+            events: Mutex::new(HashMap::new()),
+            graphs: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn next_handle(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn dev_ptr(&self, buf: DeviceBuf) -> Result<*mut c_void> {
+        let guard = self.dev_bufs.lock().unwrap();
+        let a = guard.get(&buf.id).ok_or_else(|| SmallTideError::Backend {
+            backend: "hip",
+            message: format!("invalid DeviceBuf id={}", buf.id),
+        })?;
+        if buf.offset_bytes + buf.size_bytes > a.size_bytes {
+            return Err(SmallTideError::Backend {
+                backend: "hip",
+                message: format!(
+                    "DeviceBuf slice out of bounds: {} + {} > {}",
+                    buf.offset_bytes, buf.size_bytes, a.size_bytes
+                ),
+            });
+        }
+        Ok(unsafe { (a.ptr as *mut u8).add(buf.offset_bytes) as *mut c_void })
+    }
+
+    fn opt_dev_ptr(&self, buf: Option<DeviceBuf>) -> Result<*mut c_void> {
+        match buf {
+            Some(b) => self.dev_ptr(b),
+            None => Ok(ptr::null_mut()),
+        }
+    }
+
+    fn pinned_entry(&self, buf: PinnedBuf) -> Result<(*mut c_void, usize)> {
+        let guard = self.pinned_bufs.lock().unwrap();
+        guard
+            .get(&buf.id)
+            .map(|a| (a.ptr, a.size_bytes))
+            .ok_or_else(|| SmallTideError::Backend {
+                backend: "hip",
+                message: format!("invalid PinnedBuf id={}", buf.id),
+            })
+    }
+
+    fn raw_stream(&self, stream: Stream) -> Result<HipStream> {
+        if stream.0 == 0 {
+            return Ok(ptr::null_mut());
+        }
+        let guard = self.streams.lock().unwrap();
+        guard
+            .get(&stream.0)
+            .map(|s| s.0)
+            .ok_or_else(|| SmallTideError::Backend {
+                backend: "hip",
+                message: format!("invalid Stream id={}", stream.0),
+            })
+    }
+
+    fn raw_event(&self, event: Event) -> Result<HipEvent> {
+        let guard = self.events.lock().unwrap();
+        guard
+            .get(&event.0)
+            .map(|e| e.0)
+            .ok_or_else(|| SmallTideError::Backend {
+                backend: "hip",
+                message: format!("invalid Event id={}", event.0),
+            })
+    }
+}
+
+impl Drop for HipBackend {
+    fn drop(&mut self) {
+        for (_, g) in self.graphs.get_mut().unwrap().drain() {
+            unsafe {
+                let _ = (self.rt.hip_graph_exec_destroy)(g.exec);
+                let _ = (self.rt.hip_graph_destroy)(g.graph);
+            }
+        }
+        for (_, e) in self.events.get_mut().unwrap().drain() {
+            unsafe { let _ = (self.rt.hip_event_destroy)(e.0); }
+        }
+        for (_, s) in self.streams.get_mut().unwrap().drain() {
+            unsafe { let _ = (self.rt.hip_stream_destroy)(s.0); }
+        }
+        for (_, p) in self.pinned_bufs.get_mut().unwrap().drain() {
+            unsafe { let _ = (self.rt.hip_host_free)(p.ptr); }
+        }
+        for (_, d) in self.dev_bufs.get_mut().unwrap().drain() {
+            unsafe { let _ = (self.rt.hip_free)(d.ptr); }
+        }
+        unsafe {
+            let _ = (self.rt.hip_module_unload)(self.kernels.module);
+        }
+    }
+}
+
+impl ComputeBackend for HipBackend {
+    fn device_info(&self) -> Result<DeviceInfo> {
+        let r = self.rt.probe_device(self.device_id)?;
+        Ok(DeviceInfo {
+            backend_name: "hip",
+            device_name: r.device_name,
+            arch_name: "gfx1201".into(),
+            total_vram_bytes: r.total_vram_bytes,
+            free_vram_bytes: r.free_vram_bytes,
+            supports_fp8_wmma: true,
+            supports_graphs: true,
+        })
+    }
+
+    fn alloc_device(&self, size_bytes: usize) -> Result<DeviceBuf> {
+        let mut ptr: *mut c_void = ptr::null_mut();
+        unsafe { check_hip((self.rt.hip_malloc)(&mut ptr, size_bytes), "hipMalloc")? };
+        let id = self.next_handle();
+        self.dev_bufs
+            .lock()
+            .unwrap()
+            .insert(id, DeviceAlloc { ptr, size_bytes });
+        Ok(DeviceBuf { id, offset_bytes: 0, size_bytes })
+    }
+
+    fn free_device(&self, buf: DeviceBuf) -> Result<()> {
+        if buf.offset_bytes != 0 {
+            return Err(SmallTideError::Backend {
+                backend: "hip",
+                message: "cannot free a DeviceBuf sub-slice".into(),
+            });
+        }
+        if let Some(a) = self.dev_bufs.lock().unwrap().remove(&buf.id) {
+            unsafe { check_hip((self.rt.hip_free)(a.ptr), "hipFree")? };
+        }
+        Ok(())
+    }
+
+    fn alloc_pinned(&self, size_bytes: usize) -> Result<PinnedBuf> {
+        let mut ptr: *mut c_void = ptr::null_mut();
+        unsafe {
+            check_hip(
+                (self.rt.hip_host_malloc)(&mut ptr, size_bytes, HIP_HOST_MALLOC_DEFAULT),
+                "hipHostMalloc",
+            )?;
+        }
+        let id = self.next_handle();
+        self.pinned_bufs
+            .lock()
+            .unwrap()
+            .insert(id, PinnedAlloc { ptr, size_bytes });
+        Ok(PinnedBuf { id, size_bytes })
+    }
+
+    fn free_pinned(&self, buf: PinnedBuf) -> Result<()> {
+        if let Some(a) = self.pinned_bufs.lock().unwrap().remove(&buf.id) {
+            unsafe { check_hip((self.rt.hip_host_free)(a.ptr), "hipHostFree")? };
+        }
+        Ok(())
+    }
+
+    unsafe fn pinned_as_mut_slice(&self, buf: PinnedBuf) -> Result<&mut [u8]> {
+        let (ptr, len) = self.pinned_entry(buf)?;
+        Ok(std::slice::from_raw_parts_mut(ptr as *mut u8, len))
+    }
+
+    fn create_stream(&self, _kind: QueueKind) -> Result<Stream> {
+        let mut s: HipStream = ptr::null_mut();
+        unsafe {
+            check_hip(
+                (self.rt.hip_stream_create_with_flags)(&mut s, HIP_STREAM_NON_BLOCKING),
+                "hipStreamCreateWithFlags",
+            )?;
+        }
+        let id = self.next_handle();
+        self.streams.lock().unwrap().insert(id, StreamEntry(s));
+        Ok(Stream(id))
+    }
+
+    fn destroy_stream(&self, stream: Stream) -> Result<()> {
+        if let Some(s) = self.streams.lock().unwrap().remove(&stream.0) {
+            unsafe { check_hip((self.rt.hip_stream_destroy)(s.0), "hipStreamDestroy")? };
+        }
+        Ok(())
+    }
+
+    fn create_event(&self) -> Result<Event> {
+        let mut e: HipEvent = ptr::null_mut();
+        unsafe {
+            check_hip(
+                (self.rt.hip_event_create_with_flags)(&mut e, HIP_EVENT_DISABLE_TIMING),
+                "hipEventCreateWithFlags",
+            )?;
+        }
+        let id = self.next_handle();
+        self.events.lock().unwrap().insert(id, EventEntry(e));
+        Ok(Event(id))
+    }
+
+    fn destroy_event(&self, event: Event) -> Result<()> {
+        if let Some(e) = self.events.lock().unwrap().remove(&event.0) {
+            unsafe { check_hip((self.rt.hip_event_destroy)(e.0), "hipEventDestroy")? };
+        }
+        Ok(())
+    }
+
+    fn record_event(&self, event: Event, stream: Stream) -> Result<()> {
+        let e = self.raw_event(event)?;
+        let s = self.raw_stream(stream)?;
+        unsafe { check_hip((self.rt.hip_event_record)(e, s), "hipEventRecord") }
+    }
+
+    fn stream_wait_event(&self, stream: Stream, event: Event) -> Result<()> {
+        let e = self.raw_event(event)?;
+        let s = self.raw_stream(stream)?;
+        unsafe { check_hip((self.rt.hip_stream_wait_event)(s, e, 0), "hipStreamWaitEvent") }
+    }
+
+    fn sync_event(&self, event: Event) -> Result<()> {
+        let e = self.raw_event(event)?;
+        unsafe { check_hip((self.rt.hip_event_synchronize)(e), "hipEventSynchronize") }
+    }
+
+    fn sync_stream(&self, stream: Stream) -> Result<()> {
+        let s = self.raw_stream(stream)?;
+        unsafe { check_hip((self.rt.hip_stream_synchronize)(s), "hipStreamSynchronize") }
+    }
+
+    fn memcpy_h2d_async(
+        &self,
+        dst: DeviceBuf,
+        dst_offset: usize,
+        src: PinnedBuf,
+        src_offset: usize,
+        len: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let d = self.dev_ptr(dst)?;
+        let (h, h_len) = self.pinned_entry(src)?;
+        if dst_offset + len > dst.size_bytes || src_offset + len > h_len {
+            return Err(SmallTideError::Backend {
+                backend: "hip",
+                message: "memcpy_h2d_async out of bounds".into(),
+            });
+        }
+        let s = self.raw_stream(stream)?;
+        unsafe {
+            let dst_p = (d as *mut u8).add(dst_offset) as *mut c_void;
+            let src_p = (h as *const u8).add(src_offset) as *const c_void;
+            check_hip(
+                (self.rt.hip_memcpy_async)(dst_p, src_p, len, HIP_MEMCPY_HOST_TO_DEVICE, s),
+                "hipMemcpyAsync(H2D)",
+            )
+        }
+    }
+
+    fn memcpy_d2h_sync(
+        &self,
+        dst: &mut [u8],
+        src: DeviceBuf,
+        src_offset: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let d = self.dev_ptr(src)?;
+        if src_offset + dst.len() > src.size_bytes {
+            return Err(SmallTideError::Backend {
+                backend: "hip",
+                message: "memcpy_d2h_sync out of bounds".into(),
+            });
+        }
+        self.sync_stream(stream)?;
+        unsafe {
+            let src_p = (d as *const u8).add(src_offset) as *const c_void;
+            check_hip(
+                (self.rt.hip_memcpy)(
+                    dst.as_mut_ptr() as *mut c_void,
+                    src_p,
+                    dst.len(),
+                    HIP_MEMCPY_DEVICE_TO_HOST,
+                ),
+                "hipMemcpy(D2H)",
+            )
+        }
+    }
+
+    fn begin_graph_capture(&self, stream: Stream) -> Result<()> {
+        let s = self.raw_stream(stream)?;
+        unsafe {
+            check_hip(
+                (self.rt.hip_stream_begin_capture)(s, HIP_STREAM_CAPTURE_MODE_GLOBAL),
+                "hipStreamBeginCapture",
+            )
+        }
+    }
+
+    fn end_graph_capture(&self, stream: Stream) -> Result<Graph> {
+        let s = self.raw_stream(stream)?;
+        let mut graph: HipGraph = ptr::null_mut();
+        let mut exec: HipGraphExec = ptr::null_mut();
+        unsafe {
+            check_hip((self.rt.hip_stream_end_capture)(s, &mut graph), "hipStreamEndCapture")?;
+            check_hip(
+                (self.rt.hip_graph_instantiate)(&mut exec, graph, ptr::null_mut(), ptr::null_mut(), 0),
+                "hipGraphInstantiate",
+            )?;
+        }
+        let id = self.next_handle();
+        self.graphs
+            .lock()
+            .unwrap()
+            .insert(id, GraphEntry { graph, exec });
+        Ok(Graph(id))
+    }
+
+    fn launch_graph(&self, graph: Graph, stream: Stream) -> Result<()> {
+        let s = self.raw_stream(stream)?;
+        let exec = {
+            let guard = self.graphs.lock().unwrap();
+            guard
+                .get(&graph.0)
+                .map(|g| g.exec)
+                .ok_or_else(|| SmallTideError::Backend {
+                    backend: "hip",
+                    message: format!("invalid Graph id={}", graph.0),
+                })?
+        };
+        unsafe { check_hip((self.rt.hip_graph_launch)(exec, s), "hipGraphLaunch") }
+    }
+
+    fn destroy_graph(&self, graph: Graph) -> Result<()> {
+        if let Some(g) = self.graphs.lock().unwrap().remove(&graph.0) {
+            unsafe {
+                let _ = (self.rt.hip_graph_exec_destroy)(g.exec);
+                let _ = (self.rt.hip_graph_destroy)(g.graph);
+            }
+        }
+        Ok(())
+    }
+
+    fn rms_norm(
+        &self,
+        out: DeviceBuf,
+        x: DeviceBuf,
+        weight: DeviceBuf,
+        rows: usize,
+        hidden: usize,
+        eps: f32,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_o = self.dev_ptr(out)?;
+        let mut d_x = self.dev_ptr(x)?;
+        let mut d_w = self.dev_ptr(weight)?;
+        let s = self.raw_stream(stream)?;
+        let mut h_arg = hidden as u32;
+        let mut eps_arg = eps;
+        let mut params: [*mut c_void; 5] = [
+            &mut d_o as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+            &mut d_w as *mut _ as *mut c_void,
+            &mut h_arg as *mut _ as *mut c_void,
+            &mut eps_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.rmsnorm_f32, rows as u32, 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(rmsnorm_f32)",
+            )
+        }
+    }
+
+    fn matmul(
+        &self,
+        out: DeviceBuf,
+        x: DeviceBuf,
+        weight: DeviceBuf,
+        weight_dtype: DType,
+        m: usize,
+        n: usize,
+        k: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        if m != 1 || weight_dtype != DType::FP8E4M3 {
+            return Err(SmallTideError::Unsupported(format!(
+                "HipBackend::matmul currently implements m=1 FP8E4M3 (got m={m}, dtype={weight_dtype:?})"
+            )));
+        }
+        let mut d_y = self.dev_ptr(out)?;
+        let mut d_x = self.dev_ptr(x)?;
+        let mut d_w = self.dev_ptr(weight)?;
+        let mut d_s: *mut c_void = ptr::null_mut();
+        let s = self.raw_stream(stream)?;
+        let mut n_arg = n as u32;
+        let mut k_arg = k as u32;
+        let mut params: [*mut c_void; 6] = [
+            &mut d_y as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+            &mut d_w as *mut _ as *mut c_void,
+            &mut d_s as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+            &mut k_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.gemv_fp8_e4m3_f32, n_arg.div_ceil(4), 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(gemv_fp8_e4m3_f32)",
+            )
+        }
+    }
+
+    fn gemv_fp8(
+        &self,
+        out: DeviceBuf,
+        x: DeviceBuf,
+        w_fp8: DeviceBuf,
+        row_scales: DeviceBuf,
+        n_rows: usize,
+        k_cols: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_y = self.dev_ptr(out)?;
+        let mut d_x = self.dev_ptr(x)?;
+        let mut d_w = self.dev_ptr(w_fp8)?;
+        let mut d_s = self.dev_ptr(row_scales)?;
+        let s = self.raw_stream(stream)?;
+        let mut n_arg = n_rows as u32;
+        let mut k_arg = k_cols as u32;
+        let mut params: [*mut c_void; 6] = [
+            &mut d_y as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+            &mut d_w as *mut _ as *mut c_void,
+            &mut d_s as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+            &mut k_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.gemv_fp8_e4m3_f32, n_arg.div_ceil(4), 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(gemv_fp8_e4m3_f32)",
+            )
+        }
+    }
+
+    fn gemv_f32(
+        &self,
+        out: DeviceBuf,
+        x: DeviceBuf,
+        w_f32: DeviceBuf,
+        n_rows: usize,
+        k_cols: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_y = self.dev_ptr(out)?;
+        let mut d_x = self.dev_ptr(x)?;
+        let mut d_w = self.dev_ptr(w_f32)?;
+        let s = self.raw_stream(stream)?;
+        let mut n_arg = n_rows as u32;
+        let mut k_arg = k_cols as u32;
+        let mut params: [*mut c_void; 5] = [
+            &mut d_y as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+            &mut d_w as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+            &mut k_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.gemv_f32, n_arg.div_ceil(4), 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(gemv_f32)",
+            )
+        }
+    }
+
+    fn moe_swiglu_indirect(
+        &self,
+        out: DeviceBuf,
+        x: DeviceBuf,
+        expert_pool: DeviceBuf,
+        slot_table: DeviceBuf,
+        topk_ids: DeviceBuf,
+        topk_weights: DeviceBuf,
+        params: MoeDispatchParams,
+        stream: Stream,
+    ) -> Result<()> {
+        let mid_buf = self.alloc_device(params.top_k * params.intermediate_size * 4)?;
+        let res = self.moe_swiglu_indirect_with_scratch(
+            out, mid_buf, x, expert_pool, slot_table, topk_ids, topk_weights, params, stream,
+        );
+        let _ = self.sync_stream(stream);
+        let _ = self.free_device(mid_buf);
+        res
+    }
+
+    fn moe_swiglu_indirect_with_scratch(
+        &self,
+        out: DeviceBuf,
+        mid_scratch: DeviceBuf,
+        x: DeviceBuf,
+        expert_pool: DeviceBuf,
+        slot_table: DeviceBuf,
+        topk_ids: DeviceBuf,
+        topk_weights: DeviceBuf,
+        params: MoeDispatchParams,
+        stream: Stream,
+    ) -> Result<()> {
+        if params.batch_size != 1 {
+            return Err(SmallTideError::Unsupported(
+                "batched MoE GEMM (prefill/dspark) lands in Phase 2b".into(),
+            ));
+        }
+        let mut d_mid = self.dev_ptr(mid_scratch)?;
+        let mut d_out = self.dev_ptr(out)?;
+        let mut d_x = self.dev_ptr(x)?;
+        let mut d_pool = self.dev_ptr(expert_pool)?;
+        let mut d_slots = self.dev_ptr(slot_table)?;
+        let mut d_ids = self.dev_ptr(topk_ids)?;
+        let mut d_w = self.dev_ptr(topk_weights)?;
+        let s = self.raw_stream(stream)?;
+
+        let mut stride_arg = params.expert_stride_bytes as u64;
+        let mut h_arg = params.hidden_size as u32;
+        let mut ff_arg = params.intermediate_size as u32;
+        let mut gcap_arg: f32 = 4.0;
+        let mut ucap_arg: f32 = 25.0;
+        let mut k_arg = params.top_k as u32;
+
+        let mut p1: [*mut c_void; 10] = [
+            &mut d_mid as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+            &mut d_pool as *mut _ as *mut c_void,
+            &mut d_slots as *mut _ as *mut c_void,
+            &mut d_ids as *mut _ as *mut c_void,
+            &mut stride_arg as *mut _ as *mut c_void,
+            &mut h_arg as *mut _ as *mut c_void,
+            &mut ff_arg as *mut _ as *mut c_void,
+            &mut gcap_arg as *mut _ as *mut c_void,
+            &mut ucap_arg as *mut _ as *mut c_void,
+        ];
+        let mut p2: [*mut c_void; 10] = [
+            &mut d_out as *mut _ as *mut c_void,
+            &mut d_mid as *mut _ as *mut c_void,
+            &mut d_pool as *mut _ as *mut c_void,
+            &mut d_slots as *mut _ as *mut c_void,
+            &mut d_ids as *mut _ as *mut c_void,
+            &mut d_w as *mut _ as *mut c_void,
+            &mut stride_arg as *mut _ as *mut c_void,
+            &mut h_arg as *mut _ as *mut c_void,
+            &mut ff_arg as *mut _ as *mut c_void,
+            &mut k_arg as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.moe_w13_swiglu_indirect, ff_arg.div_ceil(4), k_arg, 1, 128, 1, 1, 0, s, p1.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(moe_w13_swiglu_indirect)",
+            )?;
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.moe_w2_accum_indirect, h_arg.div_ceil(4), 1, 1, 128, 1, 1, 0, s, p2.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(moe_w2_accum_indirect)",
+            )
+        }
+    }
+
+    fn router_topk8(
+        &self,
+        topk_ids: DeviceBuf,
+        topk_weights: DeviceBuf,
+        x: DeviceBuf,
+        gate_w: DeviceBuf,
+        gate_b: Option<DeviceBuf>,
+        hidden_size: usize,
+        route_scale: f32,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_ids = self.dev_ptr(topk_ids)?;
+        let mut d_w = self.dev_ptr(topk_weights)?;
+        let mut d_x = self.dev_ptr(x)?;
+        let mut d_gw = self.dev_ptr(gate_w)?;
+        let mut d_gb = self.opt_dev_ptr(gate_b)?;
+        let s = self.raw_stream(stream)?;
+        let mut h_arg = hidden_size as u32;
+        let mut rs_arg = route_scale;
+        let mut params: [*mut c_void; 7] = [
+            &mut d_ids as *mut _ as *mut c_void,
+            &mut d_w as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+            &mut d_gw as *mut _ as *mut c_void,
+            &mut d_gb as *mut _ as *mut c_void,
+            &mut h_arg as *mut _ as *mut c_void,
+            &mut rs_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.router_topk8_f32, 1, 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(router_topk8_f32)",
+            )
+        }
+    }
+
+    fn sconv_k4_decode(
+        &self,
+        out: DeviceBuf,
+        state: DeviceBuf,
+        x: DeviceBuf,
+        weight: DeviceBuf,
+        dyn_taps: Option<DeviceBuf>,
+        dim: usize,
+        head_dim: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_o = self.dev_ptr(out)?;
+        let mut d_st = self.dev_ptr(state)?;
+        let mut d_x = self.dev_ptr(x)?;
+        let mut d_w = self.dev_ptr(weight)?;
+        let mut d_dyn = self.opt_dev_ptr(dyn_taps)?;
+        let s = self.raw_stream(stream)?;
+        let mut dim_arg = dim as u32;
+        let mut hd_arg = head_dim as u32;
+        let mut params: [*mut c_void; 7] = [
+            &mut d_o as *mut _ as *mut c_void,
+            &mut d_st as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+            &mut d_w as *mut _ as *mut c_void,
+            &mut d_dyn as *mut _ as *mut c_void,
+            &mut dim_arg as *mut _ as *mut c_void,
+            &mut hd_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.sconv_k4_decode_f32, dim_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(sconv_k4_decode_f32)",
+            )
+        }
+    }
+
+    fn head_l2_clip(
+        &self,
+        x: DeviceBuf,
+        scale: Option<DeviceBuf>,
+        n_heads: usize,
+        head_dim: usize,
+        threshold: f32,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_x = self.dev_ptr(x)?;
+        let mut d_sc = self.opt_dev_ptr(scale)?;
+        let s = self.raw_stream(stream)?;
+        let mut nh_arg = n_heads as u32;
+        let mut hd_arg = head_dim as u32;
+        let mut thr_arg = threshold;
+        let mut params: [*mut c_void; 5] = [
+            &mut d_x as *mut _ as *mut c_void,
+            &mut d_sc as *mut _ as *mut c_void,
+            &mut nh_arg as *mut _ as *mut c_void,
+            &mut hd_arg as *mut _ as *mut c_void,
+            &mut thr_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.head_l2_clip_f32, nh_arg, 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(head_l2_clip_f32)",
+            )
+        }
+    }
+
+    fn value_norm_no_gamma(
+        &self,
+        v: DeviceBuf,
+        n_kv_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_v = self.dev_ptr(v)?;
+        let s = self.raw_stream(stream)?;
+        let mut nh_arg = n_kv_heads as u32;
+        let mut hd_arg = head_dim as u32;
+        let mut eps_arg = eps;
+        let mut params: [*mut c_void; 4] = [
+            &mut d_v as *mut _ as *mut c_void,
+            &mut nh_arg as *mut _ as *mut c_void,
+            &mut hd_arg as *mut _ as *mut c_void,
+            &mut eps_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.value_norm_no_gamma_f32, nh_arg, 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(value_norm_no_gamma_f32)",
+            )
+        }
+    }
+
+    fn rel_table(
+        &self,
+        table: DeviceBuf,
+        r: DeviceBuf,
+        rel_proj: DeviceBuf,
+        n_heads: usize,
+        rel_extent: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_t = self.dev_ptr(table)?;
+        let mut d_r = self.dev_ptr(r)?;
+        let mut d_p = self.dev_ptr(rel_proj)?;
+        let s = self.raw_stream(stream)?;
+        let mut nh_arg = n_heads as u32;
+        let mut ext_arg = rel_extent as u32;
+        let mut params: [*mut c_void; 5] = [
+            &mut d_t as *mut _ as *mut c_void,
+            &mut d_r as *mut _ as *mut c_void,
+            &mut d_p as *mut _ as *mut c_void,
+            &mut nh_arg as *mut _ as *mut c_void,
+            &mut ext_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.rel_table_f32, ext_arg.div_ceil(128), nh_arg, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(rel_table_f32)",
+            )
+        }
+    }
+
+    fn kv_store_fp8_decode(
+        &self,
+        k_cache: DeviceBuf,
+        k_scales: DeviceBuf,
+        v_cache: DeviceBuf,
+        v_scales: DeviceBuf,
+        k_in: DeviceBuf,
+        v_in: DeviceBuf,
+        n_kv_heads: usize,
+        max_seq: usize,
+        head_dim: usize,
+        slot_pos: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_kc = self.dev_ptr(k_cache)?;
+        let mut d_ks = self.dev_ptr(k_scales)?;
+        let mut d_vc = self.dev_ptr(v_cache)?;
+        let mut d_vs = self.dev_ptr(v_scales)?;
+        let mut d_ki = self.dev_ptr(k_in)?;
+        let mut d_vi = self.dev_ptr(v_in)?;
+        let s = self.raw_stream(stream)?;
+        let mut nkv_arg = n_kv_heads as u32;
+        let mut max_arg = max_seq as u32;
+        let mut hd_arg = head_dim as u32;
+        let mut slot_arg = slot_pos as u32;
+        let mut params: [*mut c_void; 10] = [
+            &mut d_kc as *mut _ as *mut c_void,
+            &mut d_ks as *mut _ as *mut c_void,
+            &mut d_vc as *mut _ as *mut c_void,
+            &mut d_vs as *mut _ as *mut c_void,
+            &mut d_ki as *mut _ as *mut c_void,
+            &mut d_vi as *mut _ as *mut c_void,
+            &mut nkv_arg as *mut _ as *mut c_void,
+            &mut max_arg as *mut _ as *mut c_void,
+            &mut hd_arg as *mut _ as *mut c_void,
+            &mut slot_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.kv_store_fp8_decode, nkv_arg, 1, 1, hd_arg, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(kv_store_fp8_decode)",
+            )
+        }
+    }
+
+    fn flash_decode_fp8(
+        &self,
+        out: DeviceBuf,
+        partial_out: DeviceBuf,
+        partial_m: DeviceBuf,
+        partial_l: DeviceBuf,
+        q: DeviceBuf,
+        k_cache: DeviceBuf,
+        k_scales: DeviceBuf,
+        v_cache: DeviceBuf,
+        v_scales: DeviceBuf,
+        rel_table: Option<DeviceBuf>,
+        sink_logit: Option<DeviceBuf>,
+        params: FlashDecodeParams,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_out = self.dev_ptr(out)?;
+        let mut d_po = self.dev_ptr(partial_out)?;
+        let mut d_pm = self.dev_ptr(partial_m)?;
+        let mut d_pl = self.dev_ptr(partial_l)?;
+        let mut d_q = self.dev_ptr(q)?;
+        let mut d_kc = self.dev_ptr(k_cache)?;
+        let mut d_ks = self.dev_ptr(k_scales)?;
+        let mut d_vc = self.dev_ptr(v_cache)?;
+        let mut d_vs = self.dev_ptr(v_scales)?;
+        let mut d_rel = self.opt_dev_ptr(rel_table)?;
+        let mut d_sink = self.opt_dev_ptr(sink_logit)?;
+        let s = self.raw_stream(stream)?;
+
+        let mut nq_arg = params.n_q_heads as u32;
+        let mut nkv_arg = params.n_kv_heads as u32;
+        let mut max_arg = params.max_seq as u32;
+        let mut qpos_arg = params.q_pos as u32;
+        let mut rext_arg = params.rel_extent as u32;
+        let mut loc_arg: u32 = if params.is_local { 1 } else { 0 };
+        let mut splits_arg = params.num_splits as u32;
+        let mut inv_sqrt_d = params.inv_sqrt_d;
+
+        let mut p1: [*mut c_void; 17] = [
+            &mut d_po as *mut _ as *mut c_void,
+            &mut d_pm as *mut _ as *mut c_void,
+            &mut d_pl as *mut _ as *mut c_void,
+            &mut d_q as *mut _ as *mut c_void,
+            &mut d_kc as *mut _ as *mut c_void,
+            &mut d_ks as *mut _ as *mut c_void,
+            &mut d_vc as *mut _ as *mut c_void,
+            &mut d_vs as *mut _ as *mut c_void,
+            &mut d_rel as *mut _ as *mut c_void,
+            &mut nq_arg as *mut _ as *mut c_void,
+            &mut nkv_arg as *mut _ as *mut c_void,
+            &mut max_arg as *mut _ as *mut c_void,
+            &mut qpos_arg as *mut _ as *mut c_void,
+            &mut rext_arg as *mut _ as *mut c_void,
+            &mut loc_arg as *mut _ as *mut c_void,
+            &mut splits_arg as *mut _ as *mut c_void,
+            &mut inv_sqrt_d as *mut _ as *mut c_void,
+        ];
+        let mut p2: [*mut c_void; 7] = [
+            &mut d_out as *mut _ as *mut c_void,
+            &mut d_po as *mut _ as *mut c_void,
+            &mut d_pm as *mut _ as *mut c_void,
+            &mut d_pl as *mut _ as *mut c_void,
+            &mut d_sink as *mut _ as *mut c_void,
+            &mut nq_arg as *mut _ as *mut c_void,
+            &mut splits_arg as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.flash_decode_fp8_split, nkv_arg, splits_arg, 1, 128, 1, 1, 0, s, p1.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(flash_decode_fp8_split)",
+            )?;
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.flash_decode_fp8_reduce, nq_arg, 1, 1, 32, 1, 1, 0, s, p2.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(flash_decode_fp8_reduce)",
+            )
+        }
+    }
+
+    fn gate_attn_sigmoid_mul(
+        &self,
+        out: DeviceBuf,
+        attn: DeviceBuf,
+        gate: DeviceBuf,
+        n: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_o = self.dev_ptr(out)?;
+        let mut d_a = self.dev_ptr(attn)?;
+        let mut d_g = self.dev_ptr(gate)?;
+        let s = self.raw_stream(stream)?;
+        let mut n_arg = n as u32;
+        let mut params: [*mut c_void; 4] = [
+            &mut d_o as *mut _ as *mut c_void,
+            &mut d_a as *mut _ as *mut c_void,
+            &mut d_g as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.gate_attn_sigmoid_mul_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(gate_attn_sigmoid_mul_f32)",
+            )
+        }
+    }
+
+    fn attn_res_mix(
+        &self,
+        out: DeviceBuf,
+        blocks: Option<DeviceBuf>,
+        cur: DeviceBuf,
+        queries: DeviceBuf,
+        num_blocks: usize,
+        num_queries: usize,
+        hidden: usize,
+        eps: f32,
+        normalize_values: bool,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_o = self.dev_ptr(out)?;
+        let mut d_b = self.opt_dev_ptr(blocks)?;
+        let mut d_c = self.dev_ptr(cur)?;
+        let mut d_q = self.dev_ptr(queries)?;
+        let s = self.raw_stream(stream)?;
+        let mut nb_arg = num_blocks as u32;
+        let mut nq_arg = num_queries as u32;
+        let mut h_arg = hidden as u32;
+        let mut eps_arg = eps;
+        let mut nv_arg: u32 = if normalize_values { 1 } else { 0 };
+        let mut params: [*mut c_void; 9] = [
+            &mut d_o as *mut _ as *mut c_void,
+            &mut d_b as *mut _ as *mut c_void,
+            &mut d_c as *mut _ as *mut c_void,
+            &mut d_q as *mut _ as *mut c_void,
+            &mut nb_arg as *mut _ as *mut c_void,
+            &mut nq_arg as *mut _ as *mut c_void,
+            &mut h_arg as *mut _ as *mut c_void,
+            &mut eps_arg as *mut _ as *mut c_void,
+            &mut nv_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.attn_res_mix_f32, nq_arg, 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(attn_res_mix_f32)",
+            )
+        }
+    }
+
+    fn loop_control_prep(
+        &self,
+        out: DeviceBuf,
+        cur: DeviceBuf,
+        msg: DeviceBuf,
+        hidden: usize,
+        eps: f32,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_o = self.dev_ptr(out)?;
+        let mut d_c = self.dev_ptr(cur)?;
+        let mut d_m = self.dev_ptr(msg)?;
+        let s = self.raw_stream(stream)?;
+        let mut h_arg = hidden as u32;
+        let mut eps_arg = eps;
+        let mut params: [*mut c_void; 5] = [
+            &mut d_o as *mut _ as *mut c_void,
+            &mut d_c as *mut _ as *mut c_void,
+            &mut d_m as *mut _ as *mut c_void,
+            &mut h_arg as *mut _ as *mut c_void,
+            &mut eps_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.loop_control_prep_f32, 2, 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(loop_control_prep_f32)",
+            )
+        }
+    }
+
+    fn loop_control_apply(
+        &self,
+        out: DeviceBuf,
+        cur: DeviceBuf,
+        msg: DeviceBuf,
+        gain_raw: DeviceBuf,
+        forget_raw: DeviceBuf,
+        n: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_o = self.dev_ptr(out)?;
+        let mut d_c = self.dev_ptr(cur)?;
+        let mut d_m = self.dev_ptr(msg)?;
+        let mut d_g = self.dev_ptr(gain_raw)?;
+        let mut d_f = self.dev_ptr(forget_raw)?;
+        let s = self.raw_stream(stream)?;
+        let mut n_arg = n as u32;
+        let mut params: [*mut c_void; 6] = [
+            &mut d_o as *mut _ as *mut c_void,
+            &mut d_c as *mut _ as *mut c_void,
+            &mut d_m as *mut _ as *mut c_void,
+            &mut d_g as *mut _ as *mut c_void,
+            &mut d_f as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.loop_control_apply_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(loop_control_apply_f32)",
+            )
+        }
+    }
+
+    fn vec_add(
+        &self,
+        out: DeviceBuf,
+        a: DeviceBuf,
+        b: DeviceBuf,
+        n: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_o = self.dev_ptr(out)?;
+        let mut d_a = self.dev_ptr(a)?;
+        let mut d_b = self.dev_ptr(b)?;
+        let s = self.raw_stream(stream)?;
+        let mut n_arg = n as u32;
+        let mut params: [*mut c_void; 4] = [
+            &mut d_o as *mut _ as *mut c_void,
+            &mut d_a as *mut _ as *mut c_void,
+            &mut d_b as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.vec_add_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(vec_add_f32)",
+            )
+        }
+    }
+
+    fn vec_scale(&self, x: DeviceBuf, alpha: f32, n: usize, stream: Stream) -> Result<()> {
+        let mut d_x = self.dev_ptr(x)?;
+        let s = self.raw_stream(stream)?;
+        let mut a_arg = alpha;
+        let mut n_arg = n as u32;
+        let mut params: [*mut c_void; 3] = [
+            &mut d_x as *mut _ as *mut c_void,
+            &mut a_arg as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.vec_scale_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(vec_scale_f32)",
+            )
+        }
+    }
+
+    fn vec_copy(&self, dst: DeviceBuf, src: DeviceBuf, n: usize, stream: Stream) -> Result<()> {
+        let mut d_dst = self.dev_ptr(dst)?;
+        let mut d_src = self.dev_ptr(src)?;
+        let s = self.raw_stream(stream)?;
+        let mut n_arg = n as u32;
+        let mut params: [*mut c_void; 3] = [
+            &mut d_dst as *mut _ as *mut c_void,
+            &mut d_src as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.vec_copy_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(vec_copy_f32)",
+            )
+        }
+    }
+
+    fn zero_f32(&self, dst: DeviceBuf, n: usize, stream: Stream) -> Result<()> {
+        let mut d_dst = self.dev_ptr(dst)?;
+        let s = self.raw_stream(stream)?;
+        let mut n_arg = n as u32;
+        let mut params: [*mut c_void; 2] = [
+            &mut d_dst as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.zero_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(zero_f32)",
+            )
+        }
+    }
+
+    fn final_logit_softcap(
+        &self,
+        logits: DeviceBuf,
+        vocab_size: usize,
+        cap: f32,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_l = self.dev_ptr(logits)?;
+        let s = self.raw_stream(stream)?;
+        let mut v_arg = vocab_size as u32;
+        let mut c_arg = cap;
+        let mut params: [*mut c_void; 3] = [
+            &mut d_l as *mut _ as *mut c_void,
+            &mut v_arg as *mut _ as *mut c_void,
+            &mut c_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.final_logit_softcap_f32, v_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(final_logit_softcap_f32)",
+            )
+        }
+    }
+
+    fn argmax_partial_f32(
+        &self,
+        out_vals: DeviceBuf,
+        out_idx: DeviceBuf,
+        x: DeviceBuf,
+        n: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_v = self.dev_ptr(out_vals)?;
+        let mut d_i = self.dev_ptr(out_idx)?;
+        let mut d_x = self.dev_ptr(x)?;
+        let s = self.raw_stream(stream)?;
+        let mut n_arg = n as u32;
+        let mut params: [*mut c_void; 4] = [
+            &mut d_v as *mut _ as *mut c_void,
+            &mut d_i as *mut _ as *mut c_void,
+            &mut d_x as *mut _ as *mut c_void,
+            &mut n_arg as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            check_hip(
+                (self.rt.hip_module_launch_kernel)(
+                    self.kernels.argmax_partial_f32, 64, 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
+                ),
+                "launch(argmax_partial_f32)",
+            )
+        }
+    }
+}

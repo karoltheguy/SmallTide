@@ -1,0 +1,11 @@
+[package]
+name = "smalltide-tide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smalltide-core = { path = "../smalltide-core" }
+smalltide-io = { path = "../smalltide-io" }
+serde.workspace = true
+serde_json.workspace = true

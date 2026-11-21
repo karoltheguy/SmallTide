@@ -1,0 +1,10 @@
+[package]
+name = "smalltide-model-inkling2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smalltide-core = { path = "../smalltide-core" }
+smalltide-io = { path = "../smalltide-io" }
+smalltide-tide = { path = "../smalltide-tide" }

@@ -1,0 +1,9 @@
+[package]
+name = "smalltide-backend-hip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smalltide-core = { path = "../smalltide-core" }
+libloading.workspace = true

@@ -1,0 +1,291 @@
+// SmallTide RDNA 4 (gfx1201) HIP Kernels
+// Compiled offline via: hipcc --genco --offload-arch=gfx1201 -O3
+// Loaded dynamically at runtime through amdhip64_7.dll (hipModuleLoadData).
+
+#include <hip/hip_runtime.h>
+#include <stdint.h>
+
+// ---------------------------------------------------------------------------
+// Fast Exact Low-Precision Decoders (FP4 E2M1, FP8 E4M3FN, UE8M0)
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float decode_fp4_e2m1(uint32_t nibble) {
+    // 1 sign bit, 2 exp bits (bias 1), 1 mantissa bit
+    // Magnitudes: 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+    static constexpr float kMag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float v = kMag[nibble & 7u];
+    return (nibble & 8u) ? -v : v;
+}
+
+__device__ __forceinline__ float decode_fp8_e4m3fn(uint32_t b) {
+    uint32_t sign = (b & 0x80u) << 24;
+    uint32_t exp  = (b >> 3) & 0x0Fu;
+    uint32_t mant = b & 0x07u;
+    if (exp == 0u) {
+        // Subnormal: (-1)^s * mant * 2^-9
+        float val = static_cast<float>(mant) * (1.0f / 512.0f);
+        return sign ? -val : val;
+    }
+    if (exp == 15u && mant == 7u) {
+        return 0.0f; // NaN guard
+    }
+    // Normal: bias 7 -> IEEE f32 bias 127 => +120
+    uint32_t f32_bits = sign | ((exp + 120u) << 23) | (mant << 20);
+    return __uint_as_float(f32_bits);
+}
+
+__device__ __forceinline__ float decode_ue8m0(uint32_t e) {
+    if (e == 0u) return 0.0f;
+    if (e == 255u) return 0.0f;
+    return __uint_as_float(e << 23);
+}
+
+// Wave32 warp reduction (RDNA 4 native wavefront size = 32)
+__device__ __forceinline__ float wave32_sum(float val) {
+    val += __shfl_xor(val, 16, 32);
+    val += __shfl_xor(val, 8, 32);
+    val += __shfl_xor(val, 4, 32);
+    val += __shfl_xor(val, 2, 32);
+    val += __shfl_xor(val, 1, 32);
+    return val;
+}
+
+// ---------------------------------------------------------------------------
+// 1. No-op Kernel (Phase 0/1 WDDM Launch Latency vs hipGraph Benchmark)
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_noop(uint32_t* counter) {
+    if (blockIdx.x == 0 && threadIdx.x == 0 && counter != nullptr) {
+        counter[0] += 1u;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. RMSNorm (FP32 in/out, FP32 gamma) - 1 block (256 threads) per row
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_rmsnorm_f32(
+    float* __restrict__ out,
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    uint32_t hidden,
+    float eps
+) {
+    uint32_t row = blockIdx.x;
+    const float* x_row = x + static_cast<size_t>(row) * hidden;
+    float* o_row = out + static_cast<size_t>(row) * hidden;
+
+    float local_sq = 0.0f;
+    for (uint32_t i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float v = x_row[i];
+        local_sq += v * v;
+    }
+
+    __shared__ float warp_sums[8];
+    float wsum = wave32_sum(local_sq);
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t wid  = threadIdx.x >> 5;
+    if (lane == 0u) warp_sums[wid] = wsum;
+    __syncthreads();
+
+    float total_sq = 0.0f;
+    if (wid == 0u) {
+        total_sq = (lane < (blockDim.x >> 5)) ? warp_sums[lane] : 0.0f;
+        total_sq = wave32_sum(total_sq);
+    }
+    __shared__ float inv_rms;
+    if (threadIdx.x == 0u) {
+        inv_rms = rsqrtf(total_sq / static_cast<float>(hidden) + eps);
+    }
+    __syncthreads();
+
+    float s = inv_rms;
+    for (uint32_t i = threadIdx.x; i < hidden; i += blockDim.x) {
+        o_row[i] = x_row[i] * s * weight[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. FP8 E4M3FN GEMV (Batch = 1 decode): y[n] = sum_k x[k] * (W_fp8[n,k] * row_scale[n])
+//    Grid: (ceil(N / 4), 1, 1), Block: (128, 1, 1) -> 4 warps (Wave32), 1 warp per output row!
+//    K must be a multiple of 16 (Inkling-2-Mini: 2304, 3072, 1152 -> all multiples of 128!).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_gemv_fp8_e4m3_f32(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ w_fp8,
+    const float* __restrict__ row_scale,
+    uint32_t n_rows,
+    uint32_t k_cols
+) {
+    uint32_t warp_in_block = threadIdx.x >> 5;
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t row = blockIdx.x * 4u + warp_in_block;
+    if (row >= n_rows) return;
+
+    const uint4* w_vec = reinterpret_cast<const uint4*>(w_fp8 + static_cast<size_t>(row) * k_cols);
+    const float4* x_vec = reinterpret_cast<const float4*>(x);
+    uint32_t k_chunks16 = k_cols >> 4; // 16 bytes = 16 FP8 elements per uint4
+
+    float acc = 0.0f;
+    for (uint32_t c = lane; c < k_chunks16; c += 32u) {
+        uint4 w16 = w_vec[c];
+        uint32_t base4 = c << 2;
+
+        float4 x0 = x_vec[base4 + 0];
+        float4 x1 = x_vec[base4 + 1];
+        float4 x2 = x_vec[base4 + 2];
+        float4 x3 = x_vec[base4 + 3];
+
+        acc = fmaf(decode_fp8_e4m3fn(w16.x & 0xFFu),         x0.x, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.x >> 8) & 0xFFu),  x0.y, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.x >> 16) & 0xFFu), x0.z, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.x >> 24) & 0xFFu), x0.w, acc);
+
+        acc = fmaf(decode_fp8_e4m3fn(w16.y & 0xFFu),         x1.x, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.y >> 8) & 0xFFu),  x1.y, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.y >> 16) & 0xFFu), x1.z, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.y >> 24) & 0xFFu), x1.w, acc);
+
+        acc = fmaf(decode_fp8_e4m3fn(w16.z & 0xFFu),         x2.x, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.z >> 8) & 0xFFu),  x2.y, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.z >> 16) & 0xFFu), x2.z, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.z >> 24) & 0xFFu), x2.w, acc);
+
+        acc = fmaf(decode_fp8_e4m3fn(w16.w & 0xFFu),         x3.x, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.w >> 8) & 0xFFu),  x3.y, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.w >> 16) & 0xFFu), x3.z, acc);
+        acc = fmaf(decode_fp8_e4m3fn((w16.w >> 24) & 0xFFu), x3.w, acc);
+    }
+
+    float sum = wave32_sum(acc);
+    if (lane == 0u) {
+        float sc = (row_scale != nullptr) ? row_scale[row] : 1.0f;
+        y[row] = sum * sc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. NVFP4 (ModelOpt) GEMV (Batch = 1 decode):
+//    Block size = 16 elements = 8 packed bytes (`uint2`) + 1 FP8 E4M3 scale byte.
+//    Global `outer_scale` multiplies the row sum.
+//    Grid: (ceil(N / 4), 1, 1), Block: (128, 1, 1) -> 4 warps, 1 warp per output row.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_gemv_nvfp4_f32(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ w_packed, // [N, K/2]
+    const uint8_t* __restrict__ w_scales, // [N, K/16] FP8 E4M3
+    float outer_scale,
+    uint32_t n_rows,
+    uint32_t k_cols
+) {
+    uint32_t warp_in_block = threadIdx.x >> 5;
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t row = blockIdx.x * 4u + warp_in_block;
+    if (row >= n_rows) return;
+
+    uint32_t n_blocks16 = k_cols >> 4;
+    const uint2* w_row = reinterpret_cast<const uint2*>(w_packed + static_cast<size_t>(row) * (k_cols >> 1));
+    const uint8_t* s_row = w_scales + static_cast<size_t>(row) * n_blocks16;
+    const float4* x_vec = reinterpret_cast<const float4*>(x);
+
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < n_blocks16; b += 32u) {
+        uint2 w8 = w_row[b]; // 8 bytes = 16 FP4 nibbles
+        float blk_scale = decode_fp8_e4m3fn(s_row[b]);
+        uint32_t base4 = b << 2;
+
+        float4 x0 = x_vec[base4 + 0];
+        float4 x1 = x_vec[base4 + 1];
+        float4 x2 = x_vec[base4 + 2];
+        float4 x3 = x_vec[base4 + 3];
+
+        float sub = 0.0f;
+        uint32_t lo = w8.x;
+        sub = fmaf(decode_fp4_e2m1(lo & 0xFu),         x0.x, sub);
+        sub = fmaf(decode_fp4_e2m1((lo >> 4) & 0xFu),  x0.y, sub);
+        sub = fmaf(decode_fp4_e2m1((lo >> 8) & 0xFu),  x0.z, sub);
+        sub = fmaf(decode_fp4_e2m1((lo >> 12) & 0xFu), x0.w, sub);
+        sub = fmaf(decode_fp4_e2m1((lo >> 16) & 0xFu), x1.x, sub);
+        sub = fmaf(decode_fp4_e2m1((lo >> 20) & 0xFu), x1.y, sub);
+        sub = fmaf(decode_fp4_e2m1((lo >> 24) & 0xFu), x1.z, sub);
+        sub = fmaf(decode_fp4_e2m1((lo >> 28) & 0xFu), x1.w, sub);
+
+        uint32_t hi = w8.y;
+        sub = fmaf(decode_fp4_e2m1(hi & 0xFu),         x2.x, sub);
+        sub = fmaf(decode_fp4_e2m1((hi >> 4) & 0xFu),  x2.y, sub);
+        sub = fmaf(decode_fp4_e2m1((hi >> 8) & 0xFu),  x2.z, sub);
+        sub = fmaf(decode_fp4_e2m1((hi >> 12) & 0xFu), x2.w, sub);
+        sub = fmaf(decode_fp4_e2m1((hi >> 16) & 0xFu), x3.x, sub);
+        sub = fmaf(decode_fp4_e2m1((hi >> 20) & 0xFu), x3.y, sub);
+        sub = fmaf(decode_fp4_e2m1((hi >> 24) & 0xFu), x3.z, sub);
+        sub = fmaf(decode_fp4_e2m1((hi >> 28) & 0xFu), x3.w, sub);
+
+        acc = fmaf(sub, blk_scale, acc);
+    }
+
+    float sum = wave32_sum(acc);
+    if (lane == 0u) {
+        y[row] = sum * outer_scale;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. MXFP8 GEMV (Batch = 1 decode, Inkling-2-Mini Layers 20-23):
+//    Verified on-disk safetensors shape: `w_scales` is [N, K/32] UE8M0 (`[128, 2304, 72]`).
+//    Grid: (ceil(N / 4), 1, 1), Block: (128, 1, 1) -> 4 warps, 1 warp per output row.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_gemv_mxfp8_f32(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ w_fp8,    // [N, K]
+    const uint8_t* __restrict__ w_scales, // [N, K/32] UE8M0
+    uint32_t n_rows,
+    uint32_t k_cols
+) {
+    uint32_t warp_in_block = threadIdx.x >> 5;
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t row = blockIdx.x * 4u + warp_in_block;
+    if (row >= n_rows) return;
+
+    uint32_t n_blocks32 = k_cols >> 5;
+    const uint4* w_vec = reinterpret_cast<const uint4*>(w_fp8 + static_cast<size_t>(row) * k_cols);
+    const uint8_t* s_row = w_scales + static_cast<size_t>(row) * n_blocks32;
+    const float4* x_vec = reinterpret_cast<const float4*>(x);
+
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < n_blocks32; b += 32u) {
+        float blk_scale = decode_ue8m0(s_row[b]);
+        uint4 wa = w_vec[b * 2u + 0u];
+        uint4 wb = w_vec[b * 2u + 1u];
+        uint32_t base4 = b << 3;
+
+        float sub = 0.0f;
+        #define DOT4_FP8(U32, FV) \
+            sub = fmaf(decode_fp8_e4m3fn((U32) & 0xFFu),         (FV).x, sub); \
+            sub = fmaf(decode_fp8_e4m3fn(((U32) >> 8) & 0xFFu),  (FV).y, sub); \
+            sub = fmaf(decode_fp8_e4m3fn(((U32) >> 16) & 0xFFu), (FV).z, sub); \
+            sub = fmaf(decode_fp8_e4m3fn(((U32) >> 24) & 0xFFu), (FV).w, sub);
+
+        DOT4_FP8(wa.x, x_vec[base4 + 0]);
+        DOT4_FP8(wa.y, x_vec[base4 + 1]);
+        DOT4_FP8(wa.z, x_vec[base4 + 2]);
+        DOT4_FP8(wa.w, x_vec[base4 + 3]);
+        DOT4_FP8(wb.x, x_vec[base4 + 4]);
+        DOT4_FP8(wb.y, x_vec[base4 + 5]);
+        DOT4_FP8(wb.z, x_vec[base4 + 6]);
+        DOT4_FP8(wb.w, x_vec[base4 + 7]);
+        #undef DOT4_FP8
+
+        acc = fmaf(sub, blk_scale, acc);
+    }
+
+    float sum = wave32_sum(acc);
+    if (lane == 0u) {
+        y[row] = sum;
+    }
+}
+
+#include "moe_ops.hip"
+#include "attn_ops.hip"
+#include "inkling2_ops.hip"
+#include "batched_ops.hip"

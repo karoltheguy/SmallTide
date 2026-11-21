@@ -1,0 +1,26 @@
+# Rust build outputs
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Compiled HIP / CUDA / SPIR-V artifacts
+*.hsaco
+*.co
+*.cubin
+*.ptx
+*.spv
+
+# Model checkpoints & local packs
+*.safetensors
+*.gguf
+*.stide
+*.bin
+models/
+weights/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini

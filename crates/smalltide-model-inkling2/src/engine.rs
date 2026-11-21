@@ -1,0 +1,1147 @@
+//! Live 48-Logical-Layer Inkling-2-Mini Inference Engine (`Inkling2Engine<B: ComputeBackend>`).
+//!
+//! 100% backend-agnostic over `smalltide_core::ComputeBackend`:
+//! - Executes exact Inkling-2-Mini Loop architecture (`6` Prelude + `3x12` Loop Core + `6` Coda)
+//! - Hybrid attention: 40 local sliding-window (`1024`) + 8 global (`max_ctx` up to `256K`) FP8 KV
+//! - Relative position bias (`wr_du` + `rel_logits_proj`), per-head L2 clip, parameter-free V norm,
+//!   per-query attention sinks, log-scaled `tau` on global Q/R, residual short-convs (`k=4`, dynamic on global K/V)
+//! - Attention Residuals (`attn_res`) + rank-64 cross-pass Loop Core controllers
+//! - Integrated 2-stage TideLM adaptive expert executor (`TideExecutor<B>`) with zero-sync fast path
+//!   for 100%-VRAM-resident layers (e.g., all 36 Loop Core layers on RX 9070 XT).
+
+use crate::weights::{DenseLayerGpu, Fp8MatrixGpu, Inkling2DenseGpu, LoopControllerGpu};
+use smalltide_core::backend::{FlashDecodeParams, MoeDispatchParams};
+use smalltide_core::{
+    ComputeBackend, DType, DeviceBuf, Inkling2Config, PhysicalLayerId, PinnedBuf, Result, Stream,
+    TideTelemetry,
+};
+use smalltide_io::quant::bf16_to_f32;
+use smalltide_tide::runtime::TideExecutor;
+use std::sync::Arc;
+use std::time::Instant;
+
+const MAX_FLASH_SPLITS: usize = 64;
+const MAX_ATTN_RES_BLOCKS: usize = 8;
+
+/// Optional per-component wall-clock breakdown (accumulated across steps when profiling is enabled).
+#[derive(Debug, Default, Clone)]
+pub struct StepProfile {
+    pub steps: u64,
+    pub embed_ms: f64,
+    pub res_and_ctrl_ms: f64,
+    pub attn_proj_ms: f64,
+    pub sconv_clip_rel_ms: f64,
+    pub flash_attn_ms: f64,
+    pub attn_out_ms: f64,
+    pub router_d2h_ms: f64,
+    pub tide_rescue_ms: f64,
+    pub moe_ms: f64,
+    pub lm_head_ms: f64,
+    pub tide_post_ms: f64,
+}
+
+/// Sampling configuration for text generation.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub repetition_penalty: f32,
+    pub seed: u64,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0, // Greedy by default for deterministic verification
+            top_p: 0.95,
+            top_k: 40,
+            repetition_penalty: 1.0,
+            seed: 42,
+        }
+    }
+}
+
+/// Per-logical-layer FP8 KV cache + 4-channel causal short-convolution state (`k = 4`, history `3`).
+struct LogicalLayerState {
+    _is_local: bool,
+    max_seq: usize,
+    k_cache: DeviceBuf,  // [8, max_seq, 128] u8 FP8
+    k_scales: DeviceBuf, // [8, max_seq] f32
+    v_cache: DeviceBuf,  // [8, max_seq, 128] u8 FP8
+    v_scales: DeviceBuf, // [8, max_seq] f32
+    sconv_k: DeviceBuf,  // [3, 1024] f32
+    sconv_v: DeviceBuf,  // [3, 1024] f32
+    sconv_attn: DeviceBuf, // [3, 2304] f32
+    sconv_mlp: DeviceBuf,  // [3, 2304] f32
+}
+
+/// Reusable activation scratch buffers in VRAM (~4 MiB total — zero per-token allocations!).
+struct ActivationScratch {
+    cur: DeviceBuf,         // [H]
+    embed_tmp: DeviceBuf,   // [H]
+    inp_sa: DeviceBuf,      // [H]
+    ffn_inp: DeviceBuf,     // [H]
+    blocks: DeviceBuf,      // [MAX_ATTN_RES_BLOCKS, H]
+    prelude_cur: DeviceBuf, // [H]
+    bank: DeviceBuf,        // [MAX_ATTN_RES_BLOCKS, H]
+    bank_out: DeviceBuf,    // [H]
+    messages: DeviceBuf,    // [4, H]
+
+    in_qkv: DeviceBuf,      // [3, H]
+    ctrl_qkv: DeviceBuf,    // [3, H]
+    norm_qkv: DeviceBuf,    // [3, H]
+
+    ctrl_prep: DeviceBuf,   // [2 * H]
+    ctrl_gate: DeviceBuf,   // [rank = 64]
+    ctrl_gain: DeviceBuf,   // [H]
+    ctrl_forget: DeviceBuf, // [H]
+
+    q: DeviceBuf,           // [24 * 128 = 3072]
+    k_raw: DeviceBuf,       // [1024]
+    k: DeviceBuf,           // [1024]
+    v_raw: DeviceBuf,       // [1024]
+    v: DeviceBuf,           // [1024]
+    k_dyn: DeviceBuf,       // [32]
+    v_dyn: DeviceBuf,       // [32]
+    r: DeviceBuf,           // [24 * 16 = 384]
+    sinks: DeviceBuf,       // [24]
+    rel_table: DeviceBuf,   // [24 * 1024]
+
+    partial_out: DeviceBuf, // [24 * MAX_FLASH_SPLITS * 128]
+    partial_m: DeviceBuf,   // [24 * MAX_FLASH_SPLITS]
+    partial_l: DeviceBuf,   // [24 * MAX_FLASH_SPLITS]
+    attn_out: DeviceBuf,    // [3072]
+    gate_out: DeviceBuf,    // [3072]
+    o_raw: DeviceBuf,       // [H]
+    sconv_tmp: DeviceBuf,   // [H]
+
+    moe_in: DeviceBuf,      // [H]
+    moe_ctrl: DeviceBuf,    // [H]
+    moe_norm: DeviceBuf,    // [H]
+    topk_ids: DeviceBuf,    // [8] u32
+    topk_weights: DeviceBuf,// [8] f32
+    moe_mid: DeviceBuf,     // [8 * 1152] f32
+    moe_out: DeviceBuf,     // [H]
+
+    logits: DeviceBuf,      // [unpadded_vocab_size] f32
+    argmax_vals: DeviceBuf, // [64] f32
+    argmax_idx: DeviceBuf,  // [64] u32
+}
+
+pub struct Inkling2Engine<B: ComputeBackend> {
+    pub backend: Arc<B>,
+    pub cfg: Inkling2Config,
+    pub dense: Inkling2DenseGpu<B>,
+    pub tide: TideExecutor<B>,
+    pub global_max_seq: usize,
+    layer_states: Vec<LogicalLayerState>,
+    scratch: ActivationScratch,
+    embed_pinned: PinnedBuf,
+    rng_state: u64,
+    tokens_decoded: u64,
+    pub profile_enabled: bool,
+    pub profile: StepProfile,
+}
+
+impl<B: ComputeBackend> Inkling2Engine<B> {
+    pub fn new(
+        cfg: Inkling2Config,
+        dense: Inkling2DenseGpu<B>,
+        tide: TideExecutor<B>,
+        global_max_seq: usize,
+    ) -> Result<Self> {
+        let backend = dense.backend.clone();
+        let stream = tide.compute_stream;
+        let h = cfg.hidden_size;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let q_dim = cfg.num_attention_heads * cfg.head_dim;
+        let num_logical = cfg.num_logical_layers();
+
+        let mut layer_states = Vec::with_capacity(num_logical);
+        for il in 0..num_logical {
+            let (phys, _) = crate::map_logical_to_physical(&cfg, smalltide_core::LogicalLayerId(il as u16));
+            let is_local = cfg.is_local_layer(phys.0 as usize);
+            let max_seq = if is_local {
+                cfg.local_window_size
+            } else {
+                global_max_seq.max(cfg.local_window_size)
+            };
+            let kv_bytes = cfg.num_key_value_heads * max_seq * cfg.head_dim;
+            let sc_bytes = cfg.num_key_value_heads * max_seq * 4;
+            let sconv_k = backend.alloc_device(3 * kv_dim * 4)?;
+            let sconv_v = backend.alloc_device(3 * kv_dim * 4)?;
+            let sconv_attn = backend.alloc_device(3 * h * 4)?;
+            let sconv_mlp = backend.alloc_device(3 * h * 4)?;
+            backend.zero_f32(sconv_k, 3 * kv_dim, stream)?;
+            backend.zero_f32(sconv_v, 3 * kv_dim, stream)?;
+            backend.zero_f32(sconv_attn, 3 * h, stream)?;
+            backend.zero_f32(sconv_mlp, 3 * h, stream)?;
+            layer_states.push(LogicalLayerState {
+                _is_local: is_local,
+                max_seq,
+                k_cache: backend.alloc_device(kv_bytes)?,
+                k_scales: backend.alloc_device(sc_bytes)?,
+                v_cache: backend.alloc_device(kv_bytes)?,
+                v_scales: backend.alloc_device(sc_bytes)?,
+                sconv_k,
+                sconv_v,
+                sconv_attn,
+                sconv_mlp,
+            });
+        }
+
+        let alloc_f32 = |n: usize| backend.alloc_device(n * 4);
+        let scratch = ActivationScratch {
+            cur: alloc_f32(h)?,
+            embed_tmp: alloc_f32(h)?,
+            inp_sa: alloc_f32(h)?,
+            ffn_inp: alloc_f32(h)?,
+            blocks: alloc_f32(MAX_ATTN_RES_BLOCKS * h)?,
+            prelude_cur: alloc_f32(h)?,
+            bank: alloc_f32(MAX_ATTN_RES_BLOCKS * h)?,
+            bank_out: alloc_f32(h)?,
+            messages: alloc_f32(4 * h)?,
+            in_qkv: alloc_f32(3 * h)?,
+            ctrl_qkv: alloc_f32(3 * h)?,
+            norm_qkv: alloc_f32(3 * h)?,
+            ctrl_prep: alloc_f32(2 * h)?,
+            ctrl_gate: alloc_f32(cfg.loop_gate_rank)?,
+            ctrl_gain: alloc_f32(h)?,
+            ctrl_forget: alloc_f32(h)?,
+            q: alloc_f32(q_dim)?,
+            k_raw: alloc_f32(kv_dim)?,
+            k: alloc_f32(kv_dim)?,
+            v_raw: alloc_f32(kv_dim)?,
+            v: alloc_f32(kv_dim)?,
+            k_dyn: alloc_f32(cfg.num_key_value_heads * cfg.sconv_kernel_size)?,
+            v_dyn: alloc_f32(cfg.num_key_value_heads * cfg.sconv_kernel_size)?,
+            r: alloc_f32(cfg.num_attention_heads * cfg.d_rel)?,
+            sinks: alloc_f32(cfg.num_attention_heads)?,
+            rel_table: alloc_f32(cfg.num_attention_heads * cfg.rel_extent)?,
+            partial_out: alloc_f32(cfg.num_attention_heads * MAX_FLASH_SPLITS * cfg.head_dim)?,
+            partial_m: alloc_f32(cfg.num_attention_heads * MAX_FLASH_SPLITS)?,
+            partial_l: alloc_f32(cfg.num_attention_heads * MAX_FLASH_SPLITS)?,
+            attn_out: alloc_f32(q_dim)?,
+            gate_out: alloc_f32(q_dim)?,
+            o_raw: alloc_f32(h)?,
+            sconv_tmp: alloc_f32(h)?,
+            moe_in: alloc_f32(h)?,
+            moe_ctrl: alloc_f32(h)?,
+            moe_norm: alloc_f32(h)?,
+            topk_ids: backend.alloc_device(cfg.num_experts_per_tok * 4)?,
+            topk_weights: alloc_f32(cfg.num_experts_per_tok)?,
+            moe_mid: alloc_f32(cfg.num_experts_per_tok * cfg.intermediate_size)?,
+            moe_out: alloc_f32(h)?,
+            logits: alloc_f32(cfg.unpadded_vocab_size)?,
+            argmax_vals: alloc_f32(64)?,
+            argmax_idx: backend.alloc_device(64 * 4)?,
+        };
+
+        let embed_pinned = backend.alloc_pinned(h * 4)?;
+        backend.sync_stream(stream)?;
+
+        Ok(Self {
+            backend,
+            cfg,
+            dense,
+            tide,
+            global_max_seq,
+            layer_states,
+            scratch,
+            embed_pinned,
+            rng_state: 0x9E37_79B9_7F4A_7C15,
+            tokens_decoded: 0,
+            profile_enabled: false,
+            profile: StepProfile::default(),
+        })
+    }
+
+    /// Total KV cache + short-conv VRAM allocated across all 48 logical layers.
+    pub fn kv_vram_bytes(&self) -> usize {
+        self.layer_states
+            .iter()
+            .map(|s| {
+                s.k_cache.size_bytes
+                    + s.k_scales.size_bytes
+                    + s.v_cache.size_bytes
+                    + s.v_scales.size_bytes
+                    + s.sconv_k.size_bytes
+                    + s.sconv_v.size_bytes
+                    + s.sconv_attn.size_bytes
+                    + s.sconv_mlp.size_bytes
+            })
+            .sum()
+    }
+
+    /// Resets all 48 logical layers' short-conv history for a fresh sequence (pos = 0).
+    pub fn reset_sequence(&mut self) -> Result<()> {
+        let s = self.tide.compute_stream;
+        let h = self.cfg.hidden_size;
+        let kv_dim = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        for st in &self.layer_states {
+            self.backend.zero_f32(st.sconv_k, 3 * kv_dim, s)?;
+            self.backend.zero_f32(st.sconv_v, 3 * kv_dim, s)?;
+            self.backend.zero_f32(st.sconv_attn, 3 * h, s)?;
+            self.backend.zero_f32(st.sconv_mlp, 3 * h, s)?;
+        }
+        self.backend.sync_stream(s)?;
+        Ok(())
+    }
+
+    /// Mode 2: Prefill -> Decode Boundary Tide Rebalance.
+    pub fn rebalance_after_prefill(&mut self, max_swaps: usize) -> Result<usize> {
+        let ops = self.tide.scheduler.plan_prefill_decode_rebalance(max_swaps);
+        let n = ops.len();
+        if n > 0 {
+            self.tide.execute_transfers(&ops, true, false)?;
+        }
+        Ok(n)
+    }
+
+    /// Mode 3 + Periodic Rebalance: Called once after each decoded token.
+    pub fn post_decode_tide_step(&mut self) -> Result<()> {
+        let _ = self.tide.poll_stage2_completions()?;
+        let async_ops = self.tide.scheduler.plan_async_step();
+        if !async_ops.is_empty() {
+            // Stage 2 Disk->RAM runs asynchronously on dedicated OS thread; Stage 1 RAM->VRAM on copy stream
+            self.tide.execute_transfers(&async_ops, false, true)?;
+        }
+        self.tokens_decoded += 1;
+        let reb_ops = self
+            .tide
+            .scheduler
+            .maybe_periodic_rebalance(self.tokens_decoded, 64, 16, false);
+        if !reb_ops.is_empty() {
+            self.tide.execute_transfers(&reb_ops, false, false)?;
+        }
+        Ok(())
+    }
+
+    pub fn telemetry(&self) -> &TideTelemetry {
+        &self.tide.scheduler.telemetry
+    }
+
+    #[inline]
+    fn fp8_mm(&self, out: DeviceBuf, x: DeviceBuf, m: &Fp8MatrixGpu, s: Stream) -> Result<()> {
+        self.backend
+            .gemv_fp8(out, x, m.data, m.row_scales, m.n_rows, m.k_cols, s)
+    }
+
+    /// Exact rank-64 cross-pass controller (`inkling2.cpp:241-249`).
+    fn run_control(
+        &self,
+        out: DeviceBuf,
+        cur: DeviceBuf,
+        msg: DeviceBuf,
+        ctrl: &LoopControllerGpu,
+        s: Stream,
+    ) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        self.backend
+            .loop_control_prep(self.scratch.ctrl_prep, cur, msg, h, self.cfg.rms_norm_eps, s)?;
+        self.fp8_mm(self.scratch.ctrl_gate, self.scratch.ctrl_prep, &ctrl.down, s)?;
+        self.fp8_mm(self.scratch.ctrl_gain, self.scratch.ctrl_gate, &ctrl.gain, s)?;
+        self.fp8_mm(self.scratch.ctrl_forget, self.scratch.ctrl_gate, &ctrl.forget, s)?;
+        self.backend.loop_control_apply(
+            out,
+            cur,
+            msg,
+            self.scratch.ctrl_gain,
+            self.scratch.ctrl_forget,
+            h,
+            s,
+        )
+    }
+
+    #[inline]
+    fn prof_mark(&self, s: Stream) -> Option<Instant> {
+        if self.profile_enabled {
+            let _ = self.backend.sync_stream(s);
+            Some(Instant::now())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn prof_end(&self, t: Option<Instant>, s: Stream) -> f64 {
+        if let Some(t0) = t {
+            let _ = self.backend.sync_stream(s);
+            t0.elapsed().as_secs_f64() * 1000.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Executes 1 logical layer (`il in 0..48`, physical `ip in 0..24`).
+    fn forward_layer(
+        &mut self,
+        il: usize,
+        ip: usize,
+        pos: usize,
+        is_prefill: bool,
+        num_blocks: &mut usize,
+        messages: Option<DeviceBuf>,
+    ) -> Result<()> {
+        let s = self.tide.compute_stream;
+        let h = self.cfg.hidden_size;
+        let h_bytes = h * 4;
+        let q_dim = self.cfg.num_attention_heads * self.cfg.head_dim;
+        let kv_dim = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        let eps = self.cfg.rms_norm_eps;
+
+        let t_rc = self.prof_mark(s);
+        let layer: &DenseLayerGpu = &self.dense.layers[ip];
+        let is_local = layer.is_local;
+        let has_msg = messages.is_some();
+
+        // Save inpSA = cur
+        self.backend.vec_copy(self.scratch.inp_sa, self.scratch.cur, h, s)?;
+
+        // 1. Attention Residual Mix -> inputs[0..3]
+        let (in0, in1, in2) = if let Some(attn_q) = layer.attn_res_query {
+            let blocks_view = Some(self.scratch.blocks.slice(0, (*num_blocks) * h_bytes));
+            if is_local {
+                let dst0 = self.scratch.in_qkv.slice(0, h_bytes);
+                self.backend.attn_res_mix(
+                    dst0,
+                    blocks_view,
+                    self.scratch.cur,
+                    attn_q,
+                    *num_blocks,
+                    1,
+                    h,
+                    eps,
+                    true,
+                    s,
+                )?;
+                (dst0, dst0, dst0)
+            } else {
+                self.backend.attn_res_mix(
+                    self.scratch.in_qkv,
+                    blocks_view,
+                    self.scratch.cur,
+                    attn_q,
+                    *num_blocks,
+                    3,
+                    h,
+                    eps,
+                    true,
+                    s,
+                )?;
+                (
+                    self.scratch.in_qkv.slice(0, h_bytes),
+                    self.scratch.in_qkv.slice(h_bytes, h_bytes),
+                    self.scratch.in_qkv.slice(2 * h_bytes, h_bytes),
+                )
+            }
+        } else {
+            (self.scratch.cur, self.scratch.cur, self.scratch.cur)
+        };
+
+        // 2. Cross-Pass Loop Controllers for Q, K, V (pass > 0)
+        let (in0, in1, in2) = if let Some(msgs) = messages {
+            let ctrls = layer
+                .controllers
+                .as_ref()
+                .expect("loop core layer must have controllers");
+            let c0 = self.scratch.ctrl_qkv.slice(0, h_bytes);
+            let c1 = self.scratch.ctrl_qkv.slice(h_bytes, h_bytes);
+            let c2 = self.scratch.ctrl_qkv.slice(2 * h_bytes, h_bytes);
+            self.run_control(c0, in0, msgs.slice(0, h_bytes), &ctrls[0], s)?;
+            self.run_control(c1, in1, msgs.slice(h_bytes, h_bytes), &ctrls[1], s)?;
+            self.run_control(c2, in2, msgs.slice(2 * h_bytes, h_bytes), &ctrls[2], s)?;
+            (c0, c1, c2)
+        } else {
+            (in0, in1, in2)
+        };
+
+        // 3. Attention Input Norms (`inkling2.cpp:313-324`)
+        let (nq, nk, nv) = if is_local {
+            let norm_w = layer.attn_norm.expect("local layer attn_norm");
+            if has_msg {
+                let n0 = self.scratch.norm_qkv.slice(0, h_bytes);
+                let n1 = self.scratch.norm_qkv.slice(h_bytes, h_bytes);
+                let n2 = self.scratch.norm_qkv.slice(2 * h_bytes, h_bytes);
+                self.backend.rms_norm(n0, in0, norm_w, 1, h, eps, s)?;
+                self.backend.rms_norm(n1, in1, norm_w, 1, h, eps, s)?;
+                self.backend.rms_norm(n2, in2, norm_w, 1, h, eps, s)?;
+                (n0, n1, n2)
+            } else {
+                let n0 = self.scratch.norm_qkv.slice(0, h_bytes);
+                self.backend.rms_norm(n0, in0, norm_w, 1, h, eps, s)?;
+                (n0, n0, n0)
+            }
+        } else {
+            let n0 = self.scratch.norm_qkv.slice(0, h_bytes);
+            let n1 = self.scratch.norm_qkv.slice(h_bytes, h_bytes);
+            let n2 = self.scratch.norm_qkv.slice(2 * h_bytes, h_bytes);
+            self.backend
+                .rms_norm(n0, in0, layer.q_input_norm.unwrap(), 1, h, eps, s)?;
+            self.backend
+                .rms_norm(n1, in1, layer.k_input_norm.unwrap(), 1, h, eps, s)?;
+            self.backend
+                .rms_norm(n2, in2, layer.v_input_norm.unwrap(), 1, h, eps, s)?;
+            (n0, n1, n2)
+        };
+        let dt_rc = self.prof_end(t_rc, s);
+        if self.profile_enabled { self.profile.res_and_ctrl_ms += dt_rc; }
+
+        // 4. Q, K, V, R Projections + Causal Short Convolutions on K & V
+        let t_ap = self.prof_mark(s);
+        let layer = &self.dense.layers[ip];
+        self.fp8_mm(self.scratch.q, nq, &layer.wq, s)?;
+        self.fp8_mm(self.scratch.k_raw, nk, &layer.wk, s)?;
+        self.fp8_mm(self.scratch.v_raw, nv, &layer.wv, s)?;
+        self.fp8_mm(self.scratch.r, nq, &layer.wr, s)?;
+        let dt_ap = self.prof_end(t_ap, s);
+        if self.profile_enabled { self.profile.attn_proj_ms += dt_ap; }
+
+        let t_sc = self.prof_mark(s);
+        let layer = &self.dense.layers[ip];
+        let st = &self.layer_states[il];
+        let k_dyn = if let Some(dyn_w) = layer.k_sconv_dyn_proj {
+            self.backend.gemv_f32(self.scratch.k_dyn, nk, dyn_w, 32, h, s)?;
+            Some(self.scratch.k_dyn)
+        } else {
+            None
+        };
+        self.backend.sconv_k4_decode(
+            self.scratch.k,
+            st.sconv_k,
+            self.scratch.k_raw,
+            layer.k_sconv_static,
+            k_dyn,
+            kv_dim,
+            self.cfg.head_dim,
+            s,
+        )?;
+        let v_dyn = if let Some(dyn_w) = layer.v_sconv_dyn_proj {
+            self.backend.gemv_f32(self.scratch.v_dyn, nv, dyn_w, 32, h, s)?;
+            Some(self.scratch.v_dyn)
+        } else {
+            None
+        };
+        self.backend.sconv_k4_decode(
+            self.scratch.v,
+            st.sconv_v,
+            self.scratch.v_raw,
+            layer.v_sconv_static,
+            v_dyn,
+            kv_dim,
+            self.cfg.head_dim,
+            s,
+        )?;
+
+        // 5. QK / Rel L2 Clip + Value RMSNorm (no gamma) + Global log-scaled `tau`
+        self.backend.head_l2_clip(
+            self.scratch.q,
+            Some(layer.q_l2_clip_scale),
+            self.cfg.num_attention_heads,
+            self.cfg.head_dim,
+            self.cfg.qk_l2_clip_threshold,
+            s,
+        )?;
+        self.backend.head_l2_clip(
+            self.scratch.k,
+            None,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim,
+            self.cfg.qk_l2_clip_threshold,
+            s,
+        )?;
+        self.backend.value_norm_no_gamma(
+            self.scratch.v,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim,
+            eps,
+            s,
+        )?;
+        self.backend.head_l2_clip(
+            self.scratch.r,
+            Some(layer.rel_l2_clip_scale),
+            self.cfg.num_attention_heads,
+            self.cfg.d_rel,
+            self.cfg.rel_l2_clip_threshold,
+            s,
+        )?;
+
+        if !is_local {
+            let ratio = ((pos as f32 + 1.0) / (self.cfg.log_scaling_n_floor as f32)).max(1.0);
+            let tau = 1.0 + self.cfg.log_scaling_alpha * ratio.ln();
+            if tau != 1.0 {
+                self.backend.vec_scale(self.scratch.q, tau, q_dim, s)?;
+                self.backend
+                    .vec_scale(self.scratch.r, tau, self.cfg.num_attention_heads * self.cfg.d_rel, s)?;
+            }
+        }
+
+        // 6. Attention Sinks + Relative Bias Table + FP8 KV Store + Split-K FlashDecoding
+        self.backend
+            .gemv_f32(self.scratch.sinks, nq, layer.attn_sink, self.cfg.num_attention_heads, h, s)?;
+        self.backend.rel_table(
+            self.scratch.rel_table,
+            self.scratch.r,
+            layer.rel_logits_proj,
+            self.cfg.num_attention_heads,
+            self.cfg.rel_extent,
+            s,
+        )?;
+        let slot_pos = if is_local { pos % st.max_seq } else { pos };
+        self.backend.kv_store_fp8_decode(
+            st.k_cache,
+            st.k_scales,
+            st.v_cache,
+            st.v_scales,
+            self.scratch.k,
+            self.scratch.v,
+            self.cfg.num_key_value_heads,
+            st.max_seq,
+            self.cfg.head_dim,
+            slot_pos,
+            s,
+        )?;
+        let dt_sc = self.prof_end(t_sc, s);
+        if self.profile_enabled { self.profile.sconv_clip_rel_ms += dt_sc; }
+
+        let t_fa = self.prof_mark(s);
+        let st = &self.layer_states[il];
+        let n_valid = if is_local {
+            (pos + 1).min(st.max_seq)
+        } else {
+            pos + 1
+        };
+        let num_splits = n_valid.div_ceil(128).clamp(1, MAX_FLASH_SPLITS);
+        self.backend.flash_decode_fp8(
+            self.scratch.attn_out,
+            self.scratch.partial_out,
+            self.scratch.partial_m,
+            self.scratch.partial_l,
+            self.scratch.q,
+            st.k_cache,
+            st.k_scales,
+            st.v_cache,
+            st.v_scales,
+            Some(self.scratch.rel_table),
+            Some(self.scratch.sinks),
+            FlashDecodeParams {
+                n_q_heads: self.cfg.num_attention_heads,
+                n_kv_heads: self.cfg.num_key_value_heads,
+                max_seq: st.max_seq,
+                q_pos: pos,
+                rel_extent: self.cfg.rel_extent,
+                is_local,
+                num_splits,
+                inv_sqrt_d: 1.0 / (self.cfg.head_dim as f32).sqrt(),
+            },
+            s,
+        )?;
+        let dt_fa = self.prof_end(t_fa, s);
+        if self.profile_enabled { self.profile.flash_attn_ms += dt_fa; }
+
+        // 7. Output Gate + Wo + Post-Attention Short Conv
+        let t_ao = self.prof_mark(s);
+        let layer = &self.dense.layers[ip];
+        let st = &self.layer_states[il];
+        self.fp8_mm(self.scratch.gate_out, nq, &layer.gate_attn, s)?;
+        self.backend.gate_attn_sigmoid_mul(
+            self.scratch.attn_out,
+            self.scratch.attn_out,
+            self.scratch.gate_out,
+            q_dim,
+            s,
+        )?;
+        self.fp8_mm(self.scratch.o_raw, self.scratch.attn_out, &layer.wo, s)?;
+        self.backend.sconv_k4_decode(
+            self.scratch.sconv_tmp,
+            st.sconv_attn,
+            self.scratch.o_raw,
+            layer.attn_sconv,
+            None,
+            h,
+            0,
+            s,
+        )?;
+
+        // 8. Block Residual Boundary (`inkling2.cpp:381-388`)
+        if ip % self.cfg.n_layers_per_attn_res_block == 0 {
+            let dst_blk = self.scratch.blocks.slice((*num_blocks) * h_bytes, h_bytes);
+            self.backend.vec_copy(dst_blk, self.scratch.inp_sa, h, s)?;
+            *num_blocks += 1;
+            self.backend.vec_copy(self.scratch.cur, self.scratch.sconv_tmp, h, s)?;
+        } else {
+            self.backend
+                .vec_add(self.scratch.cur, self.scratch.inp_sa, self.scratch.sconv_tmp, h, s)?;
+        }
+        self.backend.vec_copy(self.scratch.ffn_inp, self.scratch.cur, h, s)?;
+
+        // 9. MoE Block: Mix -> Optional Loop Controller -> RMSNorm -> Router -> Tide -> Indirect MoE -> Short Conv
+        let blocks_view = Some(self.scratch.blocks.slice(0, (*num_blocks) * h_bytes));
+        self.backend.attn_res_mix(
+            self.scratch.moe_in,
+            blocks_view,
+            self.scratch.cur,
+            layer.mlp_res_query,
+            *num_blocks,
+            1,
+            h,
+            eps,
+            true,
+            s,
+        )?;
+        let moe_in_final = if let Some(msgs) = messages {
+            let ctrls = layer.controllers.as_ref().unwrap();
+            self.run_control(
+                self.scratch.moe_ctrl,
+                self.scratch.moe_in,
+                msgs.slice(3 * h_bytes, h_bytes),
+                &ctrls[3],
+                s,
+            )?;
+            self.scratch.moe_ctrl
+        } else {
+            self.scratch.moe_in
+        };
+        self.backend
+            .rms_norm(self.scratch.moe_norm, moe_in_final, layer.mlp_norm, 1, h, eps, s)?;
+        let dt_ao = self.prof_end(t_ao, s);
+        if self.profile_enabled { self.profile.attn_out_ms += dt_ao; }
+
+        let t_rt = self.prof_mark(s);
+        let layer = &self.dense.layers[ip];
+        self.backend.router_topk8(
+            self.scratch.topk_ids,
+            self.scratch.topk_weights,
+            self.scratch.moe_norm,
+            layer.router_weight,
+            Some(layer.router_bias),
+            h,
+            self.cfg.route_scale,
+            s,
+        )?;
+
+        // TideLM Adaptive Expert Dispatch:
+        // Zero-sync fast path when all 128 experts of this physical layer are already VRAM-resident!
+        let phys_id = PhysicalLayerId(ip as u16);
+        let fully_resident = self.tide.scheduler.is_layer_fully_resident_vram(phys_id);
+        let mut rescue_ms_local = 0.0f64;
+        if fully_resident {
+            self.tide
+                .scheduler
+                .record_full_layer_hit(phys_id, self.cfg.num_experts_per_tok as u64);
+        } else {
+            let mut ids_bytes = [0u8; 32];
+            let mut w_bytes = [0u8; 32];
+            self.backend
+                .memcpy_d2h_sync(&mut ids_bytes, self.scratch.topk_ids, 0, s)?;
+            self.backend
+                .memcpy_d2h_sync(&mut w_bytes, self.scratch.topk_weights, 0, s)?;
+            let mut topk_ids_u16 = [0u16; 8];
+            let mut topk_w_f32 = [0.0f32; 8];
+            for k in 0..8 {
+                topk_ids_u16[k] =
+                    u32::from_le_bytes(ids_bytes[k * 4..(k + 1) * 4].try_into().unwrap()) as u16;
+                topk_w_f32[k] =
+                    f32::from_le_bytes(w_bytes[k * 4..(k + 1) * 4].try_into().unwrap());
+            }
+            if is_prefill {
+                self.tide
+                    .scheduler
+                    .record_prefill_routing(phys_id, &topk_ids_u16, &topk_w_f32);
+            }
+            let plan = self
+                .tide
+                .scheduler
+                .plan_layer_dispatch(phys_id, &topk_ids_u16, &topk_w_f32);
+            if !plan.sync_transfers.is_empty() {
+                let tr0 = Instant::now();
+                self.tide
+                    .execute_transfers(&plan.sync_transfers, true, false)?;
+                if self.profile_enabled {
+                    let _ = self.backend.sync_stream(self.tide.copy_stream);
+                    rescue_ms_local = tr0.elapsed().as_secs_f64() * 1000.0;
+                }
+            }
+        }
+        let dt_rt = self.prof_end(t_rt, s);
+        if self.profile_enabled {
+            self.profile.router_d2h_ms += (dt_rt - rescue_ms_local).max(0.0);
+            self.profile.tide_rescue_ms += rescue_ms_local;
+        }
+
+        let t_moe = self.prof_mark(s);
+        let is_mxfp8 = self.cfg.is_mxfp8_layer(ip);
+        let (pool, stride, dtype) = if is_mxfp8 {
+            (
+                self.tide.vram_pool_mxfp8,
+                self.tide.mxfp8_layout.aligned_slab_bytes,
+                DType::MXFP8,
+            )
+        } else {
+            (
+                self.tide.vram_pool_nvfp4,
+                self.tide.nvfp4_layout.aligned_slab_bytes,
+                DType::NVFP4,
+            )
+        };
+        let layer_slot_table = self.tide.gpu_slot_table.slice(
+            ip * self.cfg.n_routed_experts * 4,
+            self.cfg.n_routed_experts * 4,
+        );
+        self.backend.moe_swiglu_indirect_with_scratch(
+            self.scratch.moe_out,
+            self.scratch.moe_mid,
+            self.scratch.moe_norm,
+            pool,
+            layer_slot_table,
+            self.scratch.topk_ids,
+            self.scratch.topk_weights,
+            MoeDispatchParams {
+                batch_size: 1,
+                hidden_size: h,
+                intermediate_size: self.cfg.intermediate_size,
+                top_k: self.cfg.num_experts_per_tok,
+                weight_dtype: dtype,
+                expert_stride_bytes: stride,
+            },
+            s,
+        )?;
+
+        let st = &self.layer_states[il];
+        self.backend.sconv_k4_decode(
+            self.scratch.sconv_tmp,
+            st.sconv_mlp,
+            self.scratch.moe_out,
+            self.dense.layers[ip].mlp_sconv,
+            None,
+            h,
+            0,
+            s,
+        )?;
+        self.backend
+            .vec_add(self.scratch.cur, self.scratch.ffn_inp, self.scratch.sconv_tmp, h, s)?;
+        let dt_moe = self.prof_end(t_moe, s);
+        if self.profile_enabled { self.profile.moe_ms += dt_moe; }
+        Ok(())
+    }
+
+    /// Runs a complete 48-logical-layer forward step for `token_id` at position `pos`.
+    /// When `need_logits` is false (e.g. non-final prefill tokens), skips the 200K `lm_head` GEMV.
+    pub fn forward_token(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+        is_prefill: bool,
+        need_logits: bool,
+    ) -> Result<()> {
+        let s = self.tide.compute_stream;
+        let h = self.cfg.hidden_size;
+        let h_bytes = h * 4;
+        let eps = self.cfg.rms_norm_eps;
+
+        // 0. Host RAM BF16 Embedding Lookup -> Pinned -> GPU -> Embed RMSNorm
+        let tok = (token_id as usize).min(self.cfg.vocab_size - 1);
+        let row_off = tok * h * 2;
+        let row_bytes = &self.dense.embed_bf16_host[row_off..row_off + h * 2];
+        unsafe {
+            let dst = self.backend.pinned_as_mut_slice(self.embed_pinned)?;
+            let dst_f32 = std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut f32, h);
+            for i in 0..h {
+                let bits = u16::from_le_bytes([row_bytes[2 * i], row_bytes[2 * i + 1]]);
+                dst_f32[i] = bf16_to_f32(bits);
+            }
+        }
+        self.backend
+            .memcpy_h2d_async(self.scratch.embed_tmp, 0, self.embed_pinned, 0, h_bytes, s)?;
+        self.backend.rms_norm(
+            self.scratch.cur,
+            self.scratch.embed_tmp,
+            self.dense.embed_norm,
+            1,
+            h,
+            eps,
+            s,
+        )?;
+
+        let mut num_blocks = 0usize;
+
+        // 1. Prelude: physical layers 0..6 (logical 0..6)
+        let start = self.cfg.loop_start_layer;
+        let end = self.cfg.loop_end_exclusive;
+        let core_len = end - start;
+        for ip in 0..start {
+            self.forward_layer(ip, ip, pos, is_prefill, &mut num_blocks, None)?;
+        }
+
+        // Save prelude output & prelude block count for all 3 loop passes (`inkling2-loop.cpp:88-89`)
+        self.backend
+            .vec_copy(self.scratch.prelude_cur, self.scratch.cur, h, s)?;
+        let prelude_num_blocks = num_blocks;
+
+        // 2. Loop Core: 3 passes over physical layers 6..18 (logical 6..42)
+        for pass in 0..self.cfg.loop_passes {
+            let mut bank_count = 0usize;
+            if pass > 0 {
+                // `bank = blocks[prelude_num_blocks + 1 .. num_blocks]`, `bank_out = cur`
+                let bank_start = prelude_num_blocks + 1;
+                bank_count = num_blocks.saturating_sub(bank_start);
+                if bank_count > 0 {
+                    self.backend.vec_copy(
+                        self.scratch.bank.slice(0, bank_count * h_bytes),
+                        self.scratch.blocks.slice(bank_start * h_bytes, bank_count * h_bytes),
+                        bank_count * h,
+                        s,
+                    )?;
+                }
+                self.backend
+                    .vec_copy(self.scratch.bank_out, self.scratch.cur, h, s)?;
+                // Reset cur & blocks to prelude state (prelude_blocks are still in blocks[0..prelude_num_blocks])
+                self.backend
+                    .vec_copy(self.scratch.cur, self.scratch.prelude_cur, h, s)?;
+                num_blocks = prelude_num_blocks;
+            }
+
+            for ip in start..end {
+                let il = start + pass * core_len + (ip - start);
+                if pass == 0 {
+                    self.forward_layer(il, ip, pos, is_prefill, &mut num_blocks, None)?;
+                } else {
+                    let msg_q = self.dense.layers[ip]
+                        .loop_msg_queries
+                        .expect("loop core layer must have loop_msg_queries");
+                    let bank_view = if bank_count > 0 {
+                        Some(self.scratch.bank.slice(0, bank_count * h_bytes))
+                    } else {
+                        None
+                    };
+                    self.backend.attn_res_mix(
+                        self.scratch.messages,
+                        bank_view,
+                        self.scratch.bank_out,
+                        msg_q,
+                        bank_count,
+                        4,
+                        h,
+                        eps,
+                        true,
+                        s,
+                    )?;
+                    self.forward_layer(
+                        il,
+                        ip,
+                        pos,
+                        is_prefill,
+                        &mut num_blocks,
+                        Some(self.scratch.messages),
+                    )?;
+                }
+            }
+        }
+
+        // 3. Coda: physical layers 18..24 (logical 42..48)
+        let coda_logical_base = start + self.cfg.loop_passes * core_len;
+        for ip in end..self.cfg.num_physical_layers {
+            let il = coda_logical_base + (ip - end);
+            self.forward_layer(il, ip, pos, is_prefill, &mut num_blocks, None)?;
+        }
+
+        if !need_logits {
+            return Ok(());
+        }
+
+        // 4. Output Head (`inkling2.cpp:421-445`)
+        let t_lm = self.prof_mark(s);
+        let blocks_view = Some(self.scratch.blocks.slice(0, num_blocks * h_bytes));
+        self.backend.attn_res_mix(
+            self.scratch.moe_in,
+            blocks_view,
+            self.scratch.cur,
+            self.dense.output_res_query,
+            num_blocks,
+            1,
+            h,
+            eps,
+            true,
+            s,
+        )?;
+        self.backend.rms_norm(
+            self.scratch.moe_norm,
+            self.scratch.moe_in,
+            self.dense.final_norm,
+            1,
+            h,
+            eps,
+            s,
+        )?;
+        // Compute only the unpadded 200,058 vocab rows (skipping 966 padded rows!)
+        self.backend.gemv_fp8(
+            self.scratch.logits,
+            self.scratch.moe_norm,
+            self.dense.unembed_fp8.data,
+            self.dense.unembed_fp8.row_scales,
+            self.cfg.unpadded_vocab_size,
+            h,
+            s,
+        )?;
+        if self.cfg.final_logit_softcapping > 0.0 {
+            self.backend.final_logit_softcap(
+                self.scratch.logits,
+                self.cfg.unpadded_vocab_size,
+                self.cfg.final_logit_softcapping,
+                s,
+            )?;
+        }
+        let dt_lm = self.prof_end(t_lm, s);
+        if self.profile_enabled {
+            self.profile.lm_head_ms += dt_lm;
+            self.profile.steps += 1;
+        }
+        Ok(())
+    }
+
+    /// Samples the next token ID from the logits computed by `forward_token(..., need_logits = true)`.
+    pub fn sample_next_token(
+        &mut self,
+        params: &SamplingParams,
+        recent_tokens: &[u32],
+    ) -> Result<u32> {
+        let s = self.tide.compute_stream;
+        let vocab = self.cfg.unpadded_vocab_size;
+
+        // Fast GPU argmax path when greedy and no repetition penalty (~5 µs, 512 B D2H!)
+        if params.temperature <= 0.0 && (params.repetition_penalty - 1.0).abs() < 1e-6 {
+            self.backend.argmax_partial_f32(
+                self.scratch.argmax_vals,
+                self.scratch.argmax_idx,
+                self.scratch.logits,
+                vocab,
+                s,
+            )?;
+            let mut v_bytes = [0u8; 64 * 4];
+            let mut i_bytes = [0u8; 64 * 4];
+            self.backend
+                .memcpy_d2h_sync(&mut v_bytes, self.scratch.argmax_vals, 0, s)?;
+            self.backend
+                .memcpy_d2h_sync(&mut i_bytes, self.scratch.argmax_idx, 0, s)?;
+            let mut best_v = f32::NEG_INFINITY;
+            let mut best_i = 0u32;
+            for b in 0..64 {
+                let v = f32::from_le_bytes(v_bytes[b * 4..(b + 1) * 4].try_into().unwrap());
+                let idx = u32::from_le_bytes(i_bytes[b * 4..(b + 1) * 4].try_into().unwrap());
+                if v > best_v {
+                    best_v = v;
+                    best_i = idx;
+                }
+            }
+            return Ok(best_i);
+        }
+
+        // General host sampling path (temperature + top-k + top-p + repetition penalty)
+        let mut logits = vec![0.0f32; vocab];
+        let logits_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(logits.as_mut_ptr() as *mut u8, vocab * 4) };
+        self.backend
+            .memcpy_d2h_sync(logits_bytes, self.scratch.logits, 0, s)?;
+
+        if (params.repetition_penalty - 1.0).abs() > 1e-6 {
+            for &t in recent_tokens {
+                if (t as usize) < vocab {
+                    let v = &mut logits[t as usize];
+                    if *v > 0.0 {
+                        *v /= params.repetition_penalty;
+                    } else {
+                        *v *= params.repetition_penalty;
+                    }
+                }
+            }
+        }
+
+        if params.temperature <= 0.0 {
+            let mut best_i = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for (i, &v) in logits.iter().enumerate() {
+                if v > best_v {
+                    best_v = v;
+                    best_i = i;
+                }
+            }
+            return Ok(best_i as u32);
+        }
+
+        let inv_t = 1.0 / params.temperature;
+        let mut indexed: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i as u32, v * inv_t))
+            .collect();
+        let k = params.top_k.clamp(1, vocab);
+        indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+        indexed.truncate(k);
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let max_l = indexed[0].1;
+        let mut sum = 0.0f32;
+        for (_, v) in &mut indexed {
+            *v = (*v - max_l).exp();
+            sum += *v;
+        }
+        let inv_sum = 1.0 / sum.max(1e-12);
+        let mut cum = 0.0f32;
+        let mut cut = indexed.len();
+        for (i, (_, p)) in indexed.iter_mut().enumerate() {
+            *p *= inv_sum;
+            cum += *p;
+            if cum >= params.top_p {
+                cut = i + 1;
+                break;
+            }
+        }
+        indexed.truncate(cut);
+        let renorm: f32 = indexed.iter().map(|(_, p)| *p).sum();
+
+        // xorshift64*
+        self.rng_state ^= self.rng_state >> 12;
+        self.rng_state ^= self.rng_state << 25;
+        self.rng_state ^= self.rng_state >> 27;
+        let u = ((self.rng_state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32)
+            / ((1u32 << 24) as f32);
+        let target = u * renorm;
+        let mut acc = 0.0f32;
+        for &(id, p) in &indexed {
+            acc += p;
+            if acc >= target {
+                return Ok(id);
+            }
+        }
+        Ok(indexed[0].0)
+    }
+}
+
+impl<B: ComputeBackend> Drop for Inkling2Engine<B> {
+    fn drop(&mut self) {
+        let _ = self.backend.sync_stream(self.tide.compute_stream);
+        let _ = self.backend.free_pinned(self.embed_pinned);
+        for st in &self.layer_states {
+            let _ = self.backend.free_device(st.k_cache);
+            let _ = self.backend.free_device(st.k_scales);
+            let _ = self.backend.free_device(st.v_cache);
+            let _ = self.backend.free_device(st.v_scales);
+            let _ = self.backend.free_device(st.sconv_k);
+            let _ = self.backend.free_device(st.sconv_v);
+            let _ = self.backend.free_device(st.sconv_attn);
+            let _ = self.backend.free_device(st.sconv_mlp);
+        }
+        let s = &self.scratch;
+        for buf in [
+            s.cur, s.embed_tmp, s.inp_sa, s.ffn_inp, s.blocks, s.prelude_cur, s.bank, s.bank_out,
+            s.messages, s.in_qkv, s.ctrl_qkv, s.norm_qkv, s.ctrl_prep, s.ctrl_gate, s.ctrl_gain,
+            s.ctrl_forget, s.q, s.k_raw, s.k, s.v_raw, s.v, s.k_dyn, s.v_dyn, s.r, s.sinks,
+            s.rel_table, s.partial_out, s.partial_m, s.partial_l, s.attn_out, s.gate_out, s.o_raw,
+            s.sconv_tmp, s.moe_in, s.moe_ctrl, s.moe_norm, s.topk_ids, s.topk_weights, s.moe_mid,
+            s.moe_out, s.logits, s.argmax_vals, s.argmax_idx,
+        ] {
+            let _ = self.backend.free_device(buf);
+        }
+    }
+}

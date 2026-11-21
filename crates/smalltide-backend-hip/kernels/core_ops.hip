@@ -142,36 +142,27 @@ extern "C" __global__ void smalltide_gemv_fp8_e4m3_f32(
     const float4* x_vec = reinterpret_cast<const float4*>(x);
     uint32_t k_chunks16 = k_cols >> 4; // 16 bytes = 16 FP8 elements per uint4
 
-    float acc = 0.0f;
-    for (uint32_t c = lane; c < k_chunks16; c += 32u) {
-        uint4 w16 = w_vec[c];
+    // Two 16-byte weight loads in flight per lane per iteration, 4 independent accumulators,
+    // packed hardware FP8 conversion.
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    auto dot16 = [&](uint4 w16, uint32_t c) {
         uint32_t base4 = c << 2;
-
-        float4 x0 = x_vec[base4 + 0];
-        float4 x1 = x_vec[base4 + 1];
-        float4 x2 = x_vec[base4 + 2];
-        float4 x3 = x_vec[base4 + 3];
-
-        acc = fmaf(decode_fp8_e4m3fn(w16.x & 0xFFu),         x0.x, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.x >> 8) & 0xFFu),  x0.y, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.x >> 16) & 0xFFu), x0.z, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.x >> 24) & 0xFFu), x0.w, acc);
-
-        acc = fmaf(decode_fp8_e4m3fn(w16.y & 0xFFu),         x1.x, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.y >> 8) & 0xFFu),  x1.y, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.y >> 16) & 0xFFu), x1.z, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.y >> 24) & 0xFFu), x1.w, acc);
-
-        acc = fmaf(decode_fp8_e4m3fn(w16.z & 0xFFu),         x2.x, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.z >> 8) & 0xFFu),  x2.y, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.z >> 16) & 0xFFu), x2.z, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.z >> 24) & 0xFFu), x2.w, acc);
-
-        acc = fmaf(decode_fp8_e4m3fn(w16.w & 0xFFu),         x3.x, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.w >> 8) & 0xFFu),  x3.y, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.w >> 16) & 0xFFu), x3.z, acc);
-        acc = fmaf(decode_fp8_e4m3fn((w16.w >> 24) & 0xFFu), x3.w, acc);
+        float4 x0 = x_vec[base4 + 0], x1 = x_vec[base4 + 1], x2 = x_vec[base4 + 2], x3 = x_vec[base4 + 3];
+        float4 d0 = decode_fp8x4(w16.x), d1 = decode_fp8x4(w16.y), d2 = decode_fp8x4(w16.z), d3 = decode_fp8x4(w16.w);
+        a0 = fmaf(d0.x, x0.x, a0); a0 = fmaf(d0.y, x0.y, a0); a0 = fmaf(d0.z, x0.z, a0); a0 = fmaf(d0.w, x0.w, a0);
+        a1 = fmaf(d1.x, x1.x, a1); a1 = fmaf(d1.y, x1.y, a1); a1 = fmaf(d1.z, x1.z, a1); a1 = fmaf(d1.w, x1.w, a1);
+        a2 = fmaf(d2.x, x2.x, a2); a2 = fmaf(d2.y, x2.y, a2); a2 = fmaf(d2.z, x2.z, a2); a2 = fmaf(d2.w, x2.w, a2);
+        a3 = fmaf(d3.x, x3.x, a3); a3 = fmaf(d3.y, x3.y, a3); a3 = fmaf(d3.z, x3.z, a3); a3 = fmaf(d3.w, x3.w, a3);
+    };
+    uint32_t c = lane;
+    for (; c + 32u < k_chunks16; c += 64u) {
+        uint4 wa = w_vec[c];
+        uint4 wb = w_vec[c + 32u];
+        dot16(wa, c);
+        dot16(wb, c + 32u);
     }
+    if (c < k_chunks16) dot16(w_vec[c], c);
+    float acc = (a0 + a1) + (a2 + a3);
 
     float sum = wave32_sum(acc);
     if (lane == 0u) {

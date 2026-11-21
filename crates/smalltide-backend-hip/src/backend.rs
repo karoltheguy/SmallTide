@@ -1699,7 +1699,7 @@ impl ComputeBackend for HipBackend {
             (mp.expert_stride_bytes as u64, mp.hidden_size as u32, mp.intermediate_size as u32, 4.0f32, 25.0f32);
         let k = mp.top_k as u32;
         let mut args = [p(&mut a), p(&mut bx), p(&mut c), p(&mut d), p(&mut e), p(&mut st), p(&mut h), p(&mut i), p(&mut gc), p(&mut uc)];
-        let v2 = std::env::var_os("SMALLTIDE_MOE_V2").is_some();
+        let v2 = std::env::var_os("SMALLTIDE_MOE_V3").is_none();
         if v2 {
             self.launch(self.kernels.moe_w13_decode, (i.div_ceil(8), k, 1), 256, &mut args, stream, "launch(moe_w13_decode)")?;
         } else {

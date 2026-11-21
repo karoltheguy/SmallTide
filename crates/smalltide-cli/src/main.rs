@@ -684,8 +684,10 @@ fn run_generate(args: &[String]) {
         let m8 = mxfp8_slots as u32;
         let mut sets: Vec<(String, Vec<u32>, bool)> = Vec::new();
         sets.push(("all 8 missing (launch floor)".to_string(), vec![u32::MAX; 8], false));
-        for st in (0..n4.saturating_sub(8)).step_by(512) {
-            sets.push((format!("nvfp4 slots {st}..{}", st + 8), (st..st + 8).collect(), false));
+        for stride in [1u32, 2, 4, 8, 16, 64, 128] {
+            if 7 * stride < n4 {
+                sets.push((format!("nvfp4 8 slots stride {stride}"), (0..8).map(|i| i * stride).collect(), false));
+            }
         }
         for st in (0..m8.saturating_sub(8)).step_by(160) {
             sets.push((format!("mxfp8 slots {st}..{}", st + 8), (st..st + 8).collect(), true));
@@ -756,6 +758,53 @@ fn run_generate(args: &[String]) {
     let mut next_tok = engine
         .sample_next_token(&sampling, &generated)
         .expect("sample first token");
+
+    if std::env::var_os("SMALLTIDE_GRAPH_BENCH").is_some() {
+        // Dev experiment: GPU time of one decode token, eager vs replayed HIP graph (the graph
+        // bakes in this token's position, so its outputs are not used).
+        let s = engine.tide.compute_stream;
+        let pos0 = prompt_ids.len();
+        for _ in 0..3 {
+            engine.forward_token(next_tok, pos0, false, true).expect("warm");
+            engine.post_decode_tide_step().expect("post");
+            backend.sync_stream(s).expect("sync");
+        }
+        let n = 20;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            engine.forward_token(next_tok, pos0, false, true).expect("eager");
+            backend.sync_stream(s).expect("sync");
+        }
+        let eager = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        engine.post_decode_tide_step().expect("post");
+        engine.run_deferred_tide_step().expect("deferred");
+        backend.sync_stream(s).expect("sync");
+        engine.tide.wait_and_publish_all_pending().expect("drain pending");
+        backend.sync_stream(engine.tide.copy_stream).expect("sync copy");
+        backend.sync_stream(s).expect("sync");
+        let _ = engine.tide.poll_pending();
+        engine.clear_route_log_flag();
+        backend.begin_graph_capture(s).expect("begin capture");
+        let cap = engine.forward_token(next_tok, pos0, false, true);
+        let graph = backend.end_graph_capture(s);
+        match (cap, graph) {
+            (Ok(()), Ok(g)) => {
+                for _ in 0..3 {
+                    backend.launch_graph(g, s).expect("launch");
+                }
+                backend.sync_stream(s).expect("sync");
+                let t0 = Instant::now();
+                for _ in 0..n {
+                    backend.launch_graph(g, s).expect("launch");
+                    backend.sync_stream(s).expect("sync");
+                }
+                let replay = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+                println!("[graph-bench] one decode token: eager {eager:.2} ms | graph replay {replay:.2} ms");
+            }
+            (c, g) => println!("[graph-bench] capture failed: forward={c:?} graph={:?}", g.err()),
+        }
+        return;
+    }
 
     const EOS_ID: u32 = 200_006;
     const EOT_ID: u32 = 199_999;

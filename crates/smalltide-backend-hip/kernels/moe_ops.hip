@@ -279,6 +279,19 @@ extern "C" __global__ void smalltide_moe_w2_accum_indirect(
 // all 8 experts in parallel (grid.y), unweighted per-expert outputs + fused reduce/post.
 // ===========================================================================
 
+// 8 E2M1 nibbles of one word -> floats via byte-permute LUT to FP8 E4M3 codes + hardware cvt.
+// Every E2M1 value {0,.5,1,1.5,2,3,4,6} is exact in E4M3 (0x00,30,38,3C,40,44,48,4C).
+// Returns even nibbles (values 0,2,4,6) in `ev` and odd nibbles (1,3,5,7) in `od`.
+__device__ __forceinline__ void e2m1x8(uint32_t w, float4& ev, float4& od) {
+    const uint32_t LUT_LO = 0x3C383000u, LUT_HI = 0x4C484440u;
+    uint32_t lo = w & 0x0F0F0F0Fu;
+    uint32_t hi = (w >> 4) & 0x0F0F0F0Fu;
+    uint32_t c_lo = __builtin_amdgcn_perm(LUT_HI, LUT_LO, lo & 0x07070707u) | ((lo & 0x08080808u) << 4);
+    uint32_t c_hi = __builtin_amdgcn_perm(LUT_HI, LUT_LO, hi & 0x07070707u) | ((hi & 0x08080808u) << 4);
+    ev = decode_fp8x4(c_lo);
+    od = decode_fp8x4(c_hi);
+}
+
 // dot of a 16-byte NVFP4 chunk (32 values, 2 scale blocks) with 32 consecutive activations.
 __device__ __forceinline__ float nvfp4_chunk_dot(uint4 w, float s0, float s1, const float4* __restrict__ x8) {
     uint32_t wd[4] = {w.x, w.y, w.z, w.w};
@@ -286,16 +299,15 @@ __device__ __forceinline__ float nvfp4_chunk_dot(uint4 w, float s0, float s1, co
     #pragma unroll
     for (uint32_t j = 0u; j < 4u; ++j) {
         float4 xa = x8[2u * j], xb = x8[2u * j + 1u];
-        uint32_t v = wd[j];
-        float a = 0.0f;
-        a = fmaf(fp4x2(v), xa.x, a);         a = fmaf(fp4x2(v >> 4), xa.y, a);
-        a = fmaf(fp4x2(v >> 8), xa.z, a);    a = fmaf(fp4x2(v >> 12), xa.w, a);
-        a = fmaf(fp4x2(v >> 16), xb.x, a);   a = fmaf(fp4x2(v >> 20), xb.y, a);
-        a = fmaf(fp4x2(v >> 24), xb.z, a);   a = fmaf(fp4x2(v >> 28), xb.w, a);
+        float4 ev, od;
+        e2m1x8(wd[j], ev, od);
+        // word j holds values 8j..8j+7: even nibbles -> xa.x, xa.z, xb.x, xb.z; odd -> xa.y, xa.w, xb.y, xb.w
+        float a = ev.x * xa.x;
+        a = fmaf(od.x, xa.y, a); a = fmaf(ev.y, xa.z, a); a = fmaf(od.y, xa.w, a);
+        a = fmaf(ev.z, xb.x, a); a = fmaf(od.z, xb.y, a); a = fmaf(ev.w, xb.z, a); a = fmaf(od.w, xb.w, a);
         if (j < 2u) acc0 += a; else acc1 += a;
     }
-    // fp4x2 returns 2x the E2M1 value: fold the 0.5 into the block scales.
-    return 0.5f * (acc0 * s0 + acc1 * s1);
+    return acc0 * s0 + acc1 * s1;
 }
 
 // dot of a 16-byte MXFP8 chunk (16 values; one UE8M0 scale per 32) with 16 activations.
@@ -425,6 +437,7 @@ extern "C" __global__ void smalltide_moe_post_decode(
 // keeps two rows' loads in flight.
 // ===========================================================================
 #define ST_MOE3_ROWS_PER_BLOCK 32u
+#define ST_MOE3_MAX_K 2304u // hidden (w13) / intermediate (w2) staged in LDS
 
 struct MoeBlockCtx {
     const uint8_t* w;
@@ -489,9 +502,13 @@ extern "C" __global__ void smalltide_moe_w13_decode3(
     uint64_t slab_stride, uint32_t hidden, uint32_t inter, float gate_cap, float up_cap
 ) {
     __shared__ MoeBlockCtx ctx;
+    __shared__ float4 sx4[ST_MOE3_MAX_K / 4];
     uint32_t k = blockIdx.y;
+    // Stage the activation vector in LDS once per block (it is re-read for every weight chunk).
+    for (uint32_t i = threadIdx.x; i < (hidden >> 2); i += blockDim.x) sx4[i] = reinterpret_cast<const float4*>(x)[i];
     moe3_resolve(&ctx, pool, slot_table, topk_ids, k, slab_stride, true);
     if (ctx.valid == 0u) return;
+    const float* xs = reinterpret_cast<const float*>(sx4);
     uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     size_t wrow = (ctx.tag == 0u) ? (hidden >> 1) : hidden;
     size_t srow = (ctx.tag == 0u) ? (hidden >> 4) : (hidden >> 5);
@@ -501,7 +518,7 @@ extern "C" __global__ void smalltide_moe_w13_decode3(
         if (r >= inter) break;
         float g, u;
         moe3_row_dot2(ctx.tag, ctx.w + (2u * r) * wrow, ctx.sc + (2u * r) * srow,
-                      ctx.w + (2u * r + 1u) * wrow, ctx.sc + (2u * r + 1u) * srow, x, hidden, lane, &g, &u);
+                      ctx.w + (2u * r + 1u) * wrow, ctx.sc + (2u * r + 1u) * srow, xs, hidden, lane, &g, &u);
         if (lane == 0u) mid[static_cast<size_t>(k) * inter + r] = situ_f32(g * ctx.outer, u * ctx.outer, gate_cap, up_cap);
     }
 }
@@ -513,7 +530,12 @@ extern "C" __global__ void smalltide_moe_w2_decode3(
     uint64_t slab_stride, uint32_t hidden, uint32_t inter
 ) {
     __shared__ MoeBlockCtx ctx;
+    __shared__ float4 sm4[ST_MOE3_MAX_K / 4];
     uint32_t k = blockIdx.y;
+    {
+        const float4* src = reinterpret_cast<const float4*>(mid + static_cast<size_t>(k) * inter);
+        for (uint32_t i = threadIdx.x; i < (inter >> 2); i += blockDim.x) sm4[i] = src[i];
+    }
     moe3_resolve(&ctx, pool, slot_table, topk_ids, k, slab_stride, false);
     uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     uint32_t h0 = blockIdx.x * ST_MOE3_ROWS_PER_BLOCK + warp * 4u;
@@ -525,7 +547,7 @@ extern "C" __global__ void smalltide_moe_w2_decode3(
     }
     size_t wrow = (ctx.tag == 0u) ? (inter >> 1) : inter;
     size_t srow = (ctx.tag == 0u) ? (inter >> 4) : (inter >> 5);
-    const float* m = mid + static_cast<size_t>(k) * inter;
+    const float* m = reinterpret_cast<const float*>(sm4);
     for (uint32_t hh = 0u; hh < 4u; hh += 2u) {
         uint32_t h = h0 + hh;
         if (h >= hidden) break;

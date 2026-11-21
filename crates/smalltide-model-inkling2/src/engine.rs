@@ -448,9 +448,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             b.sync_stream(s)?;
             let t0 = Instant::now();
-            b.moe_decode_experts(self.scratch.moe_mid, self.scratch.moe_tmp, self.scratch.moe_norm, pool, table, ids, params, s)?;
+            // Back-to-back launches so the result is in-stream kernel time, not sync latency.
+            let reps = if flush { 1 } else { 20 };
+            for _ in 0..reps {
+                b.moe_decode_experts(self.scratch.moe_mid, self.scratch.moe_tmp, self.scratch.moe_norm, pool, table, ids, params, s)?;
+            }
             b.sync_stream(s)?;
-            total += t0.elapsed().as_secs_f64() * 1000.0;
+            total += t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
         }
         b.free_device(flush_buf)?;
         b.free_device(table)?;
@@ -556,6 +560,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
         }
         Ok(())
+    }
+
+    /// Dev: drop the pending routing-log readback (used before graph capture experiments).
+    pub fn clear_route_log_flag(&mut self) {
+        self.route_log_inflight = false;
     }
 
     pub fn telemetry(&self) -> &TideTelemetry {

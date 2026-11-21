@@ -64,6 +64,11 @@ unsafe impl Send for Adapter {}
 unsafe impl Sync for Adapter {}
 
 impl Adapter {
+    /// The underlying `IDXGIAdapter3*` (valid while `self` lives).
+    pub fn raw(&self) -> *mut c_void {
+        self.a3
+    }
+
     pub fn open_amd() -> Option<Self> {
         unsafe {
             let lib = libloading::Library::new("dxgi.dll").ok()?;

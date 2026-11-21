@@ -97,6 +97,50 @@ unsafe impl Send for HipBackend {}
 unsafe impl Sync for HipBackend {}
 
 impl HipBackend {
+    /// Imports a shared D3D12 buffer (NT handle) as device memory. The returned buffer is
+    /// borrowed: the D3D12 resource must outlive it.
+    #[cfg(windows)]
+    pub fn import_d3d12_buffer(&self, buf: &crate::d3d12::D3d12Buffer) -> Result<DeviceBuf> {
+        #[repr(C)]
+        struct HandleDesc {
+            ty: i32,
+            handle: *mut c_void,
+            name: *const c_void,
+            size: u64,
+            flags: u32,
+            reserved: [u32; 16],
+        }
+        #[repr(C)]
+        struct BufferDesc {
+            offset: u64,
+            size: u64,
+            flags: u32,
+            reserved: [u32; 16],
+        }
+        type FnImport = unsafe extern "C" fn(*mut *mut c_void, *const HandleDesc) -> i32;
+        type FnMap = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const BufferDesc) -> i32;
+        let lib = unsafe { libloading::Library::new("amdhip64_7.dll") }
+            .map_err(|e| SmallTideError::Backend { backend: "hip", message: format!("reload amdhip64_7.dll: {e}") })?;
+        let (import, map): (FnImport, FnMap) = unsafe {
+            let a = lib.get::<FnImport>(b"hipImportExternalMemory\0").map_err(|e| SmallTideError::Backend { backend: "hip", message: format!("{e}") })?;
+            let b = lib.get::<FnMap>(b"hipExternalMemoryGetMappedBuffer\0").map_err(|e| SmallTideError::Backend { backend: "hip", message: format!("{e}") })?;
+            (*a, *b)
+        };
+        std::mem::forget(lib); // already loaded by the runtime; keep the symbols valid
+        const D3D12_RESOURCE: i32 = 5;
+        const DEDICATED: u32 = 1;
+        let hd = HandleDesc { ty: D3D12_RESOURCE, handle: buf.handle, name: ptr::null(), size: buf.size, flags: DEDICATED, reserved: [0; 16] };
+        let mut ext: *mut c_void = ptr::null_mut();
+        unsafe { check_hip(import(&mut ext, &hd), "hipImportExternalMemory")? };
+        let bd = BufferDesc { offset: 0, size: buf.size, flags: 0, reserved: [0; 16] };
+        let mut dptr: *mut c_void = ptr::null_mut();
+        unsafe { check_hip(map(&mut dptr, ext, &bd), "hipExternalMemoryGetMappedBuffer")? };
+        let size_bytes = buf.size as usize;
+        let did = self.next_handle();
+        self.dev_bufs.lock().unwrap().insert(did, DeviceAlloc { ptr: dptr, size_bytes, borrowed: true });
+        Ok(DeviceBuf { id: did, offset_bytes: 0, size_bytes })
+    }
+
     pub fn new(device_id: i32) -> Result<Self> {
         let rt = HipRuntime::load()?;
         let _ = rt.probe_device(device_id)?;

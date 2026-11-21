@@ -504,7 +504,33 @@ fn run_vram_probe() {
         let _ = backend.free_device(big);
         return;
     }
-    for i in 0..30 {
+    #[cfg(windows)]
+    let d3d = if std::env::var_os("SMALLTIDE_PROBE_D3D12").is_some() {
+        let dev = _wddm.as_ref().and_then(|a| smalltide_backend_hip::d3d12::D3d12Device::create(a.raw()));
+        println!("D3D12 device: {}", if dev.is_some() { "ok" } else { "FAILED" });
+        dev
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let mut d3d_bufs = Vec::new();
+    let n_chunks = std::env::var("SMALLTIDE_PROBE_CHUNKS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(30);
+    for i in 0..n_chunks {
+        #[cfg(windows)]
+        let b = if let Some(dev) = &d3d {
+            match dev.alloc_shared_buffer(chunk as u64).map_err(|e| e).and_then(|db| {
+                let r = backend.import_d3d12_buffer(&db).map_err(|e| format!("{e}"));
+                d3d_bufs.push(db);
+                r
+            }) {
+                Ok(b) => b,
+                Err(e) => { println!("d3d12 alloc failed at chunk {i}: {e}"); break }
+            }
+        } else {
+            let Ok(b) = backend.alloc_device(chunk) else { println!("alloc failed at chunk {i}"); break };
+            b
+        };
+        #[cfg(not(windows))]
         let Ok(b) = backend.alloc_device(chunk) else { println!("alloc failed at chunk {i}"); break };
         let _ = backend.zero_f32(b, chunk / 4, s);
         let _ = backend.sync_stream(s);
@@ -517,6 +543,17 @@ fn run_vram_probe() {
         let free = backend.device_info().map(|d| d.free_vram_bytes as f64 / (1u64 << 30) as f64).unwrap_or(0.0);
         println!("chunk {i:2} ({:5.1} GiB allocated): read {gbs:7.1} GB/s | reported free {free:.2} GiB", (i + 1) as f64 * 0.5);
         bufs.push(b);
+    }
+    if std::env::var_os("SMALLTIDE_PROBE_REREAD").is_some() {
+        for (i, b) in bufs.iter().enumerate() {
+            let t0 = Instant::now();
+            for _ in 0..4 {
+                backend.vec_copy(scratch, *b, chunk / 4, s).expect("copy");
+            }
+            backend.sync_stream(s).expect("sync");
+            let gbs = (4 * chunk) as f64 / t0.elapsed().as_secs_f64() / 1e9;
+            println!("reread chunk {i:2}: {gbs:7.1} GB/s");
+        }
     }
     if let Some(secs) = std::env::var("SMALLTIDE_PROBE_HOLD").ok().and_then(|v| v.parse::<u64>().ok()) {
         println!("holding allocations for {secs}s (pid {})", std::process::id());

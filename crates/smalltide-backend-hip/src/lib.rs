@@ -7,6 +7,8 @@
 pub mod backend;
 pub mod ffi;
 #[cfg(windows)]
+pub mod d3d12;
+#[cfg(windows)]
 pub mod wddm;
 
 pub use backend::HipBackend;

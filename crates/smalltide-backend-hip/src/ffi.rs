@@ -20,6 +20,8 @@ pub type HipGraphExec = *mut c_void;
 pub const HIP_SUCCESS: HipError = 0;
 pub const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+pub const HIP_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
+pub const HIP_ERROR_NOT_READY: HipError = 600;
 pub const HIP_STREAM_NON_BLOCKING: c_uint = 0x01;
 pub const HIP_HOST_MALLOC_DEFAULT: c_uint = 0x00;
 pub const HIP_EVENT_DISABLE_TIMING: c_uint = 0x02;
@@ -43,6 +45,7 @@ type FnHipEventCreateWithFlags = unsafe extern "C" fn(*mut HipEvent, c_uint) -> 
 type FnHipEventDestroy = unsafe extern "C" fn(HipEvent) -> HipError;
 type FnHipEventRecord = unsafe extern "C" fn(HipEvent, HipStream) -> HipError;
 type FnHipEventSynchronize = unsafe extern "C" fn(HipEvent) -> HipError;
+type FnHipEventQuery = unsafe extern "C" fn(HipEvent) -> HipError;
 type FnHipMemcpy = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> HipError;
 type FnHipMemcpyAsync =
     unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, HipStream) -> HipError;
@@ -171,6 +174,7 @@ pub struct HipRuntime {
     pub hip_event_destroy: FnHipEventDestroy,
     pub hip_event_record: FnHipEventRecord,
     pub hip_event_synchronize: FnHipEventSynchronize,
+    pub hip_event_query: FnHipEventQuery,
     pub hip_memcpy: FnHipMemcpy,
     pub hip_memcpy_async: FnHipMemcpyAsync,
     pub hip_module_load_data: FnHipModuleLoadData,
@@ -252,6 +256,7 @@ impl HipRuntime {
             hip_event_destroy: load_sym!(b"hipEventDestroy\0", FnHipEventDestroy),
             hip_event_record: load_sym!(b"hipEventRecord\0", FnHipEventRecord),
             hip_event_synchronize: load_sym!(b"hipEventSynchronize\0", FnHipEventSynchronize),
+            hip_event_query: load_sym!(b"hipEventQuery\0", FnHipEventQuery),
             hip_memcpy: load_sym!(b"hipMemcpy\0", FnHipMemcpy),
             hip_memcpy_async: load_sym!(b"hipMemcpyAsync\0", FnHipMemcpyAsync),
             hip_module_load_data: load_sym!(b"hipModuleLoadData\0", FnHipModuleLoadData),

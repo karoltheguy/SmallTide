@@ -29,6 +29,9 @@ pub struct LayerDispatchPlan {
     /// Exact renormalization multiplier (`sum(all_topk_weights) / sum(executed_weights)`)
     /// when tail misses are skipped in `Disabled` or `Threshold` mode.
     pub weight_renorm_scale: f32,
+    /// True if a top-k expert's async DMA is still in flight: the compute stream must wait on the
+    /// copy stream (GPU-side) and the pending experts must be published before the MoE kernel.
+    pub wait_pending: bool,
 }
 
 pub struct TideScheduler {
@@ -97,7 +100,7 @@ impl TideScheduler {
             if !self.cache.has_free_vram_room_for(id) {
                 break;
             }
-            if let Some(op) = self.cache.promote_to_vram(id, true) {
+            if let Some(op) = self.cache.promote_to_vram(id, true, true) {
                 self.record_transfer_telemetry(&op, false);
                 ops.push(op);
             }
@@ -124,7 +127,7 @@ impl TideScheduler {
 
         for &(id, _) in &outer_experts {
             if self.cache.has_free_vram_room_for(id) {
-                if let Some(op) = self.cache.promote_to_vram(id, false) {
+                if let Some(op) = self.cache.promote_to_vram(id, false, true) {
                     self.record_transfer_telemetry(&op, false);
                     ops.push(op);
                 }
@@ -184,7 +187,7 @@ impl TideScheduler {
                 continue;
             }
             let pin = self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
-            if let Some(op) = self.cache.promote_to_vram(id, pin) {
+            if let Some(op) = self.cache.promote_to_vram(id, pin, true) {
                 self.record_transfer_telemetry(&op, false);
                 ops.push(op);
                 swaps += 1;
@@ -227,6 +230,14 @@ impl TideScheduler {
         let mut hit_experts = Vec::with_capacity(topk_ids.len());
         let mut sync_transfers = Vec::new();
         let mut rescued_experts = Vec::new();
+        let mut wait_pending = false;
+
+        // Bug fix: a sync rescue must never evict another expert of this same top-k.
+        let protect: Vec<ExpertId> = topk_ids
+            .iter()
+            .map(|&e| ExpertId { layer, expert: e })
+            .collect();
+        self.cache.set_protected(&protect);
 
         let total_weight: f32 = topk_weights.iter().sum();
         let inv_total_w = if total_weight > 1e-8 { 1.0 / total_weight } else { 1.0 };
@@ -238,6 +249,10 @@ impl TideScheduler {
             self.cache.touch_expert(id, norm_w);
 
             let entry = self.cache.entry(id);
+            if self.cache.is_vram_pending(id) && !entry.is_scratch_slot {
+                // Async promotion already in flight: wait for it on the GPU instead of re-copying.
+                wait_pending = true;
+            }
             if !entry.vram_slot.is_missing() {
                 self.record_hit(layer);
                 hit_experts.push(ActiveExpertSlot {
@@ -264,7 +279,7 @@ impl TideScheduler {
                 // never thrash warm resident experts!
                 if self.cache.should_promote_instead_of_scratch(id) {
                     let pin = self.model_cfg.is_loop_core_layer(layer.0 as usize);
-                    if let Some(op) = self.cache.promote_to_vram(id, pin) {
+                    if let Some(op) = self.cache.promote_to_vram(id, pin, true) {
                         self.record_transfer_telemetry(&op, true);
                         sync_transfers.push(op);
                         let new_slot = self.cache.entry(id).vram_slot;
@@ -300,6 +315,7 @@ impl TideScheduler {
             }
         }
 
+        self.cache.clear_protected();
         let weight_renorm_scale = if executed_weight > 1e-8 && executed_weight < total_weight {
             total_weight / executed_weight
         } else {
@@ -311,6 +327,7 @@ impl TideScheduler {
             sync_transfers,
             rescued_experts,
             weight_renorm_scale,
+            wait_pending,
         }
     }
 
@@ -359,7 +376,7 @@ impl TideScheduler {
                     && self.cache.is_ram_ready(id)
                 {
                     let pin = self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
-                    if let Some(op) = self.cache.promote_to_vram(id, pin) {
+                    if let Some(op) = self.cache.promote_to_vram(id, pin, false) {
                         self.record_transfer_telemetry(&op, false);
                         ops.push(op);
                         done += 1;
@@ -418,8 +435,18 @@ impl TideScheduler {
             if !beats_coldest {
                 break;
             }
+            if !self.cache.is_ram_ready(id) {
+                // Bug fix: never block decode on NVMe. Queue an async Disk->RAM read (if not
+                // already in flight) and let Mode 3 promote it once it is Ready.
+                if let Some(op) = self.cache.promote_to_ram_with_flag(id, true) {
+                    self.record_transfer_telemetry(&op, false);
+                    ops.push(op);
+                }
+                *self.pending_async_vram.entry(id).or_insert(0.0) += h;
+                continue;
+            }
             let pin = self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
-            if let Some(op) = self.cache.promote_to_vram(id, pin) {
+            if let Some(op) = self.cache.promote_to_vram(id, pin, false) {
                 self.record_transfer_telemetry(&op, false);
                 ops.push(op);
             }
@@ -513,6 +540,7 @@ mod tests {
         // Mode 1: Pre-prefill warm-up at short context (0.6 GiB KV)
         sched.cache.set_kv_reserved_bytes((0.6 * GIB as f64) as usize);
         let ops = sched.plan_pre_prefill(None);
+        sched.cache.publish_all_pending(); // executor would publish once DMAs land
         assert!(!ops.is_empty());
 
         let (pre, loop_c, coda) = sched.cache.count_vram_resident();
@@ -538,6 +566,7 @@ mod tests {
         // Tight RAM budget (2 GiB) forces Stage 2 Disk->RAM streaming!
         let mut sched = TideScheduler::new(model_cfg, tide_cfg, 8 * GIB, 2 * GIB);
         let _ = sched.plan_pre_prefill(None);
+        sched.cache.publish_all_pending();
         assert!(sched.cache.ram_used_bytes() <= 2 * GIB);
 
         // Mode 2: Prefill activates specific outer-layer Coda experts (layer 22)
@@ -547,6 +576,7 @@ mod tests {
             sched.record_prefill_routing(PhysicalLayerId(22), &hot_ids, &weights);
         }
         let rebal = sched.plan_prefill_decode_rebalance(32);
+        sched.cache.publish_all_pending();
         assert!(!rebal.is_empty());
         for &e in &hot_ids {
             assert!(
@@ -582,6 +612,7 @@ mod tests {
         tide_cfg.rescue_policy = RescuePolicy::Exact;
         let mut sched = TideScheduler::new(model_cfg, tide_cfg, 8 * GIB, 16 * GIB);
         let _ = sched.plan_pre_prefill(None);
+        sched.cache.publish_all_pending();
 
         // Warm up ALL currently VRAM-resident outer experts so they are hot (heat >= 5.0)
         for l in 0..24u16 {
@@ -623,5 +654,83 @@ mod tests {
         sched.consolidate_priors(&mut priors, 0.4);
         assert_eq!(priors.sessions_recorded, 1);
         assert!(priors.scores[23 * 128 + 126] > 0.5);
+    }
+
+    fn eid(l: u16, e: u16) -> ExpertId {
+        ExpertId { layer: PhysicalLayerId(l), expert: e }
+    }
+
+    /// Review bug 2: a sync rescue must never evict another expert of the same layer's top-k.
+    #[test]
+    fn test_sync_rescue_never_evicts_current_topk() {
+        let model_cfg = Inkling2Config::default();
+        let mut tide_cfg = TideConfig::default();
+        tide_cfg.rescue_policy = RescuePolicy::Exact;
+        let mut sched = TideScheduler::new(model_cfg, tide_cfg, 16 * GIB, 16 * GIB);
+        // Only 2 MXFP8 VRAM slots: layer 20 experts 0 and 1 end up resident.
+        sched.cache.configure_scratch_ring(2560, 2, 8);
+        let _ = sched.plan_pre_prefill(None);
+        sched.cache.publish_all_pending();
+        assert!(sched.cache.is_vram_hit(eid(20, 0)) && sched.cache.is_vram_hit(eid(20, 1)));
+
+        // Expert 0 is the coldest resident, expert 1 is warm, and the missing expert 5 is hot.
+        sched.cache.touch_expert(eid(20, 1), 5.0);
+        sched.cache.touch_expert(eid(20, 5), 10.0);
+        // top-k = [5 (miss), 0 (hit)]: the rescue for 5 must evict 1, not the in-use expert 0.
+        let plan = sched.plan_layer_dispatch(PhysicalLayerId(20), &[5, 0], &[0.6, 0.4]);
+        assert_eq!(plan.sync_transfers.len(), 1);
+        assert!(
+            matches!(plan.sync_transfers[0], TransferOp::RamToVram { evicted_from_vram: Some(v), .. } if v == eid(20, 1)),
+            "rescue evicted the wrong expert: {:?}",
+            plan.sync_transfers[0]
+        );
+        assert!(sched.cache.is_vram_hit(eid(20, 0)), "current top-k expert was evicted");
+        sched.cache.publish_all_pending();
+        assert!(sched.cache.is_vram_hit(eid(20, 5)));
+    }
+
+    /// Review bug 1 (CPU side): an in-flight promotion is not a hit and never shows in the table.
+    #[test]
+    fn test_pending_promotion_is_not_published() {
+        let model_cfg = Inkling2Config::default();
+        let tide_cfg = TideConfig::default();
+        let mut sched = TideScheduler::new(model_cfg, tide_cfg, 16 * GIB, 16 * GIB);
+        sched.cache.configure_scratch_ring(2560, 512, 8);
+        let id = eid(21, 3);
+        let _ = sched.cache.promote_to_ram(id);
+        let op = sched.cache.promote_to_vram(id, false, false).expect("RAM-ready promotion");
+        assert!(matches!(op, TransferOp::RamToVram { .. }));
+        assert!(sched.cache.is_vram_pending(id) && !sched.cache.is_vram_hit(id));
+        let flat = sched.cache.flat_index(id);
+        assert_eq!(sched.cache.gpu_slot_table()[flat], SlotIndex::MISSING.0);
+        // A layer that needs it must wait on the copy instead of reading a half-written slot.
+        let plan = sched.plan_layer_dispatch(PhysicalLayerId(21), &[3], &[1.0]);
+        assert!(plan.wait_pending && plan.sync_transfers.is_empty());
+        let slot = sched.cache.entry(id).vram_slot;
+        assert!(sched.cache.publish_vram(id, slot));
+        assert_eq!(sched.cache.gpu_slot_table()[flat], slot.0);
+    }
+
+    /// Review bug 3: decode-time async paths never issue blocking Disk->VRAM reads.
+    #[test]
+    fn test_async_paths_never_block_on_disk() {
+        let model_cfg = Inkling2Config::default();
+        let mut tide_cfg = TideConfig::default();
+        tide_cfg.preload_before_prefill = false;
+        let mut sched = TideScheduler::new(model_cfg, tide_cfg, 16 * GIB, 16 * GIB);
+        // Nothing is in RAM; a hot expert would previously be promoted via DiskToVramDirect.
+        let hot = eid(22, 7);
+        for _ in 0..10 {
+            sched.cache.touch_expert(hot, 1.0);
+        }
+        let ops = sched.maybe_periodic_rebalance(0, 64, 8, true);
+        assert!(ops.iter().all(|op| !matches!(op, TransferOp::DiskToVramDirect { .. })));
+        assert!(ops.iter().any(|op| matches!(op, TransferOp::DiskToRam { expert, .. } if *expert == hot)));
+        assert!(!sched.cache.is_ram_ready(hot), "read must be marked in flight");
+        // Once the background read lands, Mode 3 promotes it RAM->VRAM.
+        sched.cache.mark_ram_ready(hot);
+        let ops2 = sched.plan_async_step();
+        assert!(ops2.iter().any(|op| matches!(op, TransferOp::RamToVram { expert, .. } if *expert == hot)));
+        assert!(ops2.iter().all(|op| !matches!(op, TransferOp::DiskToVramDirect { .. })));
     }
 }

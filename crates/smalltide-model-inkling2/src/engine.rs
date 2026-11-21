@@ -119,14 +119,23 @@ struct ActivationScratch {
     moe_in: DeviceBuf,      // [H]
     moe_ctrl: DeviceBuf,    // [H]
     moe_norm: DeviceBuf,    // [H]
-    topk_ids: DeviceBuf,    // [8] u32
-    topk_weights: DeviceBuf,// [8] f32
+    /// Per-logical-layer router output log: `[48][16]` u32 words = 8 ids then 8 f32 weights.
+    /// One combined D2H per partial layer, one async D2H per token for heat bookkeeping.
+    route_log: DeviceBuf,
     moe_mid: DeviceBuf,     // [8 * 1152] f32
     moe_out: DeviceBuf,     // [H]
 
     logits: DeviceBuf,      // [unpadded_vocab_size] f32
-    argmax_vals: DeviceBuf, // [64] f32
-    argmax_idx: DeviceBuf,  // [64] u32
+    argmax_buf: DeviceBuf,  // [64] f32 vals + [64] u32 idx (single D2H)
+}
+
+const ROUTE_WORDS: usize = 16;
+
+/// Optional per-token hidden-state dump for reference verification (`SMALLTIDE_DUMP_DIR`).
+struct DumpState {
+    dir: std::path::PathBuf,
+    hidden: Vec<f32>, // [num_logical * H]
+    routes: Vec<u32>, // [num_logical * 8]
 }
 
 pub struct Inkling2Engine<B: ComputeBackend> {
@@ -138,6 +147,14 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     layer_states: Vec<LogicalLayerState>,
     scratch: ActivationScratch,
     embed_pinned: PinnedBuf,
+    route_log_host: PinnedBuf,
+    route_log_event: smalltide_core::Event,
+    route_log_inflight: bool,
+    route_log_is_prefill: bool,
+    /// Logical layers whose routing the scheduler already saw this token (partial layers).
+    layer_planned: Vec<bool>,
+    dump: Option<DumpState>,
+    dump_token: (u32, usize),
     rng_state: u64,
     tokens_decoded: u64,
     pub profile_enabled: bool,
@@ -229,17 +246,27 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             moe_in: alloc_f32(h)?,
             moe_ctrl: alloc_f32(h)?,
             moe_norm: alloc_f32(h)?,
-            topk_ids: backend.alloc_device(cfg.num_experts_per_tok * 4)?,
-            topk_weights: alloc_f32(cfg.num_experts_per_tok)?,
+            route_log: backend.alloc_device(num_logical * ROUTE_WORDS * 4)?,
             moe_mid: alloc_f32(cfg.num_experts_per_tok * cfg.intermediate_size)?,
             moe_out: alloc_f32(h)?,
             logits: alloc_f32(cfg.unpadded_vocab_size)?,
-            argmax_vals: alloc_f32(64)?,
-            argmax_idx: backend.alloc_device(64 * 4)?,
+            argmax_buf: backend.alloc_device(128 * 4)?,
         };
+        backend.zero_f32(scratch.route_log, num_logical * ROUTE_WORDS, stream)?;
 
         let embed_pinned = backend.alloc_pinned(h * 4)?;
+        let route_log_host = backend.alloc_pinned(num_logical * ROUTE_WORDS * 4)?;
+        let route_log_event = backend.create_event()?;
         backend.sync_stream(stream)?;
+        let dump = std::env::var_os("SMALLTIDE_DUMP_DIR").map(|d| {
+            let dir = std::path::PathBuf::from(d);
+            let _ = std::fs::create_dir_all(&dir);
+            DumpState {
+                dir,
+                hidden: vec![0.0; num_logical * h],
+                routes: vec![0; num_logical * 8],
+            }
+        });
 
         Ok(Self {
             backend,
@@ -250,6 +277,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             layer_states,
             scratch,
             embed_pinned,
+            route_log_host,
+            route_log_event,
+            route_log_inflight: false,
+            route_log_is_prefill: false,
+            layer_planned: vec![false; num_logical],
+            dump,
+            dump_token: (0, 0),
             rng_state: 0x9E37_79B9_7F4A_7C15,
             tokens_decoded: 0,
             profile_enabled: false,
@@ -301,6 +335,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
     /// Mode 3 + Periodic Rebalance: Called once after each decoded token.
     pub fn post_decode_tide_step(&mut self) -> Result<()> {
+        self.consume_route_log()?;
         let _ = self.tide.poll_stage2_completions()?;
         let async_ops = self.tide.scheduler.plan_async_step();
         if !async_ops.is_empty() {
@@ -314,6 +349,54 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             .maybe_periodic_rebalance(self.tokens_decoded, 64, 16, false);
         if !reb_ops.is_empty() {
             self.tide.execute_transfers(&reb_ops, false, false)?;
+        }
+        Ok(())
+    }
+
+    /// Folds the last token's router log (fully-resident layers, which skip the per-layer
+    /// readback) into the cache's heat / prefill scores, so eviction and priors see every layer.
+    fn consume_route_log(&mut self) -> Result<()> {
+        if !self.route_log_inflight {
+            return Ok(());
+        }
+        self.backend.sync_event(self.route_log_event)?;
+        self.route_log_inflight = false;
+        let num_logical = self.layer_planned.len();
+        let words: Vec<u32> = unsafe {
+            let bytes = self.backend.pinned_as_mut_slice(self.route_log_host)?;
+            bytes[..num_logical * ROUTE_WORDS * 4]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        for il in 0..num_logical {
+            if self.layer_planned[il] {
+                continue;
+            }
+            let (phys, _) = crate::map_logical_to_physical(
+                &self.cfg,
+                smalltide_core::LogicalLayerId(il as u16),
+            );
+            let w = &words[il * ROUTE_WORDS..(il + 1) * ROUTE_WORDS];
+            let mut ids = [0u16; 8];
+            let mut ws = [0f32; 8];
+            let mut tot = 0.0f32;
+            for k in 0..8 {
+                ids[k] = w[k] as u16;
+                ws[k] = f32::from_bits(w[8 + k]);
+                tot += ws[k];
+            }
+            if self.route_log_is_prefill {
+                self.tide.scheduler.record_prefill_routing(phys, &ids, &ws);
+            } else {
+                let inv = if tot > 1e-8 { 1.0 / tot } else { 0.0 };
+                for k in 0..8 {
+                    self.tide.scheduler.cache.touch_expert(
+                        smalltide_core::ExpertId { layer: phys, expert: ids[k] },
+                        ws[k] * inv,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -710,9 +793,12 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
         let t_rt = self.prof_mark(s);
         let layer = &self.dense.layers[ip];
+        let topk_ids = self.scratch.route_log.slice(il * ROUTE_WORDS * 4, 32);
+        let topk_weights = self.scratch.route_log.slice(il * ROUTE_WORDS * 4 + 32, 32);
+        let route_row = self.scratch.route_log.slice(il * ROUTE_WORDS * 4, ROUTE_WORDS * 4);
         self.backend.router_topk8(
-            self.scratch.topk_ids,
-            self.scratch.topk_weights,
+            topk_ids,
+            topk_weights,
             self.scratch.moe_norm,
             layer.router_weight,
             Some(layer.router_bias),
@@ -726,25 +812,41 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let phys_id = PhysicalLayerId(ip as u16);
         let fully_resident = self.tide.scheduler.is_layer_fully_resident_vram(phys_id);
         let mut rescue_ms_local = 0.0f64;
-        if fully_resident {
+        let need_dump_routes = self.dump.is_some();
+        if fully_resident && !need_dump_routes {
             self.tide
                 .scheduler
                 .record_full_layer_hit(phys_id, self.cfg.num_experts_per_tok as u64);
+        } else if fully_resident {
+            self.tide
+                .scheduler
+                .record_full_layer_hit(phys_id, self.cfg.num_experts_per_tok as u64);
+            let mut rb = [0u8; 64];
+            self.backend.memcpy_d2h_sync(&mut rb, route_row, 0, s)?;
+            if let Some(d) = self.dump.as_mut() {
+                for k in 0..8 {
+                    d.routes[il * 8 + k] =
+                        u32::from_le_bytes(rb[k * 4..(k + 1) * 4].try_into().unwrap());
+                }
+            }
         } else {
-            let mut ids_bytes = [0u8; 32];
-            let mut w_bytes = [0u8; 32];
-            self.backend
-                .memcpy_d2h_sync(&mut ids_bytes, self.scratch.topk_ids, 0, s)?;
-            self.backend
-                .memcpy_d2h_sync(&mut w_bytes, self.scratch.topk_weights, 0, s)?;
+            // One combined 64 B readback (ids + weights are adjacent in the routing log).
+            let mut rb = [0u8; 64];
+            self.backend.memcpy_d2h_sync(&mut rb, route_row, 0, s)?;
             let mut topk_ids_u16 = [0u16; 8];
             let mut topk_w_f32 = [0.0f32; 8];
             for k in 0..8 {
                 topk_ids_u16[k] =
-                    u32::from_le_bytes(ids_bytes[k * 4..(k + 1) * 4].try_into().unwrap()) as u16;
+                    u32::from_le_bytes(rb[k * 4..(k + 1) * 4].try_into().unwrap()) as u16;
                 topk_w_f32[k] =
-                    f32::from_le_bytes(w_bytes[k * 4..(k + 1) * 4].try_into().unwrap());
+                    f32::from_le_bytes(rb[32 + k * 4..32 + (k + 1) * 4].try_into().unwrap());
             }
+            if let Some(d) = self.dump.as_mut() {
+                for k in 0..8 {
+                    d.routes[il * 8 + k] = topk_ids_u16[k] as u32;
+                }
+            }
+            self.layer_planned[il] = true;
             if is_prefill {
                 self.tide
                     .scheduler
@@ -756,11 +858,24 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 .plan_layer_dispatch(phys_id, &topk_ids_u16, &topk_w_f32);
             if !plan.sync_transfers.is_empty() {
                 let tr0 = Instant::now();
+                // Sync path: compute waits for the copies and publishes everything pending.
                 self.tide
                     .execute_transfers(&plan.sync_transfers, true, false)?;
                 if self.profile_enabled {
                     let _ = self.backend.sync_stream(self.tide.copy_stream);
                     rescue_ms_local = tr0.elapsed().as_secs_f64() * 1000.0;
+                }
+            } else if plan.wait_pending {
+                // A top-k expert's async DMA is still in flight: wait on the GPU, then publish.
+                self.tide.wait_and_publish_all_pending()?;
+            }
+            if let Some(d) = self.dump.as_mut() {
+                // Bit 31 marks experts the MoE kernel will skip (unpublished in the GPU table).
+                for k in 0..8 {
+                    let id = smalltide_core::ExpertId { layer: phys_id, expert: topk_ids_u16[k] };
+                    if !self.tide.scheduler.cache.is_vram_hit(id) {
+                        d.routes[il * 8 + k] |= 0x8000_0000;
+                    }
                 }
             }
         }
@@ -795,8 +910,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.scratch.moe_norm,
             pool,
             layer_slot_table,
-            self.scratch.topk_ids,
-            self.scratch.topk_weights,
+            topk_ids,
+            topk_weights,
             MoeDispatchParams {
                 batch_size: 1,
                 hidden_size: h,
@@ -823,6 +938,44 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             .vec_add(self.scratch.cur, self.scratch.ffn_inp, self.scratch.sconv_tmp, h, s)?;
         let dt_moe = self.prof_end(t_moe, s);
         if self.profile_enabled { self.profile.moe_ms += dt_moe; }
+        if self.dump.is_some() {
+            let mut hb = vec![0u8; h * 4];
+            self.backend.memcpy_d2h_sync(&mut hb, self.scratch.cur, 0, s)?;
+            let d = self.dump.as_mut().unwrap();
+            for (i, c) in hb.chunks_exact(4).enumerate() {
+                d.hidden[il * h + i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes `tok{pos}.bin`: magic, pos, token, num_logical, hidden, has_logits, then
+    /// `[num_logical][hidden]` f32 layer outputs, `[num_logical][8]` u32 routed ids and
+    /// optionally `[unpadded_vocab]` f32 logits.
+    fn write_dump(&mut self, has_logits: bool) -> Result<()> {
+        let s = self.tide.compute_stream;
+        let vocab = self.cfg.unpadded_vocab_size;
+        let mut logits = Vec::new();
+        if has_logits {
+            logits = vec![0u8; vocab * 4];
+            self.backend.memcpy_d2h_sync(&mut logits, self.scratch.logits, 0, s)?;
+        }
+        let (tok, pos) = self.dump_token;
+        let d = self.dump.as_ref().unwrap();
+        let n_log = self.layer_planned.len();
+        let mut out = Vec::with_capacity(24 + d.hidden.len() * 4 + d.routes.len() * 4 + logits.len());
+        for v in [0x5354_4450u32, pos as u32, tok, n_log as u32, self.cfg.hidden_size as u32, has_logits as u32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &d.hidden {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in &d.routes {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&logits);
+        std::fs::write(d.dir.join(format!("tok{pos}.bin")), out)
+            .map_err(|e| smalltide_core::SmallTideError::Backend { backend: "dump", message: e.to_string() })?;
         Ok(())
     }
 
@@ -839,6 +992,14 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let h = self.cfg.hidden_size;
         let h_bytes = h * 4;
         let eps = self.cfg.rms_norm_eps;
+
+        // Token boundary: fold the previous token's routing log into heat, then publish any async
+        // promotions whose DMA has landed (non-blocking query; table upload is stream-ordered).
+        self.consume_route_log()?;
+        let published = self.tide.poll_pending()?;
+        self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+        self.layer_planned.iter_mut().for_each(|p| *p = false);
+        self.dump_token = (token_id, pos);
 
         // 0. Host RAM BF16 Embedding Lookup -> Pinned -> GPU -> Embed RMSNorm
         let tok = (token_id as usize).min(self.cfg.vocab_size - 1);
@@ -946,7 +1107,18 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.forward_layer(il, ip, pos, is_prefill, &mut num_blocks, None)?;
         }
 
+        // Async routing-log readback (consumed at the next token boundary).
+        let log_bytes = self.layer_planned.len() * ROUTE_WORDS * 4;
+        self.backend
+            .memcpy_d2h_async(self.route_log_host, 0, self.scratch.route_log, 0, log_bytes, s)?;
+        self.backend.record_event(self.route_log_event, s)?;
+        self.route_log_inflight = true;
+        self.route_log_is_prefill = is_prefill;
+
         if !need_logits {
+            if self.dump.is_some() {
+                self.write_dump(false)?;
+            }
             return Ok(());
         }
 
@@ -997,6 +1169,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.profile.lm_head_ms += dt_lm;
             self.profile.steps += 1;
         }
+        if self.dump.is_some() {
+            self.write_dump(true)?;
+        }
         Ok(())
     }
 
@@ -1012,23 +1187,20 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         // Fast GPU argmax path when greedy and no repetition penalty (~5 µs, 512 B D2H!)
         if params.temperature <= 0.0 && (params.repetition_penalty - 1.0).abs() < 1e-6 {
             self.backend.argmax_partial_f32(
-                self.scratch.argmax_vals,
-                self.scratch.argmax_idx,
+                self.scratch.argmax_buf.slice(0, 256),
+                self.scratch.argmax_buf.slice(256, 256),
                 self.scratch.logits,
                 vocab,
                 s,
             )?;
-            let mut v_bytes = [0u8; 64 * 4];
-            let mut i_bytes = [0u8; 64 * 4];
+            let mut bytes = [0u8; 128 * 4];
             self.backend
-                .memcpy_d2h_sync(&mut v_bytes, self.scratch.argmax_vals, 0, s)?;
-            self.backend
-                .memcpy_d2h_sync(&mut i_bytes, self.scratch.argmax_idx, 0, s)?;
+                .memcpy_d2h_sync(&mut bytes, self.scratch.argmax_buf, 0, s)?;
             let mut best_v = f32::NEG_INFINITY;
             let mut best_i = 0u32;
             for b in 0..64 {
-                let v = f32::from_le_bytes(v_bytes[b * 4..(b + 1) * 4].try_into().unwrap());
-                let idx = u32::from_le_bytes(i_bytes[b * 4..(b + 1) * 4].try_into().unwrap());
+                let v = f32::from_le_bytes(bytes[b * 4..(b + 1) * 4].try_into().unwrap());
+                let idx = u32::from_le_bytes(bytes[256 + b * 4..256 + (b + 1) * 4].try_into().unwrap());
                 if v > best_v {
                     best_v = v;
                     best_i = idx;
@@ -1122,6 +1294,8 @@ impl<B: ComputeBackend> Drop for Inkling2Engine<B> {
     fn drop(&mut self) {
         let _ = self.backend.sync_stream(self.tide.compute_stream);
         let _ = self.backend.free_pinned(self.embed_pinned);
+        let _ = self.backend.free_pinned(self.route_log_host);
+        let _ = self.backend.destroy_event(self.route_log_event);
         for st in &self.layer_states {
             let _ = self.backend.free_device(st.k_cache);
             let _ = self.backend.free_device(st.k_scales);
@@ -1138,8 +1312,8 @@ impl<B: ComputeBackend> Drop for Inkling2Engine<B> {
             s.messages, s.in_qkv, s.ctrl_qkv, s.norm_qkv, s.ctrl_prep, s.ctrl_gate, s.ctrl_gain,
             s.ctrl_forget, s.q, s.k_raw, s.k, s.v_raw, s.v, s.k_dyn, s.v_dyn, s.r, s.sinks,
             s.rel_table, s.partial_out, s.partial_m, s.partial_l, s.attn_out, s.gate_out, s.o_raw,
-            s.sconv_tmp, s.moe_in, s.moe_ctrl, s.moe_norm, s.topk_ids, s.topk_weights, s.moe_mid,
-            s.moe_out, s.logits, s.argmax_vals, s.argmax_idx,
+            s.sconv_tmp, s.moe_in, s.moe_ctrl, s.moe_norm, s.route_log, s.moe_mid,
+            s.moe_out, s.logits, s.argmax_buf,
         ] {
             let _ = self.backend.free_device(buf);
         }

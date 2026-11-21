@@ -16,6 +16,10 @@ pub struct ExpertResidency {
     pub vram_pinned: bool,
     /// True if `vram_slot` currently points to a transient Scratch Rescue slot (not counted in resident bytes).
     pub is_scratch_slot: bool,
+    /// True while the DMA into `vram_slot` may still be in flight: the slot is allocated but NOT yet
+    /// published in the GPU indirection table, so the CPU must not count it as a hit and kernels
+    /// never see it. Cleared by `publish_vram` once the executor knows the copy has landed.
+    pub vram_pending: bool,
     /// Monotonic step when last activated.
     pub last_touch_step: u64,
     /// Loop-weighted EWMA activation heat score.
@@ -30,6 +34,7 @@ impl Default for ExpertResidency {
             ram_in_flight: false,
             vram_pinned: false,
             is_scratch_slot: false,
+            vram_pending: false,
             last_touch_step: 0,
             heat: 0.0,
         }
@@ -103,10 +108,14 @@ pub struct TideCache {
 
     /// Flat table indexed by `layer * n_routed_experts + expert`.
     entries: Vec<ExpertResidency>,
-    /// Mirror of GPU-side indirection table (`u32::MAX` = MISSING).
+    /// Mirror of the *published* GPU-side indirection table (`u32::MAX` = MISSING).
+    /// An expert appears here only once its slab is fully resident (never while `vram_pending`).
     gpu_slot_table: Vec<u32>,
     /// Indices into `gpu_slot_table` modified since the last GPU sync.
     dirty_gpu_indices: HashSet<usize>,
+    /// Flat indices that must not be evicted right now (e.g. the current layer's top-k during a
+    /// sync rescue), so a rescue can never evict an expert the very same kernel is about to read.
+    protected: Vec<usize>,
 
     /// Transient Scratch Rescue Ring state (base slot index & ring cursor per class).
     scratch_base_nvfp4: u32,
@@ -152,6 +161,7 @@ impl TideCache {
             entries: vec![ExpertResidency::default(); total],
             gpu_slot_table: vec![SlotIndex::MISSING.0; total],
             dirty_gpu_indices: HashSet::new(),
+            protected: Vec::new(),
             scratch_base_nvfp4: 4096,
             scratch_base_mxfp8: 4096,
             max_vram_slots_nvfp4: None,
@@ -265,6 +275,7 @@ impl TideCache {
             if self.entries[p_idx].is_scratch_slot {
                 self.entries[p_idx].vram_slot = SlotIndex::MISSING;
                 self.entries[p_idx].is_scratch_slot = false;
+                self.entries[p_idx].vram_pending = false;
                 self.gpu_slot_table[p_idx] = SlotIndex::MISSING.0;
                 self.dirty_gpu_indices.insert(p_idx);
             }
@@ -275,8 +286,7 @@ impl TideCache {
         let idx = self.flat_index(id);
         self.entries[idx].vram_slot = scratch_slot;
         self.entries[idx].is_scratch_slot = true;
-        self.gpu_slot_table[idx] = scratch_slot.0;
-        self.dirty_gpu_indices.insert(idx);
+        self.entries[idx].vram_pending = true;
 
         let src_ram = if self.is_ram_ready(id) {
             Some(self.entries[idx].ram_slot)
@@ -412,10 +422,13 @@ impl TideCache {
         let mut best_score = f64::INFINITY;
 
         for (idx, e) in self.entries.iter().enumerate() {
-            if e.vram_slot.is_missing() || e.is_scratch_slot {
+            if e.vram_slot.is_missing() || e.is_scratch_slot || e.vram_pending {
                 continue;
             }
             if e.vram_pinned && !allow_pinned {
+                continue;
+            }
+            if self.protected.contains(&idx) {
                 continue;
             }
             let id = self.expert_from_flat(idx);
@@ -469,6 +482,7 @@ impl TideCache {
         debug_assert!(!slot.is_missing());
         self.entries[idx].vram_slot = SlotIndex::MISSING;
         self.entries[idx].vram_pinned = false;
+        self.entries[idx].vram_pending = false;
         self.gpu_slot_table[idx] = SlotIndex::MISSING.0;
         self.dirty_gpu_indices.insert(idx);
         self.vram_used_bytes = self.vram_used_bytes.saturating_sub(self.expert_bytes(id));
@@ -563,12 +577,25 @@ impl TideCache {
     }
 
     /// Stage 1 (or Direct Stage 2->0): Promotes `id` into Tier 0 VRAM, optionally pinning it.
-    pub fn promote_to_vram(&mut self, id: ExpertId, pin_in_vram: bool) -> Option<TransferOp> {
+    ///
+    /// The new slot is left `vram_pending` (unpublished) until the executor knows its DMA landed.
+    /// With `allow_disk_direct = false` (every path inside the decode loop except sync rescue) an
+    /// expert that is not Ready in RAM is NOT promoted (returns `None`, nothing evicted); the caller
+    /// should queue an async Disk->RAM read instead of blocking the token loop on NVMe.
+    pub fn promote_to_vram(
+        &mut self,
+        id: ExpertId,
+        pin_in_vram: bool,
+        allow_disk_direct: bool,
+    ) -> Option<TransferOp> {
         let idx = self.flat_index(id);
         if !self.entries[idx].vram_slot.is_missing() && !self.entries[idx].is_scratch_slot {
             if pin_in_vram {
                 self.entries[idx].vram_pinned = true;
             }
+            return None;
+        }
+        if !allow_disk_direct && !self.is_ram_ready(id) {
             return None;
         }
 
@@ -595,7 +622,10 @@ impl TideCache {
         while class_full(self) {
             let mut best: Option<(usize, f64)> = None;
             for (i, e) in self.entries.iter().enumerate() {
-                if e.vram_slot.is_missing() || e.is_scratch_slot || e.vram_pinned {
+                if e.vram_slot.is_missing() || e.is_scratch_slot || e.vram_pinned || e.vram_pending {
+                    continue;
+                }
+                if self.protected.contains(&i) {
                     continue;
                 }
                 let eid = self.expert_from_flat(i);
@@ -628,10 +658,15 @@ impl TideCache {
             ExpertClass::Nvfp4 => self.used_vram_slots_nvfp4 += 1,
             ExpertClass::Mxfp8 => self.used_vram_slots_mxfp8 += 1,
         }
+        // A scratch occupant being promoted: drop its (published) scratch mapping first.
+        if self.entries[idx].is_scratch_slot {
+            self.clear_scratch_occupant(id);
+        }
         self.entries[idx].vram_slot = dst_slot;
         self.entries[idx].is_scratch_slot = false;
         self.entries[idx].vram_pinned = pin_in_vram;
-        self.gpu_slot_table[idx] = dst_slot.0;
+        self.entries[idx].vram_pending = true;
+        self.gpu_slot_table[idx] = SlotIndex::MISSING.0;
         self.dirty_gpu_indices.insert(idx);
         self.vram_used_bytes += need;
 
@@ -670,6 +705,80 @@ impl TideCache {
                 also_keep_ram_slot: keep_ram_slot,
                 evicted_from_vram: evicted_last,
             })
+        }
+    }
+
+    /// True if `id` is published in the GPU table (kernels will compute it) — i.e. a real VRAM hit.
+    #[inline]
+    pub fn is_vram_hit(&self, id: ExpertId) -> bool {
+        let e = &self.entries[self.flat_index(id)];
+        !e.vram_slot.is_missing() && !e.vram_pending
+    }
+
+    /// True if `id` has a VRAM slot whose DMA may still be in flight.
+    #[inline]
+    pub fn is_vram_pending(&self, id: ExpertId) -> bool {
+        let e = &self.entries[self.flat_index(id)];
+        !e.vram_slot.is_missing() && e.vram_pending
+    }
+
+    /// Publishes a pending expert into the GPU table mirror (its DMA is known complete).
+    /// `expected_slot` guards against publishing a slot that was since re-assigned.
+    pub fn publish_vram(&mut self, id: ExpertId, expected_slot: SlotIndex) -> bool {
+        let idx = self.flat_index(id);
+        let e = &mut self.entries[idx];
+        if e.vram_pending && e.vram_slot == expected_slot {
+            e.vram_pending = false;
+            self.gpu_slot_table[idx] = expected_slot.0;
+            self.dirty_gpu_indices.insert(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Publishes every pending expert (caller guarantees all outstanding DMAs are complete in
+    /// compute-stream order, e.g. the compute stream waited on the copy stream's latest event).
+    pub fn publish_all_pending(&mut self) -> usize {
+        let mut n = 0;
+        for idx in 0..self.entries.len() {
+            let e = &mut self.entries[idx];
+            if e.vram_pending && !e.vram_slot.is_missing() {
+                e.vram_pending = false;
+                self.gpu_slot_table[idx] = e.vram_slot.0;
+                self.dirty_gpu_indices.insert(idx);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    pub fn has_dirty_gpu_table(&self) -> bool {
+        !self.dirty_gpu_indices.is_empty()
+    }
+
+    /// Marks experts that must not be evicted until `clear_protected`.
+    pub fn set_protected(&mut self, ids: &[ExpertId]) {
+        self.protected.clear();
+        for &id in ids {
+            let idx = self.flat_index(id);
+            self.protected.push(idx);
+        }
+    }
+
+    pub fn clear_protected(&mut self) {
+        self.protected.clear();
+    }
+
+    fn clear_scratch_occupant(&mut self, id: ExpertId) {
+        let occupants = match self.expert_class(id) {
+            ExpertClass::Nvfp4 => &mut self.scratch_occupants_nvfp4,
+            ExpertClass::Mxfp8 => &mut self.scratch_occupants_mxfp8,
+        };
+        for o in occupants.iter_mut() {
+            if *o == Some(id) {
+                *o = None;
+            }
         }
     }
 

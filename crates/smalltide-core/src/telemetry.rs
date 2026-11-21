@@ -19,6 +19,12 @@ pub struct TideTelemetry {
     pub stage1_sync_rescues: u64,
     pub stage1_skipped_tail_misses: u64,
     pub stage1_bytes_transferred: u64,
+    /// RAM-tier slabs that were missing/stale at DMA time and had to be re-read from NVMe.
+    #[serde(default)]
+    pub stage1_ram_fallback_reads: u64,
+    /// Async promotions published after their DMA completed (pending -> resident).
+    #[serde(default)]
+    pub stage1_async_published: u64,
 
     pub stage2_disk_reads: u64,
     pub stage2_bytes_read: u64,

@@ -5,7 +5,8 @@
 
 use crate::ffi::{
     check_hip, CoreKernels, HipEvent, HipGraph, HipGraphExec, HipRuntime, HipStream,
-    HIP_EVENT_DISABLE_TIMING, HIP_HOST_MALLOC_DEFAULT, HIP_MEMCPY_DEVICE_TO_HOST,
+    HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_HOST_MALLOC_DEFAULT,
+    HIP_MEMCPY_DEVICE_TO_DEVICE, HIP_MEMCPY_DEVICE_TO_HOST,
     HIP_MEMCPY_HOST_TO_DEVICE, HIP_STREAM_CAPTURE_MODE_GLOBAL, HIP_STREAM_NON_BLOCKING,
 };
 use smalltide_core::backend::{FlashDecodeParams, MoeDispatchParams};
@@ -291,9 +292,78 @@ impl ComputeBackend for HipBackend {
         unsafe { check_hip((self.rt.hip_event_synchronize)(e), "hipEventSynchronize") }
     }
 
+    fn query_event(&self, event: Event) -> Result<bool> {
+        let e = self.raw_event(event)?;
+        let code = unsafe { (self.rt.hip_event_query)(e) };
+        match code {
+            0 => Ok(true),
+            HIP_ERROR_NOT_READY => Ok(false),
+            other => check_hip(other, "hipEventQuery").map(|_| false),
+        }
+    }
+
     fn sync_stream(&self, stream: Stream) -> Result<()> {
         let s = self.raw_stream(stream)?;
         unsafe { check_hip((self.rt.hip_stream_synchronize)(s), "hipStreamSynchronize") }
+    }
+
+    fn memcpy_d2h_async(
+        &self,
+        dst: PinnedBuf,
+        dst_offset: usize,
+        src: DeviceBuf,
+        src_offset: usize,
+        len: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let d = self.dev_ptr(src)?;
+        let (h, h_len) = self.pinned_entry(dst)?;
+        if src_offset + len > src.size_bytes || dst_offset + len > h_len {
+            return Err(SmallTideError::Backend {
+                backend: "hip",
+                message: "memcpy_d2h_async out of bounds".into(),
+            });
+        }
+        let s = self.raw_stream(stream)?;
+        unsafe {
+            let src_p = (d as *const u8).add(src_offset) as *const c_void;
+            let dst_p = (h as *mut u8).add(dst_offset) as *mut c_void;
+            check_hip(
+                (self.rt.hip_memcpy_async)(dst_p, src_p, len, HIP_MEMCPY_DEVICE_TO_HOST, s),
+                "hipMemcpyAsync(D2H)",
+            )
+        }
+    }
+
+    fn memcpy_d2d_async(
+        &self,
+        dst: DeviceBuf,
+        dst_offset: usize,
+        src: DeviceBuf,
+        src_offset: usize,
+        len: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let d = self.dev_ptr(dst)?;
+        let sp = self.dev_ptr(src)?;
+        if src_offset + len > src.size_bytes || dst_offset + len > dst.size_bytes {
+            return Err(SmallTideError::Backend {
+                backend: "hip",
+                message: "memcpy_d2d_async out of bounds".into(),
+            });
+        }
+        let s = self.raw_stream(stream)?;
+        unsafe {
+            let src_p = (sp as *const u8).add(src_offset) as *const c_void;
+            let dst_p = (d as *mut u8).add(dst_offset) as *mut c_void;
+            check_hip(
+                (self.rt.hip_memcpy_async)(dst_p, src_p, len, HIP_MEMCPY_DEVICE_TO_DEVICE, s),
+                "hipMemcpyAsync(D2D)",
+            )
+        }
     }
 
     fn memcpy_h2d_async(

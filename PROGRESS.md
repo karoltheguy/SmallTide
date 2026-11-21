@@ -36,6 +36,31 @@
     - Full TideLM 2-stage adaptive loader (`TideCache`, `TideScheduler`, `Stage2IoWorker`, `TidePriors`, `TideExecutor`, `PagedKvManager`, `ContinuousBatchScheduler`).
     - Complete `gfx1201` `.hsaco` kernel library (`core_ops.hip`, `moe_ops.hip`, `attn_ops.hip`, `inkling2_ops.hip`, `batched_ops.hip`) loaded dynamically via `C:\Windows\System32\amdhip64_7.dll`.
 * **See `REVIEW_2026-11-21.md` for reference-checked findings, Tide runtime bugs and the fix plan.**
+
+### Session 2026-11-21 (Claude, local RX 9070 XT) — review follow-up
+* **R1 — Tide runtime fixes (review bugs 1–6) + transformers reference harness: DONE**
+  - Bug 1 (async race): GPU slot table is now written only on the compute stream (dedicated pinned
+    upload ring); copy stream waits on a compute fence before overwriting any slot; new experts stay
+    `vram_pending` (unpublished, never a CPU hit) until their DMA event completes (`poll_pending` at
+    token start) or the compute stream GPU-waits on it (sync rescue / `wait_pending`).
+  - Bug 2: current top-k is `protected` from eviction during `plan_layer_dispatch`.
+  - Bug 3: `promote_to_vram(.., allow_disk_direct)`; periodic rebalance + Mode 3 queue async Disk->RAM
+    instead of blocking NVMe reads.
+  - Bug 4: RAM slabs are tagged with their owning `ExpertId`; mismatch -> blocking re-read + counter
+    `stage1_ram_fallback_reads` (never stale bytes).
+  - Bug 5: router writes into a per-logical-layer routing log; one async D2H per token feeds heat /
+    prefill scores for fully-resident layers too.
+  - Bug 6: one 64 B D2H per partial layer (ids+weights), one 512 B D2H for argmax.
+  - New unit tests: `test_sync_rescue_never_evicts_current_topk`, `test_pending_promotion_is_not_published`,
+    `test_async_paths_never_block_on_disk`.
+  - **Reference harness** `tools/inkling2_loop_ref.py`: runs the engine's dumped tokens
+    (`SMALLTIDE_DUMP_DIR=...`) through transformers PR #51050's own `Inkling2LoopTextModel`
+    (head 430050f, fp32 eager, real checkpoint, experts lazily dequantized by the PR's
+    `Inkling2LoopDequantizeExperts`) and compares all 48 logical layer outputs + logits.
+    Flags: `--emulate-fp8-dense`, `--emulate-fp8-kv`, `--force-engine-routes` (uses the engine's
+    expert choice incl. skipped-expert mask, isolating arithmetic from near-tie router flips).
+    Setup: `python -m venv refenv; pip install torch --index-url https://download.pytorch.org/whl/cpu;
+    pip install safetensors numpy "transformers @ https://github.com/huggingface/transformers/archive/430050f6f71195b76004b5d61bbb446ec0508fb3.zip"`.
 * **Next Actionable Steps:**
   - [ ] **Step 4a (Performance Pass #1 — 2×–2.5× Decode Speedup):**
     - Run `--profile` to inspect the exact `50 ms/tok` breakdown.
@@ -87,6 +112,11 @@
 
 | Benchmark / Check | Measured Result | Parity / Notes |
 | :--- | :--- | :--- |
+| **R1 baseline (before fixes)**, `run -p "What is the capital of France?" -n 64 --temp 0` | Prefill 20.5 tok/s, decode **21.99 tok/s** | Coherent ("Paris."), 22 sync rescues, 254 skipped |
+| **R1 after Tide fixes**, same command | Prefill 22.4 tok/s, decode **23.76 tok/s** | Byte-identical output, 22 sync, 250 skipped |
+| **Reference check, exact rescue, 25 pos** (fp8 dense+KV emulated, engine routes) | layer rel-err 1.7e-3 (L0) -> 1.4e-2 (L47), cos >= 0.9986, argmax **6/6**, KL <= 4e-5 | Smooth growth, no jump at loop-pass/coda boundaries |
+| Reference check, no emulation, free routing | argmax **6/6**, KL <= 3e-3 | Per-layer 1-7% (FP8 KV/weights + router near-tie flips) |
+| **Tide stress** (`--nvfp4-slots 1600 --mxfp8-slots 96`, threshold 0.25, 68 pos) | 15.3% experts skipped, 267 sync rescues, async churn every token; layer rel-err <= 4.0e-2, cos >= 0.9995, argmax 46/48 (2 near-ties) | GPU computed exactly the CPU-published expert set (no stale-slot reads) |
 | **Live 48-Layer Decode (`exact`, RX 9070 XT)** | **18.74 tok/s** (`99.5%` VRAM hit: Pre 100%, Core 100%, Coda 95.8%) | Coherent English + thinking format, `253` Stage 1 sync rescues |
 | **Live 48-Layer Decode (`threshold=0.25`, RX 9070 XT)** | **19.80 tok/s** (`99.4%` VRAM hit: Pre 100%, Core 100%, Coda 95.1%) | Coherent 2-sentence answer, clean EOS, only `26` Stage 1 sync rescues (10× fewer!) |
 | **Live Prefill (`threshold=0.25`, single-token)** | **20.02 tok/s** (Mode 2 boundary rebalance: 95 swaps in `120.2 ms`) | Will jump to 200+ tok/s once batched GEMM prefill is wired |

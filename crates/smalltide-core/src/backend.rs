@@ -121,7 +121,31 @@ pub trait ComputeBackend: Send + Sync {
     fn record_event(&self, event: Event, stream: Stream) -> Result<()>;
     fn stream_wait_event(&self, stream: Stream, event: Event) -> Result<()>;
     fn sync_event(&self, event: Event) -> Result<()>;
+    /// Non-blocking: true once all work captured by the last `record_event` has completed.
+    fn query_event(&self, event: Event) -> Result<bool>;
     fn sync_stream(&self, stream: Stream) -> Result<()>;
+
+    /// Non-blocking D2H DMA from device buffer into a pinned host buffer (ordered on `stream`).
+    fn memcpy_d2h_async(
+        &self,
+        dst: PinnedBuf,
+        dst_offset: usize,
+        src: DeviceBuf,
+        src_offset: usize,
+        len: usize,
+        stream: Stream,
+    ) -> Result<()>;
+
+    /// Non-blocking device-to-device copy (ordered on `stream`).
+    fn memcpy_d2d_async(
+        &self,
+        dst: DeviceBuf,
+        dst_offset: usize,
+        src: DeviceBuf,
+        src_offset: usize,
+        len: usize,
+        stream: Stream,
+    ) -> Result<()>;
 
     /// Non-blocking H2D DMA from pinned staging slice into device buffer at byte offsets.
     fn memcpy_h2d_async(

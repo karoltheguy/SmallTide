@@ -41,6 +41,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/attn_ops.hip");
     println!("cargo:rerun-if-changed=kernels/inkling2_ops.hip");
     println!("cargo:rerun-if-changed=kernels/batched_ops.hip");
+    println!("cargo:rerun-if-changed=kernels/prefill_ops.hip");
     println!("cargo:rerun-if-env-changed=SMALLTIDE_HIPCC");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=HIP_PATH");

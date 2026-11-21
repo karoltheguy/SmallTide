@@ -782,6 +782,35 @@ impl TideCache {
         }
     }
 
+    /// Unmaps every transient Scratch Rescue occupant (their slots are about to be reused, e.g.
+    /// by batched prefill). The caller must upload the table before overwriting the slots.
+    pub fn clear_scratch_ring(&mut self) {
+        let occ: Vec<ExpertId> = self
+            .scratch_occupants_nvfp4
+            .iter_mut()
+            .chain(self.scratch_occupants_mxfp8.iter_mut())
+            .filter_map(|o| o.take())
+            .collect();
+        for id in occ {
+            let idx = self.flat_index(id);
+            if self.entries[idx].is_scratch_slot {
+                self.entries[idx].vram_slot = SlotIndex::MISSING;
+                self.entries[idx].is_scratch_slot = false;
+                self.entries[idx].vram_pending = false;
+                self.gpu_slot_table[idx] = SlotIndex::MISSING.0;
+                self.dirty_gpu_indices.insert(idx);
+            }
+        }
+    }
+
+    /// First Scratch Rescue slot index and ring size of a class.
+    pub fn scratch_ring(&self, cls: ExpertClass) -> (u32, u32) {
+        match cls {
+            ExpertClass::Nvfp4 => (self.scratch_base_nvfp4, self.scratch_ring_size),
+            ExpertClass::Mxfp8 => (self.scratch_base_mxfp8, self.scratch_ring_size),
+        }
+    }
+
     pub fn count_vram_resident(&self) -> (usize, usize, usize) {
         let (mut prelude, mut loop_core, mut coda) = (0, 0, 0);
         for (idx, e) in self.entries.iter().enumerate() {

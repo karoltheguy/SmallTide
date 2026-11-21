@@ -69,6 +69,20 @@
     id-based BPE merges, `ignore_merges`, `Utf8Stream` incremental decoding for streaming.
   - `tools/test_tokenizer.py` (HF tokenizers 0.23.3): 20/20 adversarial cases + 59 repo files
     (268K tokens) identical.
+* **R4a — Rows-batched chunked prefill: DONE** (`crates/smalltide-model-inkling2/src/prefill.rs`,
+  `kernels/prefill_ops.hip`)
+  - Chunks of <= 128 tokens: FP8 rows GEMMs (BM=8), rows attn-res mix / clips (+tau) / sconv scan /
+    KV store, multi-row causal attention over the FP8 KV cache (rel bias + sinks), rows router
+    top-8, expert-grouped MoE (host-planned pair lists, w13+SiTU / w2 / fixed-order reduce).
+    Missing experts are staged into the Scratch Rescue slots in waves: prefill is always exact.
+  - Local KV rings grew to window + chunk = 1152 slots (decode attention takes `window`).
+  - Verified: reference harness 25 pos (forced routes) layer err 1.7e-3 -> 1.2e-2, argmax 6/6;
+    1668-token prompt batched vs token prefill: layers 0-2 <= 1.5e-4 at every position (window,
+    ring and chunk boundaries), global layer 5 past 1024 median 6.9e-4; remaining divergence is
+    router near-tie flips (first flip at 1.4e-4 upstream diff). Server + prefix cache use it
+    (prefix E2E 5/5 identical, tool-call E2E 16/16).
+  - `[Host/tok]` decode line: launches, CPU launch time, sync-blocked time (`SMALLTIDE_KTIMING=1`
+    adds per-kernel event timing; event overhead on WDDM inflates small kernels ~40 us).
 * **R3 — OpenAI tool calling: DONE**
   - `crates/smalltide-cli/src/chat_format.rs`: byte-exact port of `chat_template.jinja`
     (tool_declare with recursively sorted specs, assistant `tool_calls` as
@@ -154,6 +168,8 @@
 | **Reference check, exact rescue, 25 pos** (fp8 dense+KV emulated, engine routes) | layer rel-err 1.7e-3 (L0) -> 1.4e-2 (L47), cos >= 0.9986, argmax **6/6**, KL <= 4e-5 | Smooth growth, no jump at loop-pass/coda boundaries |
 | Reference check, no emulation, free routing | argmax **6/6**, KL <= 3e-3 | Per-layer 1-7% (FP8 KV/weights + router near-tie flips) |
 | **R2 prefix cache E2E** (5 chat turns, 60-98 tok prompts, greedy, exact) | cached 50/60, 60/79, 79/98 tok; warm 3.0-4.8 s vs cold 5.1-7.4 s | 5/5 byte-identical to cold; snapshot 86 MiB pinned |
+| **R4a prefill 1668 tok** (exact) | batched **120.9 tok/s** (13.8 s) vs token **12.2 tok/s** (137.3 s) | 9.9x; 20-tok prompt 52.6 vs 22.4 tok/s |
+| Decode host profile (64 tok) | 41.3 ms/tok: 2051 launches (1.36 ms CPU), 5 syncs **35.9 ms blocked** | GPU-bound: kernel count/shape, not CPU launch cost |
 | **Tide stress** (`--nvfp4-slots 1600 --mxfp8-slots 96`, threshold 0.25, 68 pos) | 15.3% experts skipped, 267 sync rescues, async churn every token; layer rel-err <= 4.0e-2, cos >= 0.9995, argmax 46/48 (2 near-ties) | GPU computed exactly the CPU-published expert set (no stale-slot reads) |
 | **Live 48-Layer Decode (`exact`, RX 9070 XT)** | **18.74 tok/s** (`99.5%` VRAM hit: Pre 100%, Core 100%, Coda 95.8%) | Coherent English + thinking format, `253` Stage 1 sync rescues |
 | **Live 48-Layer Decode (`threshold=0.25`, RX 9070 XT)** | **19.80 tok/s** (`99.4%` VRAM hit: Pre 100%, Core 100%, Coda 95.1%) | Coherent 2-sentence answer, clean EOS, only `26` Stage 1 sync rescues (10× fewer!) |

@@ -21,6 +21,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const MAX_FLASH_SPLITS: usize = 64;
+/// Maximum tokens per batched prefill chunk. Local KV rings hold `window + PREFILL_CHUNK` slots so
+/// a chunk's own keys never overwrite keys an earlier row of the same chunk still attends to.
+pub const PREFILL_CHUNK: usize = 128;
 const MAX_ATTN_RES_BLOCKS: usize = 8;
 
 /// Optional per-component wall-clock breakdown (accumulated across steps when profiling is enabled).
@@ -70,21 +73,24 @@ pub struct SeqSnapshot {
 }
 
 /// Per-logical-layer FP8 KV cache + 4-channel causal short-convolution state (`k = 4`, history `3`).
-struct LogicalLayerState {
-    _is_local: bool,
-    max_seq: usize,
-    k_cache: DeviceBuf,  // [8, max_seq, 128] u8 FP8
-    k_scales: DeviceBuf, // [8, max_seq] f32
-    v_cache: DeviceBuf,  // [8, max_seq, 128] u8 FP8
-    v_scales: DeviceBuf, // [8, max_seq] f32
-    sconv_k: DeviceBuf,  // [3, 1024] f32
-    sconv_v: DeviceBuf,  // [3, 1024] f32
-    sconv_attn: DeviceBuf, // [3, 2304] f32
-    sconv_mlp: DeviceBuf,  // [3, 2304] f32
+pub(crate) struct LogicalLayerState {
+    pub(crate) _is_local: bool,
+    /// KV buffer length (ring size for local layers).
+    pub(crate) max_seq: usize,
+    /// Attention window (local layers; == max_seq for global layers).
+    pub(crate) window: usize,
+    pub(crate) k_cache: DeviceBuf,  // [8, max_seq, 128] u8 FP8
+    pub(crate) k_scales: DeviceBuf, // [8, max_seq] f32
+    pub(crate) v_cache: DeviceBuf,  // [8, max_seq, 128] u8 FP8
+    pub(crate) v_scales: DeviceBuf, // [8, max_seq] f32
+    pub(crate) sconv_k: DeviceBuf,  // [3, 1024] f32
+    pub(crate) sconv_v: DeviceBuf,  // [3, 1024] f32
+    pub(crate) sconv_attn: DeviceBuf, // [3, 2304] f32
+    pub(crate) sconv_mlp: DeviceBuf,  // [3, 2304] f32
 }
 
 /// Reusable activation scratch buffers in VRAM (~4 MiB total — zero per-token allocations!).
-struct ActivationScratch {
+pub(crate) struct ActivationScratch {
     cur: DeviceBuf,         // [H]
     embed_tmp: DeviceBuf,   // [H]
     inp_sa: DeviceBuf,      // [H]
@@ -132,17 +138,17 @@ struct ActivationScratch {
     moe_mid: DeviceBuf,     // [8 * 1152] f32
     moe_out: DeviceBuf,     // [H]
 
-    logits: DeviceBuf,      // [unpadded_vocab_size] f32
+    pub(crate) logits: DeviceBuf, // [unpadded_vocab_size] f32
     argmax_buf: DeviceBuf,  // [64] f32 vals + [64] u32 idx (single D2H)
 }
 
 const ROUTE_WORDS: usize = 16;
 
 /// Optional per-token hidden-state dump for reference verification (`SMALLTIDE_DUMP_DIR`).
-struct DumpState {
-    dir: std::path::PathBuf,
-    hidden: Vec<f32>, // [num_logical * H]
-    routes: Vec<u32>, // [num_logical * 8]
+pub(crate) struct DumpState {
+    pub(crate) dir: std::path::PathBuf,
+    pub(crate) hidden: Vec<f32>, // [num_logical * H]
+    pub(crate) routes: Vec<u32>, // [num_logical * 8]
 }
 
 pub struct Inkling2Engine<B: ComputeBackend> {
@@ -151,17 +157,19 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     pub dense: Inkling2DenseGpu<B>,
     pub tide: TideExecutor<B>,
     pub global_max_seq: usize,
-    layer_states: Vec<LogicalLayerState>,
-    scratch: ActivationScratch,
+    pub(crate) layer_states: Vec<LogicalLayerState>,
+    pub(crate) scratch: ActivationScratch,
+    /// Rows-batched activation buffers for chunked prefill (allocated on first use).
+    pub(crate) pf: Option<crate::prefill::PrefillScratch>,
     embed_pinned: PinnedBuf,
     route_log_host: PinnedBuf,
     route_log_event: smalltide_core::Event,
-    route_log_inflight: bool,
+    pub(crate) route_log_inflight: bool,
     route_log_is_prefill: bool,
     /// Logical layers whose routing the scheduler already saw this token (partial layers).
     layer_planned: Vec<bool>,
-    dump: Option<DumpState>,
-    dump_token: (u32, usize),
+    pub(crate) dump: Option<DumpState>,
+    pub(crate) dump_token: (u32, usize),
     rng_state: u64,
     tokens_decoded: u64,
     pub profile_enabled: bool,
@@ -186,10 +194,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         for il in 0..num_logical {
             let (phys, _) = crate::map_logical_to_physical(&cfg, smalltide_core::LogicalLayerId(il as u16));
             let is_local = cfg.is_local_layer(phys.0 as usize);
-            let max_seq = if is_local {
-                cfg.local_window_size
+            let (max_seq, window) = if is_local {
+                (cfg.local_window_size + PREFILL_CHUNK, cfg.local_window_size)
             } else {
-                global_max_seq.max(cfg.local_window_size)
+                let g = global_max_seq.max(cfg.local_window_size);
+                (g, g)
             };
             let kv_bytes = cfg.num_key_value_heads * max_seq * cfg.head_dim;
             let sc_bytes = cfg.num_key_value_heads * max_seq * 4;
@@ -204,6 +213,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             layer_states.push(LogicalLayerState {
                 _is_local: is_local,
                 max_seq,
+                window,
                 k_cache: backend.alloc_device(kv_bytes)?,
                 k_scales: backend.alloc_device(sc_bytes)?,
                 v_cache: backend.alloc_device(kv_bytes)?,
@@ -283,6 +293,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             global_max_seq,
             layer_states,
             scratch,
+            pf: None,
             embed_pinned,
             route_log_host,
             route_log_event,
@@ -472,7 +483,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     }
 
     #[inline]
-    fn fp8_mm(&self, out: DeviceBuf, x: DeviceBuf, m: &Fp8MatrixGpu, s: Stream) -> Result<()> {
+    pub(crate) fn fp8_mm(&self, out: DeviceBuf, x: DeviceBuf, m: &Fp8MatrixGpu, s: Stream) -> Result<()> {
         self.backend
             .gemv_fp8(out, x, m.data, m.row_scales, m.n_rows, m.k_cols, s)
     }
@@ -757,7 +768,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let t_fa = self.prof_mark(s);
         let st = &self.layer_states[il];
         let n_valid = if is_local {
-            (pos + 1).min(st.max_seq)
+            (pos + 1).min(st.window)
         } else {
             pos + 1
         };
@@ -783,6 +794,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 is_local,
                 num_splits,
                 inv_sqrt_d: 1.0 / (self.cfg.head_dim as f32).sqrt(),
+                window: if is_local { st.window } else { 0 },
             },
             s,
         )?;
@@ -1018,7 +1030,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// Writes `tok{pos}.bin`: magic, pos, token, num_logical, hidden, has_logits, then
     /// `[num_logical][hidden]` f32 layer outputs, `[num_logical][8]` u32 routed ids and
     /// optionally `[unpadded_vocab]` f32 logits.
-    fn write_dump(&mut self, has_logits: bool) -> Result<()> {
+    pub(crate) fn write_dump(&mut self, has_logits: bool) -> Result<()> {
         let s = self.tide.compute_stream;
         let vocab = self.cfg.unpadded_vocab_size;
         let mut logits = Vec::new();
@@ -1359,6 +1371,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 impl<B: ComputeBackend> Drop for Inkling2Engine<B> {
     fn drop(&mut self) {
         let _ = self.backend.sync_stream(self.tide.compute_stream);
+        if let Some(pf) = self.pf.take() {
+            pf.free(&*self.backend);
+        }
         let _ = self.backend.free_pinned(self.embed_pinned);
         let _ = self.backend.free_pinned(self.route_log_host);
         let _ = self.backend.destroy_event(self.route_log_event);

@@ -289,3 +289,4 @@ extern "C" __global__ void smalltide_gemv_mxfp8_f32(
 #include "attn_ops.hip"
 #include "inkling2_ops.hip"
 #include "batched_ops.hip"
+#include "prefill_ops.hip"

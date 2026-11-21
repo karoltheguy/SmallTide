@@ -9,7 +9,7 @@ use crate::ffi::{
     HIP_MEMCPY_DEVICE_TO_DEVICE, HIP_MEMCPY_DEVICE_TO_HOST,
     HIP_MEMCPY_HOST_TO_DEVICE, HIP_STREAM_CAPTURE_MODE_GLOBAL, HIP_STREAM_NON_BLOCKING,
 };
-use smalltide_core::backend::{FlashDecodeParams, MoeDispatchParams};
+use smalltide_core::backend::{FlashDecodeParams, GroupedMoeParams, MoeDispatchParams, PrefillAttnParams};
 use smalltide_core::{
     ComputeBackend, DType, DeviceBuf, DeviceInfo, Event, Graph, PinnedBuf, QueueKind, Result,
     SmallTideError, Stream,
@@ -54,6 +54,30 @@ pub struct HipBackend {
     streams: Mutex<HashMap<u64, StreamEntry>>,
     events: Mutex<HashMap<u64, EventEntry>>,
     graphs: Mutex<HashMap<u64, GraphEntry>>,
+    /// Host-side instrumentation (see `HipBackend::take_host_stats`).
+    stat_launches: AtomicU64,
+    stat_launch_ns: AtomicU64,
+    stat_sync_ns: AtomicU64,
+    stat_syncs: AtomicU64,
+    kernel_timer: Mutex<Option<KernelTimer>>,
+}
+
+/// Per-kernel GPU timing (timing events around every launch); dev/profiling only.
+struct KernelTimer {
+    events: Vec<HipEvent>,
+    cursor: usize,
+    pending: Vec<(&'static str, usize)>,
+    totals: HashMap<&'static str, (u64, f64)>,
+}
+unsafe impl Send for KernelTimer {}
+
+/// Host-side cost counters since the last `take_host_stats`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostStats {
+    pub launches: u64,
+    pub launch_ms: f64,
+    pub syncs: u64,
+    pub sync_wait_ms: f64,
 }
 
 unsafe impl Send for HipBackend {}
@@ -74,7 +98,137 @@ impl HipBackend {
             streams: Mutex::new(HashMap::new()),
             events: Mutex::new(HashMap::new()),
             graphs: Mutex::new(HashMap::new()),
+            stat_launches: AtomicU64::new(0),
+            stat_launch_ns: AtomicU64::new(0),
+            stat_sync_ns: AtomicU64::new(0),
+            stat_syncs: AtomicU64::new(0),
+            kernel_timer: Mutex::new(None),
         })
+    }
+
+    fn kernel_name(&self, f: crate::ffi::HipFunction) -> &'static str {
+        let k = &self.kernels;
+        macro_rules! names {
+            ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
+        }
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32,
+            moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32,
+            kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32,
+            value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32,
+            rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32,
+            vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32)
+    }
+
+    /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
+    pub fn set_kernel_timing(&self, on: bool) -> Result<()> {
+        let mut g = self.kernel_timer.lock().unwrap();
+        if on && g.is_none() {
+            let mut events = Vec::with_capacity(8192);
+            for _ in 0..8192 {
+                let mut e: HipEvent = ptr::null_mut();
+                unsafe { check_hip((self.rt.hip_event_create_with_flags)(&mut e, 0), "hipEventCreateWithFlags")? };
+                events.push(e);
+            }
+            *g = Some(KernelTimer { events, cursor: 0, pending: Vec::new(), totals: HashMap::new() });
+        } else if !on {
+            if let Some(t) = g.take() {
+                for e in t.events {
+                    unsafe { let _ = (self.rt.hip_event_destroy)(e); }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_timer(&self, t: &mut KernelTimer) {
+        if let Some(&(_, last)) = t.pending.last() {
+            unsafe { let _ = (self.rt.hip_event_synchronize)(t.events[last + 1]); }
+        }
+        for (name, i) in t.pending.drain(..) {
+            let mut ms = 0.0f32;
+            unsafe { let _ = (self.rt.hip_event_elapsed_time)(&mut ms, t.events[i], t.events[i + 1]); }
+            let e = t.totals.entry(name).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += ms as f64;
+        }
+        t.cursor = 0;
+    }
+
+    /// Returns and resets accumulated `(kernel, launches, total GPU ms)`, sorted by time.
+    pub fn take_kernel_times(&self) -> Vec<(&'static str, u64, f64)> {
+        let mut g = self.kernel_timer.lock().unwrap();
+        let Some(t) = g.as_mut() else { return Vec::new() };
+        self.flush_timer(t);
+        let mut v: Vec<_> = t.totals.drain().map(|(k, (n, ms))| (k, n, ms)).collect();
+        v.sort_by(|a, b| b.2.total_cmp(&a.2));
+        v
+    }
+
+    /// Launches `f` with the given argument pointers (each must point at the argument value).
+    fn launch(
+        &self,
+        f: crate::ffi::HipFunction,
+        grid: (u32, u32, u32),
+        block: u32,
+        args: &mut [*mut c_void],
+        stream: Stream,
+        what: &'static str,
+    ) -> Result<()> {
+        let s = self.raw_stream(stream)?;
+        unsafe {
+            check_hip(
+                self.launch_raw(f, grid.0, grid.1, grid.2, block, 1, 1, 0, s, args.as_mut_ptr(), ptr::null_mut()),
+                what,
+            )
+        }
+    }
+
+    /// Returns and resets host-side launch / sync-wait counters.
+    pub fn take_host_stats(&self) -> HostStats {
+        HostStats {
+            launches: self.stat_launches.swap(0, Ordering::Relaxed),
+            launch_ms: self.stat_launch_ns.swap(0, Ordering::Relaxed) as f64 * 1e-6,
+            syncs: self.stat_syncs.swap(0, Ordering::Relaxed),
+            sync_wait_ms: self.stat_sync_ns.swap(0, Ordering::Relaxed) as f64 * 1e-6,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn launch_raw(
+        &self,
+        f: crate::ffi::HipFunction,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+        shmem: u32,
+        s: HipStream,
+        params: *mut *mut c_void,
+        extra: *mut *mut c_void,
+    ) -> crate::ffi::HipError {
+        let t0 = std::time::Instant::now();
+        let mut timer = self.kernel_timer.lock().unwrap();
+        let slot = timer.as_mut().map(|t| {
+            if t.cursor + 2 > t.events.len() {
+                self.flush_timer(t);
+            }
+            let i = t.cursor;
+            t.cursor += 2;
+            let _ = (self.rt.hip_event_record)(t.events[i], s);
+            i
+        });
+        let r = (self.rt.hip_module_launch_kernel)(f, gx, gy, gz, bx, by, bz, shmem, s, params, extra);
+        if let (Some(t), Some(i)) = (timer.as_mut(), slot) {
+            let _ = (self.rt.hip_event_record)(t.events[i + 1], s);
+            t.pending.push((self.kernel_name(f), i));
+        }
+        drop(timer);
+        self.stat_launch_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.stat_launches.fetch_add(1, Ordering::Relaxed);
+        r
     }
 
     fn next_handle(&self) -> u64 {
@@ -304,7 +458,11 @@ impl ComputeBackend for HipBackend {
 
     fn sync_stream(&self, stream: Stream) -> Result<()> {
         let s = self.raw_stream(stream)?;
-        unsafe { check_hip((self.rt.hip_stream_synchronize)(s), "hipStreamSynchronize") }
+        let t0 = std::time::Instant::now();
+        let r = unsafe { check_hip((self.rt.hip_stream_synchronize)(s), "hipStreamSynchronize") };
+        self.stat_sync_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.stat_syncs.fetch_add(1, Ordering::Relaxed);
+        r
     }
 
     fn memcpy_d2h_async(
@@ -502,7 +660,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.rmsnorm_f32, rows as u32, 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(rmsnorm_f32)",
@@ -543,7 +701,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.gemv_fp8_e4m3_f32, n_arg.div_ceil(4), 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(gemv_fp8_e4m3_f32)",
@@ -578,7 +736,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.gemv_fp8_e4m3_f32, n_arg.div_ceil(4), 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(gemv_fp8_e4m3_f32)",
@@ -610,7 +768,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.gemv_f32, n_arg.div_ceil(4), 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(gemv_f32)",
@@ -698,13 +856,13 @@ impl ComputeBackend for HipBackend {
 
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.moe_w13_swiglu_indirect, ff_arg.div_ceil(4), k_arg, 1, 128, 1, 1, 0, s, p1.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(moe_w13_swiglu_indirect)",
             )?;
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.moe_w2_accum_indirect, h_arg.div_ceil(4), 1, 1, 128, 1, 1, 0, s, p2.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(moe_w2_accum_indirect)",
@@ -742,7 +900,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.router_topk8_f32, 1, 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(router_topk8_f32)",
@@ -780,7 +938,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.sconv_k4_decode_f32, dim_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(sconv_k4_decode_f32)",
@@ -812,7 +970,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.head_l2_clip_f32, nh_arg, 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(head_l2_clip_f32)",
@@ -841,7 +999,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.value_norm_no_gamma_f32, nh_arg, 1, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(value_norm_no_gamma_f32)",
@@ -873,7 +1031,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.rel_table_f32, ext_arg.div_ceil(128), nh_arg, 1, 128, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(rel_table_f32)",
@@ -920,7 +1078,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.kv_store_fp8_decode, nkv_arg, 1, 1, hd_arg, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(kv_store_fp8_decode)",
@@ -965,8 +1123,9 @@ impl ComputeBackend for HipBackend {
         let mut loc_arg: u32 = if params.is_local { 1 } else { 0 };
         let mut splits_arg = params.num_splits as u32;
         let mut inv_sqrt_d = params.inv_sqrt_d;
+        let mut window_arg = params.window as u32;
 
-        let mut p1: [*mut c_void; 17] = [
+        let mut p1: [*mut c_void; 18] = [
             &mut d_po as *mut _ as *mut c_void,
             &mut d_pm as *mut _ as *mut c_void,
             &mut d_pl as *mut _ as *mut c_void,
@@ -984,6 +1143,7 @@ impl ComputeBackend for HipBackend {
             &mut loc_arg as *mut _ as *mut c_void,
             &mut splits_arg as *mut _ as *mut c_void,
             &mut inv_sqrt_d as *mut _ as *mut c_void,
+            &mut window_arg as *mut _ as *mut c_void,
         ];
         let mut p2: [*mut c_void; 7] = [
             &mut d_out as *mut _ as *mut c_void,
@@ -997,13 +1157,13 @@ impl ComputeBackend for HipBackend {
 
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.flash_decode_fp8_split, nkv_arg, splits_arg, 1, 128, 1, 1, 0, s, p1.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(flash_decode_fp8_split)",
             )?;
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.flash_decode_fp8_reduce, nq_arg, 1, 1, 32, 1, 1, 0, s, p2.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(flash_decode_fp8_reduce)",
@@ -1032,7 +1192,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.gate_attn_sigmoid_mul_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(gate_attn_sigmoid_mul_f32)",
@@ -1076,7 +1236,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.attn_res_mix_f32, nq_arg, 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(attn_res_mix_f32)",
@@ -1108,7 +1268,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.loop_control_prep_f32, 2, 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(loop_control_prep_f32)",
@@ -1143,7 +1303,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.loop_control_apply_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(loop_control_apply_f32)",
@@ -1172,7 +1332,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.vec_add_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(vec_add_f32)",
@@ -1192,7 +1352,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.vec_scale_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(vec_scale_f32)",
@@ -1212,7 +1372,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.vec_copy_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(vec_copy_f32)",
@@ -1230,7 +1390,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.zero_f32, n_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(zero_f32)",
@@ -1256,7 +1416,7 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.final_logit_softcap_f32, v_arg.div_ceil(256), 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(final_logit_softcap_f32)",
@@ -1285,11 +1445,129 @@ impl ComputeBackend for HipBackend {
         ];
         unsafe {
             check_hip(
-                (self.rt.hip_module_launch_kernel)(
+                self.launch_raw(
                     self.kernels.argmax_partial_f32, 64, 1, 1, 256, 1, 1, 0, s, params.as_mut_ptr(), ptr::null_mut(),
                 ),
                 "launch(argmax_partial_f32)",
             )
         }
     }
+    fn gemm_fp8_rows(&self, y: DeviceBuf, x: DeviceBuf, w_fp8: DeviceBuf, row_scales: DeviceBuf,
+        rows: usize, n_rows: usize, k_cols: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c, mut d) = (self.dev_ptr(y)?, self.dev_ptr(x)?, self.dev_ptr(w_fp8)?, self.dev_ptr(row_scales)?);
+        let (mut m, mut n, mut k) = (rows as u32, n_rows as u32, k_cols as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut m), p(&mut n), p(&mut k)];
+        self.launch(self.kernels.gemm_fp8_e4m3_batched_f32, (n.div_ceil(4), m.div_ceil(8), 1), 128, &mut args, stream, "launch(gemm_fp8_rows)")
+    }
+
+    fn gemm_f32_rows(&self, y: DeviceBuf, x: DeviceBuf, w: DeviceBuf, rows: usize, n_rows: usize,
+        k_cols: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c) = (self.dev_ptr(y)?, self.dev_ptr(x)?, self.dev_ptr(w)?);
+        let (mut m, mut n, mut k) = (rows as u32, n_rows as u32, k_cols as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut m), p(&mut n), p(&mut k)];
+        self.launch(self.kernels.gemm_f32_rows, (n.div_ceil(4), m.div_ceil(8), 1), 128, &mut args, stream, "launch(gemm_f32_rows)")
+    }
+
+    fn attn_res_mix_rows(&self, out: DeviceBuf, blocks: Option<DeviceBuf>, cur: DeviceBuf,
+        queries: DeviceBuf, num_blocks: usize, num_queries: usize, hidden: usize, eps: f32,
+        rows: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c, mut d) = (self.dev_ptr(out)?, self.opt_dev_ptr(blocks)?, self.dev_ptr(cur)?, self.dev_ptr(queries)?);
+        let (mut nb, mut nq, mut h, mut e, mut nv, mut m) = (num_blocks as u32, num_queries as u32, hidden as u32, eps, 1u32, rows as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut nb), p(&mut nq), p(&mut h), p(&mut e), p(&mut nv), p(&mut m)];
+        self.launch(self.kernels.attn_res_mix_rows_f32, (nq, m, 1), 256, &mut args, stream, "launch(attn_res_mix_rows)")
+    }
+
+    fn head_l2_clip_rows(&self, x: DeviceBuf, scale: Option<DeviceBuf>, total_heads: usize,
+        head_dim: usize, heads_per_row: usize, threshold: f32, tau: Option<(usize, f32, f32)>,
+        stream: Stream) -> Result<()> {
+        let (mut a, mut b) = (self.dev_ptr(x)?, self.opt_dev_ptr(scale)?);
+        let (pos0, alpha, floor) = tau.unwrap_or((0, 0.0, 1.0));
+        let (mut th, mut hd, mut hpr, mut thr, mut p0, mut al, mut fl) =
+            (total_heads as u32, head_dim as u32, heads_per_row as u32, threshold, pos0 as u32, alpha, floor);
+        let mut args = [p(&mut a), p(&mut b), p(&mut th), p(&mut hd), p(&mut hpr), p(&mut thr), p(&mut p0), p(&mut al), p(&mut fl)];
+        self.launch(self.kernels.head_l2_clip_rows_f32, (th, 1, 1), 128, &mut args, stream, "launch(head_l2_clip_rows)")
+    }
+
+    fn sconv_k4_rows(&self, out: DeviceBuf, state: DeviceBuf, x: DeviceBuf, weight: DeviceBuf,
+        dyn_taps: Option<DeviceBuf>, dim: usize, head_dim: usize, rows: usize, dyn_stride: usize,
+        stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c, mut d, mut e) =
+            (self.dev_ptr(out)?, self.dev_ptr(state)?, self.dev_ptr(x)?, self.dev_ptr(weight)?, self.opt_dev_ptr(dyn_taps)?);
+        let (mut di, mut hd, mut m, mut ds) = (dim as u32, head_dim as u32, rows as u32, dyn_stride as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut di), p(&mut hd), p(&mut m), p(&mut ds)];
+        self.launch(self.kernels.sconv_k4_rows_f32, (di.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(sconv_k4_rows)")
+    }
+
+    fn kv_store_fp8_rows(&self, k_cache: DeviceBuf, k_scales: DeviceBuf, v_cache: DeviceBuf,
+        v_scales: DeviceBuf, k_in: DeviceBuf, v_in: DeviceBuf, n_kv_heads: usize, max_seq: usize,
+        head_dim: usize, pos0: usize, rows: usize, is_local: bool, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c, mut d, mut e, mut f) = (self.dev_ptr(k_cache)?, self.dev_ptr(k_scales)?,
+            self.dev_ptr(v_cache)?, self.dev_ptr(v_scales)?, self.dev_ptr(k_in)?, self.dev_ptr(v_in)?);
+        let (mut nkv, mut ms, mut hd, mut p0, mut loc) = (n_kv_heads as u32, max_seq as u32, head_dim as u32, pos0 as u32, is_local as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut nkv), p(&mut ms), p(&mut hd), p(&mut p0), p(&mut loc)];
+        self.launch(self.kernels.kv_store_fp8_rows, (nkv, rows as u32, 1), hd, &mut args, stream, "launch(kv_store_fp8_rows)")
+    }
+
+    fn attn_prefill_fp8(&self, out: DeviceBuf, q: DeviceBuf, k_cache: DeviceBuf, k_scales: DeviceBuf,
+        v_cache: DeviceBuf, v_scales: DeviceBuf, rel_table: Option<DeviceBuf>, sinks: Option<DeviceBuf>,
+        pp: PrefillAttnParams, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (self.dev_ptr(out)?, self.dev_ptr(q)?,
+            self.dev_ptr(k_cache)?, self.dev_ptr(k_scales)?, self.dev_ptr(v_cache)?, self.dev_ptr(v_scales)?,
+            self.opt_dev_ptr(rel_table)?, self.opt_dev_ptr(sinks)?);
+        let (mut nq, mut nkv, mut ms, mut win, mut p0, mut re, mut isd) = (pp.n_q_heads as u32, pp.n_kv_heads as u32,
+            pp.max_seq as u32, pp.window as u32, pp.pos0 as u32, pp.rel_extent as u32, pp.inv_sqrt_d);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut g), p(&mut h),
+            p(&mut nq), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd)];
+        self.launch(self.kernels.attn_prefill_fp8, (nkv, pp.rows as u32, 1), 128, &mut args, stream, "launch(attn_prefill_fp8)")
+    }
+
+    fn router_topk8_rows(&self, route: DeviceBuf, logits: DeviceBuf, bias: Option<DeviceBuf>,
+        route_scale: f32, rows: usize, row_stride_words: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c) = (self.dev_ptr(route)?, self.dev_ptr(logits)?, self.opt_dev_ptr(bias)?);
+        let (mut rs, mut st) = (route_scale, row_stride_words as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut rs), p(&mut st)];
+        self.launch(self.kernels.router_topk8_rows, (rows as u32, 1, 1), 128, &mut args, stream, "launch(router_topk8_rows)")
+    }
+
+    fn loop_control_prep_rows(&self, out: DeviceBuf, cur: DeviceBuf, msg: DeviceBuf, hidden: usize,
+        eps: f32, rows: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c) = (self.dev_ptr(out)?, self.dev_ptr(cur)?, self.dev_ptr(msg)?);
+        let (mut h, mut e) = (hidden as u32, eps);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut h), p(&mut e)];
+        self.launch(self.kernels.loop_control_prep_rows_f32, (2, rows as u32, 1), 256, &mut args, stream, "launch(loop_control_prep_rows)")
+    }
+
+    fn moe_grouped(&self, out: DeviceBuf, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, route: DeviceBuf,
+        pool: DeviceBuf, desc: DeviceBuf, gp: GroupedMoeParams, reduce: bool, stream: Stream) -> Result<()> {
+        if gp.n_work > 0 {
+            let work = desc.slice(0, gp.n_work * 16);
+            let pairs = desc.slice(gp.pairs_offset_bytes, desc.size_bytes - gp.pairs_offset_bytes);
+            let (mut a, mut b, mut c, mut d, mut e) =
+                (self.dev_ptr(mid)?, self.dev_ptr(x)?, self.dev_ptr(pool)?, self.dev_ptr(work)?, self.dev_ptr(pairs)?);
+            let (mut st, mut h, mut i, mut gc, mut uc) = (gp.expert_stride_bytes as u64, gp.hidden_size as u32, gp.intermediate_size as u32, 4.0f32, 25.0f32);
+            let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut st), p(&mut h), p(&mut i), p(&mut gc), p(&mut uc)];
+            self.launch(self.kernels.moe_w13_grouped, (gp.n_work as u32, i.div_ceil(64), 1), 256, &mut args, stream, "launch(moe_w13_grouped)")?;
+            let (mut a, mut b, mut c, mut d, mut e, mut f) = (self.dev_ptr(tmp)?, self.dev_ptr(mid)?, self.dev_ptr(pool)?,
+                self.dev_ptr(work)?, self.dev_ptr(pairs)?, self.dev_ptr(route)?);
+            let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut st), p(&mut h), p(&mut i)];
+            self.launch(self.kernels.moe_w2_grouped, (gp.n_work as u32, h.div_ceil(64), 1), 256, &mut args, stream, "launch(moe_w2_grouped)")?;
+        }
+        if reduce {
+            self.moe_reduce_rows(out, tmp, gp.hidden_size, gp.rows, stream)?;
+        }
+        Ok(())
+    }
+
+    fn moe_reduce_rows(&self, out: DeviceBuf, tmp: DeviceBuf, hidden: usize, rows: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b) = (self.dev_ptr(out)?, self.dev_ptr(tmp)?);
+        let mut h = hidden as u32;
+        let mut args = [p(&mut a), p(&mut b), p(&mut h)];
+        self.launch(self.kernels.moe_reduce_rows, (h.div_ceil(256), rows as u32, 1), 256, &mut args, stream, "launch(moe_reduce_rows)")
+    }
+}
+
+/// Kernel-argument pointer helper.
+#[inline]
+fn p<T>(v: &mut T) -> *mut c_void {
+    v as *mut T as *mut c_void
 }

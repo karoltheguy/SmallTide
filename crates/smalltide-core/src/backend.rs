@@ -92,6 +92,35 @@ pub struct FlashDecodeParams {
     pub is_local: bool,
     pub num_splits: usize,
     pub inv_sqrt_d: f32,
+    /// Local layers: attention window when the ring (`max_seq`) is larger; 0 = `max_seq`.
+    pub window: usize,
+}
+
+/// Parameters for the multi-row causal prefill attention.
+#[derive(Debug, Clone, Copy)]
+pub struct PrefillAttnParams {
+    pub n_q_heads: usize,
+    pub n_kv_heads: usize,
+    /// KV buffer length (ring size for local layers).
+    pub max_seq: usize,
+    /// Sliding window (local layers); 0 = global causal attention over `[0, pos]`.
+    pub window: usize,
+    pub pos0: usize,
+    pub rows: usize,
+    pub rel_extent: usize,
+    pub inv_sqrt_d: f32,
+}
+
+/// Expert-grouped MoE launch for prefill (see `moe_grouped`).
+#[derive(Debug, Clone, Copy)]
+pub struct GroupedMoeParams {
+    pub rows: usize,
+    pub n_work: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub expert_stride_bytes: usize,
+    /// Byte offset of the pair list inside the descriptor buffer.
+    pub pairs_offset_bytes: usize,
 }
 
 /// Minimal backend-agnostic compute & async-transfer abstraction.
@@ -442,4 +471,65 @@ pub trait ComputeBackend: Send + Sync {
         n: usize,
         stream: Stream,
     ) -> Result<()>;
+
+    // --- Rows-batched ops (chunked prefill; M = `rows`) ---
+
+    /// `y[m, n] = (W_fp8[n, :] . x[m, :]) * row_scales[n]` for `rows` rows.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_fp8_rows(&self, y: DeviceBuf, x: DeviceBuf, w_fp8: DeviceBuf, row_scales: DeviceBuf,
+        rows: usize, n_rows: usize, k_cols: usize, stream: Stream) -> Result<()>;
+
+    /// `y[m, n] = W_f32[n, :] . x[m, :]`.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_f32_rows(&self, y: DeviceBuf, x: DeviceBuf, w: DeviceBuf, rows: usize, n_rows: usize,
+        k_cols: usize, stream: Stream) -> Result<()>;
+
+    /// Attention-residual mix for `rows` rows: blocks `[nb][M][H]`, cur `[M][H]`, out `[nq][M][H]`.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_res_mix_rows(&self, out: DeviceBuf, blocks: Option<DeviceBuf>, cur: DeviceBuf,
+        queries: DeviceBuf, num_blocks: usize, num_queries: usize, hidden: usize, eps: f32,
+        rows: usize, stream: Stream) -> Result<()>;
+
+    /// Per-head L2 clip over `total_heads` (rows x heads_per_row) with optional scale and tau.
+    #[allow(clippy::too_many_arguments)]
+    fn head_l2_clip_rows(&self, x: DeviceBuf, scale: Option<DeviceBuf>, total_heads: usize,
+        head_dim: usize, heads_per_row: usize, threshold: f32, tau: Option<(usize, f32, f32)>,
+        stream: Stream) -> Result<()>;
+
+    /// Causal k=4 short conv over `rows` consecutive tokens (continues and updates `state`).
+    #[allow(clippy::too_many_arguments)]
+    fn sconv_k4_rows(&self, out: DeviceBuf, state: DeviceBuf, x: DeviceBuf, weight: DeviceBuf,
+        dyn_taps: Option<DeviceBuf>, dim: usize, head_dim: usize, rows: usize, dyn_stride: usize,
+        stream: Stream) -> Result<()>;
+
+    /// FP8 KV store of `rows` tokens at positions `pos0..` (`is_local`: ring of `max_seq`).
+    #[allow(clippy::too_many_arguments)]
+    fn kv_store_fp8_rows(&self, k_cache: DeviceBuf, k_scales: DeviceBuf, v_cache: DeviceBuf,
+        v_scales: DeviceBuf, k_in: DeviceBuf, v_in: DeviceBuf, n_kv_heads: usize, max_seq: usize,
+        head_dim: usize, pos0: usize, rows: usize, is_local: bool, stream: Stream) -> Result<()>;
+
+    /// Multi-row causal attention over the FP8 KV cache (relative bias + sinks).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_prefill_fp8(&self, out: DeviceBuf, q: DeviceBuf, k_cache: DeviceBuf, k_scales: DeviceBuf,
+        v_cache: DeviceBuf, v_scales: DeviceBuf, rel_table: Option<DeviceBuf>, sinks: Option<DeviceBuf>,
+        params: PrefillAttnParams, stream: Stream) -> Result<()>;
+
+    /// Router top-8 for `rows` rows from logits `[M][128]`; writes route rows of 16 u32 words.
+    #[allow(clippy::too_many_arguments)]
+    fn router_topk8_rows(&self, route: DeviceBuf, logits: DeviceBuf, bias: Option<DeviceBuf>,
+        route_scale: f32, rows: usize, row_stride_words: usize, stream: Stream) -> Result<()>;
+
+    /// Loop controller prep for `rows` rows: out `[M][2H]`.
+    fn loop_control_prep_rows(&self, out: DeviceBuf, cur: DeviceBuf, msg: DeviceBuf, hidden: usize,
+        eps: f32, rows: usize, stream: Stream) -> Result<()>;
+
+    /// Expert-grouped MoE (w13+SiTU -> w2 -> fixed-order reduce) for prefill. `desc` holds
+    /// `[n_work][4]` work items `(slot, pair_start, n_pairs, _)` then the pair list `row*8+k`.
+    /// When `reduce` is false only the per-pair partials in `tmp` are written.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped(&self, out: DeviceBuf, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, route: DeviceBuf,
+        pool: DeviceBuf, desc: DeviceBuf, params: GroupedMoeParams, reduce: bool, stream: Stream) -> Result<()>;
+
+    /// Final fixed-order reduce of `tmp[M*8][H]` into `out[M][H]`.
+    fn moe_reduce_rows(&self, out: DeviceBuf, tmp: DeviceBuf, hidden: usize, rows: usize, stream: Stream) -> Result<()>;
 }

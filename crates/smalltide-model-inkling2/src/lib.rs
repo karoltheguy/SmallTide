@@ -8,6 +8,7 @@
 //! Implemented in Phase 2 (exact forward pass) and Phase 4 (dspark integration).
 
 pub mod engine;
+pub mod prefill;
 pub mod weights;
 
 use smalltide_core::{Inkling2Config, LogicalLayerId, PhysicalLayerId};

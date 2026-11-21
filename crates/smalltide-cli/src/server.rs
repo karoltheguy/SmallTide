@@ -488,21 +488,33 @@ fn engine_worker_loop(
                     .iter()
                     .position(|&t| t == TOK_MESSAGE_USER)
                     .filter(|&b| b > reuse_len && b >= 16);
+                // Batched prefill in segments so the boundary snapshot lands at the right position.
                 let mut pf_err = None;
-                for idx in reuse_len..prompt_ids.len() {
-                    if Some(idx) == boundary && !pc.has_snapshot_at(idx) {
+                let mut segs: Vec<(usize, usize)> = Vec::new();
+                match boundary {
+                    Some(bd) if bd < prompt_ids.len() => {
+                        segs.push((reuse_len, bd));
+                        segs.push((bd, prompt_ids.len()));
+                    }
+                    _ => segs.push((reuse_len, prompt_ids.len())),
+                }
+                for (a, b) in segs {
+                    if a >= b {
+                        continue;
+                    }
+                    if Some(a) == boundary && !pc.has_snapshot_at(a) {
                         let mut slot = pc.take_payload();
-                        match engine.snapshot_state(idx, &mut slot) {
-                            Ok(()) => pc.insert(idx, slot.unwrap()),
-                            Err(e) => eprintln!("[prefix-cache] snapshot at {idx} failed: {e}"),
+                        match engine.snapshot_state(a, &mut slot) {
+                            Ok(()) => pc.insert(a, slot.unwrap()),
+                            Err(e) => eprintln!("[prefix-cache] snapshot at {a} failed: {e}"),
                         }
                     }
-                    let is_last = idx + 1 == prompt_ids.len();
-                    if let Err(e) = engine.forward_token(prompt_ids[idx], idx, true, is_last) {
-                        pf_err = Some(format!("prefill error at pos {idx}: {e}"));
+                    let is_last = b == prompt_ids.len();
+                    if let Err(e) = engine.prefill(&prompt_ids[a..b], a, is_last) {
+                        pf_err = Some(format!("prefill error at pos {a}..{b}: {e}"));
                         break;
                     }
-                    pc.cached.push(prompt_ids[idx]);
+                    pc.cached.extend_from_slice(&prompt_ids[a..b]);
                 }
                 if let Some(err) = pf_err {
                     pc.invalidate();

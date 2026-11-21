@@ -381,6 +381,51 @@ impl<B: ComputeBackend> TideExecutor<B> {
         Ok(())
     }
 
+    /// Frees the Scratch Rescue Ring for direct use (unmaps occupants on the compute stream).
+    pub fn release_scratch_ring(&mut self) -> Result<()> {
+        self.scheduler.cache.clear_scratch_ring();
+        if self.scheduler.cache.has_dirty_gpu_table() {
+            self.upload_table_on_compute()?;
+        }
+        Ok(())
+    }
+
+    /// Copies `experts` (all of one class, at most the ring size) into consecutive Scratch Rescue
+    /// slots and makes the compute stream wait for them; returns their slots. The slots are NOT
+    /// published in the GPU table: the caller addresses them directly (batched prefill MoE).
+    /// Call `release_scratch_ring` once before a prefill that uses this.
+    pub fn stage_into_scratch(&mut self, experts: &[ExpertId]) -> Result<Vec<SlotIndex>> {
+        if experts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cls = self.scheduler.cache.expert_class(experts[0]);
+        let (base, size) = self.scheduler.cache.scratch_ring(cls);
+        if experts.len() > size as usize {
+            return Err(SmallTideError::Backend { backend: "tide", message: "too many experts for scratch ring".into() });
+        }
+        // Previous users of these slots (earlier kernels on the compute stream) must be done.
+        self.backend.record_event(self.compute_fence, self.compute_stream)?;
+        self.backend.stream_wait_event(self.copy_stream, self.compute_fence)?;
+        let mut slots = Vec::with_capacity(experts.len());
+        for (i, &id) in experts.iter().enumerate() {
+            debug_assert_eq!(self.scheduler.cache.expert_class(id), cls);
+            let slot = SlotIndex(base + i as u32);
+            let slab_len = self.slab_len_for(id);
+            let src_offset = self.reserve_staging(slab_len)?;
+            let e = self.scheduler.cache.entry(id);
+            let ram = if self.scheduler.cache.is_ram_ready(id) { Some(e.ram_slot) } else { None };
+            self.fill_staging_from_ram_or_disk(id, cls, ram, src_offset, slab_len)?;
+            let (dst_pool, dst_off) = self.vram_target(id, slot);
+            self.backend.memcpy_h2d_async(dst_pool, dst_off, self.pinned_staging, src_offset, slab_len, self.copy_stream)?;
+            self.scheduler.telemetry.stage1_sync_rescues += 1;
+            self.scheduler.telemetry.stage1_bytes_transferred += slab_len as u64;
+            slots.push(slot);
+        }
+        self.backend.record_event(self.dma_event, self.copy_stream)?;
+        self.backend.stream_wait_event(self.compute_stream, self.dma_event)?;
+        Ok(slots)
+    }
+
     /// Copies an expert's slab into the staging ring from its RAM slot, verifying the slot really
     /// holds this expert; falls back to a blocking NVMe read (counted in telemetry) otherwise.
     fn fill_staging_from_ram_or_disk(

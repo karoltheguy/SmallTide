@@ -238,7 +238,8 @@ extern "C" __global__ void smalltide_flash_decode_fp8_split(
     uint32_t rel_extent,                 // 1024
     uint32_t is_local,                   // 1 = sliding window ring of size max_seq, 0 = global [0..=q_pos]
     uint32_t num_splits,
-    float inv_sqrt_d
+    float inv_sqrt_d,
+    uint32_t window                      // local layers: attention window (<= max_seq ring size)
 ) {
     uint32_t kvh = blockIdx.x;
     uint32_t split = blockIdx.y;
@@ -247,7 +248,8 @@ extern "C" __global__ void smalltide_flash_decode_fp8_split(
     uint32_t gqa_ratio = n_q_heads / n_kv_heads; // 3 for Inkling-2-Mini (24:8)
     uint32_t qh0 = kvh * gqa_ratio;
 
-    uint32_t t_win_start = (is_local != 0u && (q_pos + 1u) > max_seq) ? (q_pos + 1u - max_seq) : 0u;
+    uint32_t win = (window != 0u) ? window : max_seq;
+    uint32_t t_win_start = (is_local != 0u && (q_pos + 1u) > win) ? (q_pos + 1u - win) : 0u;
     uint32_t n_valid = q_pos + 1u - t_win_start;
 
     uint32_t tokens_per_split = (n_valid + num_splits - 1u) / num_splits;

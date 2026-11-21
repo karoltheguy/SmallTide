@@ -46,6 +46,7 @@ type FnHipEventDestroy = unsafe extern "C" fn(HipEvent) -> HipError;
 type FnHipEventRecord = unsafe extern "C" fn(HipEvent, HipStream) -> HipError;
 type FnHipEventSynchronize = unsafe extern "C" fn(HipEvent) -> HipError;
 type FnHipEventQuery = unsafe extern "C" fn(HipEvent) -> HipError;
+type FnHipEventElapsedTime = unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> HipError;
 type FnHipMemcpy = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> HipError;
 type FnHipMemcpyAsync =
     unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, HipStream) -> HipError;
@@ -151,6 +152,18 @@ pub struct CoreKernels {
     pub zero_f32: HipFunction,
     pub final_logit_softcap_f32: HipFunction,
     pub argmax_partial_f32: HipFunction,
+    pub gemm_fp8_e4m3_batched_f32: HipFunction,
+    pub gemm_f32_rows: HipFunction,
+    pub attn_res_mix_rows_f32: HipFunction,
+    pub head_l2_clip_rows_f32: HipFunction,
+    pub sconv_k4_rows_f32: HipFunction,
+    pub kv_store_fp8_rows: HipFunction,
+    pub attn_prefill_fp8: HipFunction,
+    pub router_topk8_rows: HipFunction,
+    pub loop_control_prep_rows_f32: HipFunction,
+    pub moe_w13_grouped: HipFunction,
+    pub moe_w2_grouped: HipFunction,
+    pub moe_reduce_rows: HipFunction,
 }
 
 pub struct HipRuntime {
@@ -175,6 +188,7 @@ pub struct HipRuntime {
     pub hip_event_record: FnHipEventRecord,
     pub hip_event_synchronize: FnHipEventSynchronize,
     pub hip_event_query: FnHipEventQuery,
+    pub hip_event_elapsed_time: FnHipEventElapsedTime,
     pub hip_memcpy: FnHipMemcpy,
     pub hip_memcpy_async: FnHipMemcpyAsync,
     pub hip_module_load_data: FnHipModuleLoadData,
@@ -257,6 +271,7 @@ impl HipRuntime {
             hip_event_record: load_sym!(b"hipEventRecord\0", FnHipEventRecord),
             hip_event_synchronize: load_sym!(b"hipEventSynchronize\0", FnHipEventSynchronize),
             hip_event_query: load_sym!(b"hipEventQuery\0", FnHipEventQuery),
+            hip_event_elapsed_time: load_sym!(b"hipEventElapsedTime\0", FnHipEventElapsedTime),
             hip_memcpy: load_sym!(b"hipMemcpy\0", FnHipMemcpy),
             hip_memcpy_async: load_sym!(b"hipMemcpyAsync\0", FnHipMemcpyAsync),
             hip_module_load_data: load_sym!(b"hipModuleLoadData\0", FnHipModuleLoadData),
@@ -332,6 +347,18 @@ impl HipRuntime {
             zero_f32: get_fn("smalltide_zero_f32")?,
             final_logit_softcap_f32: get_fn("smalltide_final_logit_softcap_f32")?,
             argmax_partial_f32: get_fn("smalltide_argmax_partial_f32")?,
+            gemm_fp8_e4m3_batched_f32: get_fn("smalltide_gemm_fp8_e4m3_batched_f32")?,
+            gemm_f32_rows: get_fn("smalltide_gemm_f32_rows")?,
+            attn_res_mix_rows_f32: get_fn("smalltide_attn_res_mix_rows_f32")?,
+            head_l2_clip_rows_f32: get_fn("smalltide_head_l2_clip_rows_f32")?,
+            sconv_k4_rows_f32: get_fn("smalltide_sconv_k4_rows_f32")?,
+            kv_store_fp8_rows: get_fn("smalltide_kv_store_fp8_rows")?,
+            attn_prefill_fp8: get_fn("smalltide_attn_prefill_fp8")?,
+            router_topk8_rows: get_fn("smalltide_router_topk8_rows")?,
+            loop_control_prep_rows_f32: get_fn("smalltide_loop_control_prep_rows_f32")?,
+            moe_w13_grouped: get_fn("smalltide_moe_w13_grouped")?,
+            moe_w2_grouped: get_fn("smalltide_moe_w2_grouped")?,
+            moe_reduce_rows: get_fn("smalltide_moe_reduce_rows")?,
         })
     }
 

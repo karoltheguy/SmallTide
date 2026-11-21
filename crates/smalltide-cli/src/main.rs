@@ -540,6 +540,7 @@ fn run_generate(args: &[String]) {
     let mut mxfp8_slots_override: Option<usize> = None;
     let mut ram_gb: f64 = 10.0;
     let mut enable_profile = false;
+    let mut prefill_mode = "batched".to_string();
 
     let mut i = 0usize;
     while i < args.len() {
@@ -557,6 +558,7 @@ fn run_generate(args: &[String]) {
             "--mxfp8-slots" if i + 1 < args.len() => { mxfp8_slots_override = args[i + 1].parse().ok(); i += 2; }
             "--ram-gb" if i + 1 < args.len() => { ram_gb = args[i + 1].parse().unwrap_or(10.0); i += 2; }
             "--profile" => { enable_profile = true; i += 1; }
+            "--prefill" if i + 1 < args.len() => { prefill_mode = args[i + 1].clone(); i += 2; }
             other => { eprintln!("Unknown flag: {other}"); i += 1; }
         }
     }
@@ -672,12 +674,17 @@ fn run_generate(args: &[String]) {
 
     // Prefill
     let t_pf = Instant::now();
-    for (idx, &tid) in prompt_ids.iter().enumerate() {
-        let is_last = idx + 1 == prompt_ids.len();
-        engine
-            .forward_token(tid, idx, true, is_last)
-            .expect("prefill forward_token");
+    if prefill_mode == "token" {
+        for (idx, &tid) in prompt_ids.iter().enumerate() {
+            let is_last = idx + 1 == prompt_ids.len();
+            engine
+                .forward_token(tid, idx, true, is_last)
+                .expect("prefill forward_token");
+        }
+    } else {
+        engine.prefill(&prompt_ids, 0, true).expect("batched prefill");
     }
+    backend.sync_stream(engine.tide.compute_stream).expect("sync prefill");
     let pf_secs = t_pf.elapsed().as_secs_f64();
 
     // Mode 2: Prefill -> Decode Boundary Rebalance
@@ -698,6 +705,12 @@ fn run_generate(args: &[String]) {
     let t_dec = Instant::now();
     if enable_profile {
         engine.profile_enabled = true;
+    }
+    let _ = backend.take_host_stats();
+    let ktiming = std::env::var_os("SMALLTIDE_KTIMING").is_some();
+    if ktiming {
+        backend.set_kernel_timing(true).expect("kernel timing");
+        let _ = backend.take_kernel_times();
     }
     let mut next_tok = engine
         .sample_next_token(&sampling, &generated)
@@ -729,6 +742,7 @@ fn run_generate(args: &[String]) {
     }
     let dec_secs = t_dec.elapsed().as_secs_f64();
     let dec_toks = generated.len();
+    let hs = backend.take_host_stats();
     let tel = engine.telemetry();
     println!("\n--------------");
     println!(
@@ -757,6 +771,27 @@ fn run_generate(args: &[String]) {
         tel.stage1_skipped_tail_misses,
         tel.stage2_disk_reads,
     );
+    if dec_toks > 0 {
+        let n = dec_toks as f64;
+        println!(
+            "[Host/tok] {:.2} ms total | {:.0} launches ({:.2} ms CPU in hipModuleLaunchKernel) | {:.1} syncs ({:.2} ms blocked) | {:.2} ms other CPU",
+            dec_secs * 1000.0 / n,
+            hs.launches as f64 / n,
+            hs.launch_ms / n,
+            hs.syncs as f64 / n,
+            hs.sync_wait_ms / n,
+            (dec_secs * 1000.0 - hs.launch_ms - hs.sync_wait_ms) / n,
+        );
+    }
+    if ktiming && dec_toks > 0 {
+        let n = dec_toks as f64;
+        let kt = backend.take_kernel_times();
+        let total: f64 = kt.iter().map(|k| k.2).sum();
+        println!("[GPU kernels/tok] total {:.2} ms in {:.0} launches", total / n, kt.iter().map(|k| k.1 as f64).sum::<f64>() / n);
+        for (name, cnt, ms) in kt {
+            println!("  {:<28} {:>6.1}x  {:>7.3} ms  ({:>5.1} us avg)", name, cnt as f64 / n, ms / n, ms * 1000.0 / cnt as f64);
+        }
+    }
     if enable_profile && engine.profile.steps > 0 {
         let n = engine.profile.steps as f64;
         let p = &engine.profile;

@@ -5,7 +5,19 @@
 ---
 
 ## Current Status
-* **Active Phase:** **Step 3 (Live 48-Layer Inkling-2-Mini Inference) & Step 4b (OpenAI HTTP/SSE Server on port 8000 as `inkling-2-mini`) COMPLETE & LIVE VERIFIED!** -> Next up: Kernel Decode Speed Optimization (50 ms/tok -> ~18 ms/tok) + `dspark` (`mtp.safetensors`) Speculative Decoding + Multi-Sequence Continuous Batching in Server!
+* **Active Phase (2026-11-21, end of review follow-up session):** R1-R4c done (Tide race fixes +
+  transformers reference harness, prefix cache, exact tokenizer, tool calls, batched prefill,
+  decode profiling/fixes, host-mapped MXFP8 pool). Decode **~27 tok/s exact** (37 ms/tok), prefill
+  **~168 tok/s** on long prompts. See "Session 2026-11-21" below and the benchmark table.
+* **Read first - VRAM residency:** on this desktop the process only gets ~7.6 GiB of *resident*
+  VRAM (DXGI AvailableForReservation; other apps hold ~5 GiB). Device allocations beyond that are
+  silently system memory read over PCIe (~28 GB/s) although hipMemGetInfo counts them as VRAM.
+  Earlier "100% VRAM-resident" figures (e.g. coda/prelude experts) were mostly this zero-copy
+  tier. `smalltide-cli vram-probe` and `tools/dxgi_budget.py` measure it; run/serve warn.
+* **Decode time budget now (GPU, per token):** prelude/coda/MXFP8 experts over PCIe ~20 ms
+  (hardware floor until more VRAM is resident), loop-core MoE ~6 ms, everything else ~11 ms.
+  CPU launch cost is only ~1.5 ms/token and an injected no-op costs ~1.7 us of GPU time, so
+  hipGraph / device-side pos would save at most ~3 ms here; they were deliberately not done yet.
 * **Date:** 2026-11-21
 * **Reference Repos & Model Weights On Disk:**
   * **Inkling-2-Mini (`models/Inkling-2-Mini/`):** **100% DOWNLOADED & PACKED** (`model-00001-of-00001.safetensors` = `18.18 GiB`; **`experts.stide` = all 3,072 experts 4 KB-aligned packed in 19.03s**; `mtp.safetensors` = `635.8 MB` `dspark`; `tokenizer.json`; `config.json`; `hf_quant_config.json`; `chat_template.jinja`).
@@ -147,17 +159,23 @@
   - E2E `tools/test_prefix_cache.py` (server `--rescue-mode exact`): boundary restore, prompt-end
     restore (client drops reasoning) and identical-repeat rewind all produce byte-identical
     reasoning+content vs cold runs.
-* **Next Actionable Steps:**
-  - [ ] **Step 4a (Performance Pass #1 — 2×–2.5× Decode Speedup):**
-    - Run `--profile` to inspect the exact `50 ms/tok` breakdown.
-    - Parallelize `smalltide_router_topk8_f32` across 32 workgroups (currently 1 WG!), combine `topk_ids` + `topk_weights` D2H into 1 readback, fuse small elementwise/norm launches, and evaluate HIP Graph capture for the 36 pinned Loop Core layers!
-    - Wire batched prefill (`batched_ops.hip` BM=8 GEMM + batched MoE) so prompt prefill scales from `20 tok/s` to `200+ tok/s`.
-  - [ ] **Step 4c (`dspark` Speculative Decoding from `models/Inkling-2-Mini/mtp.safetensors`):**
-    - Load `mtp.safetensors` (54 BF16 tensors, 3 dense layers, `fuse_weight [4,4]` fusing hidden states at logical layers `[5, 23, 41, 48]`, `block_size: 8`, `markov_rank: 256`).
-    - Draft 5–7 tokens and batch-verify with `batched_ops.hip` for 2–3× decode speedup!
-  - [ ] **Step 5 (True Multi-Sequence Continuous Batching in Server):**
-    - Wire `ContinuousBatchScheduler` + `PagedKvManager` + `smalltide_paged_flash_decode_fp8_split` into `server.rs` so concurrent HTTP requests batch together on the GPU in parallel.
-
+* **Next Actionable Steps (ordered by expected decode gain on this machine):**
+  - [ ] **More resident VRAM** (environment): close other GPU-heavy apps (Edge, ChatGPT, Discord,
+    VS Code, ... held ~5 GiB) and re-check `vram-probe` / the `[VRAM residency]` line. If the
+    resident budget covers the NVFP4 pool, prelude/coda MoE drops from ~1.3 to ~0.2 ms/layer
+    (~10 ms/token). Optionally make Tide residency-aware (fast vs zero-copy slots; promote hot
+    outer experts into fast slots, demote cold loop-core ones).
+  - [ ] **`dspark` speculative decoding** (`mtp.safetensors`): verifying k drafted tokens reuses
+    the rows-batched prefill path (weights + PCIe-backed experts read once for k tokens) - the
+    only lever that amortizes the ~20 ms/token PCIe expert floor. Expected 2-3x.
+  - [ ] **Kernel fusion of the ~11 ms non-MoE part**: multi-segment FP8 GEMV (q,k,v,r,gate +
+    f32 sinks/dyn taps in one launch; controller down/gain/forget), fused post-projection
+    (sconv+clip+vnorm+tau+kv store), rel-bias inside attention, gate inside the attention
+    reduce, fused post-attention (sconv+residual+mix+norm).
+  - [ ] **WMMA FP8 prefill GEMMs / grouped MoE** (prefill is compute-bound at ~168 tok/s).
+  - [ ] hipGraph + device-side pos: decode is now sync-free (2 syncs/token) so a static graph is
+    possible, but measured upside is <= ~3 ms/token on WDDM.
+  - [ ] **Step 5 (Multi-sequence continuous batching in server)** - unchanged.
 ---
 
 ## Locked Architecture Invariants

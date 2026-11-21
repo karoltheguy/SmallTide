@@ -1,3 +1,4 @@
+mod prefix_cache;
 mod server;
 
 use smalltide_backend_cpu as cpu;

@@ -61,6 +61,17 @@
     expert choice incl. skipped-expert mask, isolating arithmetic from near-tie router flips).
     Setup: `python -m venv refenv; pip install torch --index-url https://download.pytorch.org/whl/cpu;
     pip install safetensors numpy "transformers @ https://github.com/huggingface/transformers/archive/430050f6f71195b76004b5d61bbb446ec0508fb3.zip"`.
+* **R2 — Server prompt prefix cache: DONE**
+  - `Inkling2Engine::{snapshot_state, restore_state}`: rewindable state = 40 local KV rings + scales
+    and all 48x4 short-conv histories (86 MiB), copied stream-ordered to pinned host RAM. Global KV
+    is append-only and needs no snapshot.
+  - `crates/smalltide-cli/src/prefix_cache.rs` (unit-tested planner): Extend live sequence /
+    Restore latest snapshot <= LCP / Reset. Snapshots at the first `<|message_user|>` (shared system
+    + tool prefix) and at every prompt end; LRU of 4. Always re-processes >= 1 prompt token.
+  - Usage reports `prompt_tokens_details.cached_tokens`; `/v1/tide/stats` -> `prefix_cache`.
+  - E2E `tools/test_prefix_cache.py` (server `--rescue-mode exact`): boundary restore, prompt-end
+    restore (client drops reasoning) and identical-repeat rewind all produce byte-identical
+    reasoning+content vs cold runs.
 * **Next Actionable Steps:**
   - [ ] **Step 4a (Performance Pass #1 — 2×–2.5× Decode Speedup):**
     - Run `--profile` to inspect the exact `50 ms/tok` breakdown.
@@ -116,6 +127,7 @@
 | **R1 after Tide fixes**, same command | Prefill 22.4 tok/s, decode **23.76 tok/s** | Byte-identical output, 22 sync, 250 skipped |
 | **Reference check, exact rescue, 25 pos** (fp8 dense+KV emulated, engine routes) | layer rel-err 1.7e-3 (L0) -> 1.4e-2 (L47), cos >= 0.9986, argmax **6/6**, KL <= 4e-5 | Smooth growth, no jump at loop-pass/coda boundaries |
 | Reference check, no emulation, free routing | argmax **6/6**, KL <= 3e-3 | Per-layer 1-7% (FP8 KV/weights + router near-tie flips) |
+| **R2 prefix cache E2E** (5 chat turns, 60-98 tok prompts, greedy, exact) | cached 50/60, 60/79, 79/98 tok; warm 3.0-4.8 s vs cold 5.1-7.4 s | 5/5 byte-identical to cold; snapshot 86 MiB pinned |
 | **Tide stress** (`--nvfp4-slots 1600 --mxfp8-slots 96`, threshold 0.25, 68 pos) | 15.3% experts skipped, 267 sync rescues, async churn every token; layer rel-err <= 4.0e-2, cos >= 0.9995, argmax 46/48 (2 near-ties) | GPU computed exactly the CPU-published expert set (no stale-slot reads) |
 | **Live 48-Layer Decode (`exact`, RX 9070 XT)** | **18.74 tok/s** (`99.5%` VRAM hit: Pre 100%, Core 100%, Coda 95.8%) | Coherent English + thinking format, `253` Stage 1 sync rescues |
 | **Live 48-Layer Decode (`threshold=0.25`, RX 9070 XT)** | **19.80 tok/s** (`99.4%` VRAM hit: Pre 100%, Core 100%, Coda 95.1%) | Coherent 2-sentence answer, clean EOS, only `26` Stage 1 sync rescues (10× fewer!) |

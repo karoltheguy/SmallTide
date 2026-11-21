@@ -62,6 +62,13 @@ impl Default for SamplingParams {
     }
 }
 
+/// Rewindable sequence state (local KV rings + short-conv histories) after `pos` tokens,
+/// held in pinned host RAM. Created and restored by `Inkling2Engine::{snapshot,restore}_state`.
+pub struct SeqSnapshot {
+    pub pos: usize,
+    host: PinnedBuf,
+}
+
 /// Per-logical-layer FP8 KV cache + 4-channel causal short-convolution state (`k = 4`, history `3`).
 struct LogicalLayerState {
     _is_local: bool,
@@ -306,6 +313,65 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     + s.sconv_mlp.size_bytes
             })
             .sum()
+    }
+
+    /// Device regions that define the rewindable sequence state: every local (sliding) layer's
+    /// FP8 KV ring + scales and every layer's short-conv histories. Global KV is append-only
+    /// (positions >= pos are simply overwritten later), so it is not part of a snapshot.
+    fn snapshot_regions(&self) -> Vec<DeviceBuf> {
+        let mut v = Vec::new();
+        for st in &self.layer_states {
+            if st._is_local {
+                v.extend([st.k_cache, st.k_scales, st.v_cache, st.v_scales]);
+            }
+            v.extend([st.sconv_k, st.sconv_v, st.sconv_attn, st.sconv_mlp]);
+        }
+        v
+    }
+
+    /// Bytes one `SeqSnapshot` occupies in pinned host RAM.
+    pub fn snapshot_bytes(&self) -> usize {
+        self.snapshot_regions().iter().map(|b| b.size_bytes).sum()
+    }
+
+    /// Captures the rewindable state after `pos` tokens into `snap` (allocating its pinned buffer
+    /// on first use). Stream-ordered on the compute stream: no CPU stall.
+    pub fn snapshot_state(&mut self, pos: usize, snap: &mut Option<SeqSnapshot>) -> Result<()> {
+        let s = self.tide.compute_stream;
+        let total = self.snapshot_bytes();
+        if snap.as_ref().map_or(true, |x| x.host.size_bytes < total) {
+            if let Some(old) = snap.take() {
+                self.backend.sync_stream(s)?;
+                self.backend.free_pinned(old.host)?;
+            }
+            *snap = Some(SeqSnapshot { pos, host: self.backend.alloc_pinned(total)? });
+        }
+        let sn = snap.as_mut().unwrap();
+        sn.pos = pos;
+        let mut off = 0usize;
+        for b in self.snapshot_regions() {
+            self.backend.memcpy_d2h_async(sn.host, off, b, 0, b.size_bytes, s)?;
+            off += b.size_bytes;
+        }
+        Ok(())
+    }
+
+    /// Restores a snapshot taken by `snapshot_state`; the next token to process is `snap.pos`.
+    /// Valid only if the global KV for positions `< snap.pos` still holds the same tokens.
+    pub fn restore_state(&mut self, snap: &SeqSnapshot) -> Result<()> {
+        let s = self.tide.compute_stream;
+        let mut off = 0usize;
+        for b in self.snapshot_regions() {
+            self.backend.memcpy_h2d_async(b, 0, snap.host, off, b.size_bytes, s)?;
+            off += b.size_bytes;
+        }
+        Ok(())
+    }
+
+    /// Frees a snapshot's pinned buffer.
+    pub fn free_snapshot(&mut self, snap: SeqSnapshot) -> Result<()> {
+        self.backend.sync_stream(self.tide.compute_stream)?;
+        self.backend.free_pinned(snap.host)
     }
 
     /// Resets all 48 logical layers' short-conv history for a fresh sequence (pos = 0).

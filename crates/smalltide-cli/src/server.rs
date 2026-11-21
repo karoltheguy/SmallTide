@@ -16,7 +16,8 @@ use smalltide_core::{ComputeBackend, DType, Inkling2Config, RescuePolicy, TideCo
 use smalltide_io::dense_loader::Inkling2DenseHost;
 use smalltide_io::stide_pack::{ExpertSlabLayout, StidePackReader};
 use smalltide_io::tokenizer::BpeTokenizer;
-use smalltide_model_inkling2::engine::{Inkling2Engine, SamplingParams};
+use crate::prefix_cache::{PrefixCache, PrefixPlan};
+use smalltide_model_inkling2::engine::{Inkling2Engine, SamplingParams, SeqSnapshot};
 use smalltide_model_inkling2::weights::Inkling2DenseGpu;
 use smalltide_tide::TideExecutor;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -30,6 +31,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const SERVED_MODEL_NAME: &str = "inkling-2-mini";
 
+const TOK_MESSAGE_USER: u32 = 200_000;
 const TOK_MESSAGE_MODEL: u32 = 200_001;
 const TOK_CONTENT_TEXT: u32 = 200_004;
 const TOK_EOS: u32 = 200_006;
@@ -60,6 +62,8 @@ enum StreamEvent {
     },
     Done {
         finish_reason: &'static str,
+        /// Prompt tokens served from the prefix cache (not re-prefilled).
+        cached_tokens: usize,
         prompt_tokens: usize,
         completion_tokens: usize,
         prefill_secs: f64,
@@ -409,8 +413,8 @@ fn engine_worker_loop(
     tok: Arc<BpeTokenizer>,
     cmd_rx: Receiver<EngineCommand>,
 ) {
-    // Prefix cache for exact multi-turn KV/sconv reuse (exact when new prompt starts with last sequence)
-    let mut cached_seq: Vec<u32> = Vec::new();
+    // Prompt prefix cache: live-sequence extension + rewind to pinned-RAM state snapshots.
+    let mut pc: PrefixCache<SeqSnapshot> = PrefixCache::new(4);
     let mut last_decode_tok_s: f64 = 0.0;
     let mut last_prefill_tok_s: f64 = 0.0;
 
@@ -440,6 +444,18 @@ fn engine_worker_loop(
                     "stage2_disk_reads": tel.stage2_disk_reads,
                     "experts_vram_resident": { "prelude": pre, "loop_core": core, "coda": coda },
                     "experts_ram_warm": ram,
+                    "prefix_cache": {
+                        "requests": pc.stats.requests,
+                        "extend_hits": pc.stats.extend_hits,
+                        "restore_hits": pc.stats.restore_hits,
+                        "misses": pc.stats.misses,
+                        "reused_tokens": pc.stats.reused_tokens,
+                        "prefilled_tokens": pc.stats.prefilled_tokens,
+                        "snapshots_taken": pc.stats.snapshots_taken,
+                        "snapshot_positions": pc.snapshot_positions(),
+                        "live_tokens": pc.cached.len(),
+                        "snapshot_mib": engine.snapshot_bytes() as f64 / (1024.0 * 1024.0),
+                    },
                     "kv_max_ctx": engine.global_max_seq,
                     "kv_vram_gib": engine.kv_vram_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
                     "vram_free_gib": vram_info.as_ref().map(|d| d.free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
@@ -479,43 +495,67 @@ fn engine_worker_loop(
                     continue;
                 }
 
-                // Exact prefix reuse if this request strictly extends the cached KV+sconv state
-                let reuse_len = if !cached_seq.is_empty()
-                    && prompt_ids.len() > cached_seq.len()
-                    && prompt_ids[..cached_seq.len()] == cached_seq[..]
-                {
-                    cached_seq.len()
-                } else {
-                    if let Err(e) = engine.reset_sequence() {
-                        let _ = event_tx.send(StreamEvent::Error(format!("reset_sequence: {e}")));
+                let t_pf = Instant::now();
+                let plan = pc.plan(&prompt_ids);
+                let rewind = match &plan {
+                    PrefixPlan::Extend { from } => Ok(*from),
+                    PrefixPlan::Restore { snap_idx, pos } => {
+                        engine.restore_state(pc.snapshot(*snap_idx)).map(|_| *pos)
+                    }
+                    PrefixPlan::Reset => engine.reset_sequence().map(|_| 0),
+                };
+                let reuse_len = match rewind {
+                    Ok(p) => p,
+                    Err(e) => {
+                        pc.invalidate();
+                        let _ = event_tx.send(StreamEvent::Error(format!("prefix restore: {e}")));
                         continue;
                     }
-                    cached_seq.clear();
-                    0
                 };
+                pc.rewound_to(&plan, reuse_len);
 
-                let t_pf = Instant::now();
+                // Snapshot points: first user-message boundary (shared system/tool prefix) and
+                // the prompt end (multi-turn divergence right after the previous prompt).
+                let boundary = prompt_ids
+                    .iter()
+                    .position(|&t| t == TOK_MESSAGE_USER)
+                    .filter(|&b| b > reuse_len && b >= 16);
                 let mut pf_err = None;
                 for idx in reuse_len..prompt_ids.len() {
+                    if Some(idx) == boundary && !pc.has_snapshot_at(idx) {
+                        let mut slot = pc.take_payload();
+                        match engine.snapshot_state(idx, &mut slot) {
+                            Ok(()) => pc.insert(idx, slot.unwrap()),
+                            Err(e) => eprintln!("[prefix-cache] snapshot at {idx} failed: {e}"),
+                        }
+                    }
                     let is_last = idx + 1 == prompt_ids.len();
                     if let Err(e) = engine.forward_token(prompt_ids[idx], idx, true, is_last) {
                         pf_err = Some(format!("prefill error at pos {idx}: {e}"));
                         break;
                     }
+                    pc.cached.push(prompt_ids[idx]);
                 }
                 if let Some(err) = pf_err {
-                    cached_seq.clear();
+                    pc.invalidate();
                     let _ = event_tx.send(StreamEvent::Error(err));
                     continue;
                 }
+                let end = prompt_ids.len();
+                if !pc.has_snapshot_at(end) {
+                    let mut slot = pc.take_payload();
+                    match engine.snapshot_state(end, &mut slot) {
+                        Ok(()) => pc.insert(end, slot.unwrap()),
+                        Err(e) => eprintln!("[prefix-cache] snapshot at {end} failed: {e}"),
+                    }
+                }
                 let pf_secs = t_pf.elapsed().as_secs_f64();
                 let new_pf_toks = prompt_ids.len() - reuse_len;
+                pc.stats.prefilled_tokens += new_pf_toks as u64;
                 if new_pf_toks > 0 {
                     last_prefill_tok_s = new_pf_toks as f64 / pf_secs.max(1e-6);
                 }
                 let _ = engine.rebalance_after_prefill(128);
-
-                cached_seq.extend_from_slice(&prompt_ids[reuse_len..]);
 
                 let t_dec = Instant::now();
                 let mut generated: Vec<u32> = Vec::with_capacity(max_tokens.min(4096));
@@ -587,11 +627,11 @@ fn engine_worker_loop(
                     }
                     if let Err(e) = engine.forward_token(next_tok, pos, false, true) {
                         let _ = event_tx.send(StreamEvent::Error(format!("decode error: {e}")));
-                        cached_seq.clear();
+                        pc.invalidate();
                         break;
                     }
                     let _ = engine.post_decode_tide_step();
-                    cached_seq.push(next_tok);
+                    pc.cached.push(next_tok);
                     pos += 1;
                     next_tok = match engine.sample_next_token(&sampling, &generated) {
                         Ok(t) => t,
@@ -609,6 +649,7 @@ fn engine_worker_loop(
                 let hit_rate = engine.telemetry().total_vram_hit_rate();
                 let _ = event_tx.send(StreamEvent::Done {
                     finish_reason,
+                    cached_tokens: reuse_len,
                     prompt_tokens: prompt_ids.len(),
                     completion_tokens: generated.len(),
                     prefill_secs: pf_secs,
@@ -842,6 +883,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             finish_reason,
                             prompt_tokens,
                             completion_tokens,
+                            cached_tokens,
                             ..
                         } => {
                             let end_chunk = json!({
@@ -857,7 +899,8 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                                 "usage": {
                                     "prompt_tokens": prompt_tokens,
                                     "completion_tokens": completion_tokens,
-                                    "total_tokens": prompt_tokens + completion_tokens
+                                    "total_tokens": prompt_tokens + completion_tokens,
+                                    "prompt_tokens_details": { "cached_tokens": cached_tokens }
                                 }
                             });
                             let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", end_chunk);
@@ -876,6 +919,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 let mut reasoning = String::new();
                 let mut finish_reason = "length";
                 let (mut pt, mut ct, mut pf_s, mut dec_s, mut hit) = (0usize, 0usize, 0.0, 0.0, 1.0);
+                let mut cached = 0usize;
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
                         StreamEvent::Delta { channel, text } => match channel {
@@ -886,11 +930,13 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             finish_reason: fr,
                             prompt_tokens,
                             completion_tokens,
+                            cached_tokens,
                             prefill_secs,
                             decode_secs,
                             vram_hit_rate,
                         } => {
                             finish_reason = fr;
+                            cached = cached_tokens;
                             pt = prompt_tokens;
                             ct = completion_tokens;
                             pf_s = prefill_secs;
@@ -924,10 +970,12 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     "usage": {
                         "prompt_tokens": pt,
                         "completion_tokens": ct,
-                        "total_tokens": pt + ct
+                        "total_tokens": pt + ct,
+                        "prompt_tokens_details": { "cached_tokens": cached }
                     },
                     "timings": {
-                        "prompt_per_second": pt as f64 / pf_s.max(1e-6),
+                        "prompt_ms": pf_s * 1000.0,
+                        "prompt_per_second": (pt - cached) as f64 / pf_s.max(1e-6),
                         "predicted_per_second": ct as f64 / dec_s.max(1e-6),
                         "vram_hit_rate_pct": hit * 100.0
                     }
@@ -1011,6 +1059,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             finish_reason,
                             prompt_tokens,
                             completion_tokens,
+                            cached_tokens,
                             ..
                         } => {
                             let end_chunk = json!({
@@ -1026,7 +1075,8 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                                 "usage": {
                                     "prompt_tokens": prompt_tokens,
                                     "completion_tokens": completion_tokens,
-                                    "total_tokens": prompt_tokens + completion_tokens
+                                    "total_tokens": prompt_tokens + completion_tokens,
+                                    "prompt_tokens_details": { "cached_tokens": cached_tokens }
                                 }
                             });
                             let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", end_chunk);
@@ -1044,6 +1094,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 let mut text = String::new();
                 let mut finish_reason = "length";
                 let (mut pt, mut ct, mut pf_s, mut dec_s, mut hit) = (0usize, 0usize, 0.0, 0.0, 1.0);
+                let mut cached = 0usize;
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
                         StreamEvent::Delta { text: piece, .. } => text.push_str(&piece),
@@ -1051,11 +1102,13 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             finish_reason: fr,
                             prompt_tokens,
                             completion_tokens,
+                            cached_tokens,
                             prefill_secs,
                             decode_secs,
                             vram_hit_rate,
                         } => {
                             finish_reason = fr;
+                            cached = cached_tokens;
                             pt = prompt_tokens;
                             ct = completion_tokens;
                             pf_s = prefill_secs;
@@ -1082,10 +1135,12 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     "usage": {
                         "prompt_tokens": pt,
                         "completion_tokens": ct,
-                        "total_tokens": pt + ct
+                        "total_tokens": pt + ct,
+                        "prompt_tokens_details": { "cached_tokens": cached }
                     },
                     "timings": {
-                        "prompt_per_second": pt as f64 / pf_s.max(1e-6),
+                        "prompt_ms": pf_s * 1000.0,
+                        "prompt_per_second": (pt - cached) as f64 / pf_s.max(1e-6),
                         "predicted_per_second": ct as f64 / dec_s.max(1e-6),
                         "vram_hit_rate_pct": hit * 100.0
                     }

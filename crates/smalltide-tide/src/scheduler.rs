@@ -10,6 +10,20 @@ use smalltide_core::{
     ExpertId, Inkling2Config, PhysicalLayerId, RescuePolicy, SlotIndex, TideConfig, TideTelemetry,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// Routing priors owned by the scheduler: installed at startup, updated at each request end.
+pub struct PriorsStore {
+    pub priors: TidePriors,
+    /// Where to persist after each request (`None` = in-memory only).
+    pub path: Option<PathBuf>,
+    /// Weight of the newest request's vote once history exists (see `TidePriors::merge_demand`).
+    pub newest_share: f32,
+    /// Prior weight in expert values (heat half-life units, see `TideCache::set_prior_rates`).
+    pub prior_weight: f32,
+    /// Fold requests in (false = frozen priors, e.g. benchmarks).
+    pub update: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct ActiveExpertSlot {
@@ -45,6 +59,11 @@ pub struct TideScheduler {
     /// Pending async promotion candidates (expert -> accumulated miss priority).
     pending_async_vram: HashMap<ExpertId, f32>,
     pending_async_ram: HashMap<ExpertId, f32>,
+    pub priors_store: Option<PriorsStore>,
+    /// Hysteresis for decode-time (per-token) async promotions: a missed expert must be worth
+    /// this many times the coldest resident it would evict. Boundary / periodic passes use
+    /// `cache::SWAP_HYSTERESIS`.
+    pub async_hysteresis: f64,
 }
 
 impl TideScheduler {
@@ -69,8 +88,42 @@ impl TideScheduler {
             prefill_scores: vec![0.0; total],
             pending_async_vram: HashMap::new(),
             pending_async_ram: HashMap::new(),
+            priors_store: None,
+            async_hysteresis: 2.0,
         }
     }
+
+    /// Installs routing priors; non-empty priors immediately drive values and warm-up.
+    pub fn install_priors(&mut self, store: PriorsStore) {
+        if !store.priors.is_empty() {
+            self.cache.set_prior_rates(store.priors.rates(&self.model_cfg), store.prior_weight);
+        }
+        self.priors_store = Some(store);
+    }
+
+    /// End of a request: folds its routing demand into the priors as one vote, refreshes the live
+    /// prior rates and persists. Returns a short log line.
+    pub fn finish_request(&mut self) -> Option<String> {
+        let demand = self.cache.take_demand();
+        let st = self.priors_store.as_mut()?;
+        if !st.update {
+            return None;
+        }
+        st.priors.merge_demand(&demand, st.newest_share);
+        if st.priors.is_empty() {
+            return None;
+        }
+        self.cache.set_prior_rates(st.priors.rates(&self.model_cfg), st.prior_weight);
+        let saved = match &st.path {
+            Some(p) => match st.priors.save_to_file(p) {
+                Ok(()) => format!("saved {}", p.display()),
+                Err(e) => format!("NOT saved ({e})"),
+            },
+            None => "in memory".into(),
+        };
+        Some(format!("[priors] {} requests folded in; {saved}", st.priors.sessions_recorded))
+    }
+
 
     /// Mode 1: Preload Before Prefill (Session Warm-up).
     /// 1) Pin Loop Core (layers 6..17) into VRAM first (up to 100% if budget permits).
@@ -82,6 +135,35 @@ impl TideScheduler {
         }
         let mut ops = Vec::new();
         let n_exp = self.model_cfg.n_routed_experts;
+
+        if self.cache.has_priors() {
+            // Priors known: load the experts with the highest expected routing mass per byte
+            // (both pools), unpinned so the session can still trade them; then warm RAM.
+            let total = self.model_cfg.num_physical_layers * n_exp;
+            let mut ranked: Vec<(ExpertId, f64)> = (0..total)
+                .map(|i| {
+                    let id = self.cache.expert_from_flat(i);
+                    (id, self.cache.prior_rate(id) as f64 / self.cache.expert_bytes(id) as f64)
+                })
+                .collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for &(id, _) in &ranked {
+                if self.cache.has_free_vram_room_for(id) {
+                    if let Some(op) = self.cache.promote_to_vram(id, false, true) {
+                        self.record_transfer_telemetry(&op, false);
+                        ops.push(op);
+                    }
+                } else if self.cache.entry(id).vram_slot.is_missing()
+                    && self.cache.ram_used_bytes() + self.cache.expert_bytes(id) <= self.cache.ram_budget_bytes()
+                {
+                    if let Some(op) = self.cache.promote_to_ram(id) {
+                        self.record_transfer_telemetry(&op, false);
+                        ops.push(op);
+                    }
+                }
+            }
+            return ops;
+        }
 
         // Step 1: Loop Core (physical layers 6..17) -> VRAM (pinned)
         let mut loop_experts: Vec<(ExpertId, f32)> = Vec::new();
@@ -151,12 +233,13 @@ impl TideScheduler {
         topk_ids: &[u16],
         topk_weights: &[f32],
     ) {
-        let mult = self.cache.loop_priority_multiplier(ExpertId { layer, expert: 0 });
+        let tot: f32 = topk_weights.iter().sum();
+        let inv = if tot > 1e-8 { 1.0 / tot } else { 0.0 };
         for (&exp, &w) in topk_ids.iter().zip(topk_weights.iter()) {
             let id = ExpertId { layer, expert: exp };
             let idx = self.cache.flat_index(id);
-            self.prefill_scores[idx] += w * mult;
-            self.cache.touch_expert(id, w);
+            self.prefill_scores[idx] += w * inv;
+            self.cache.touch_expert(id, w * inv);
         }
     }
 
@@ -168,25 +251,36 @@ impl TideScheduler {
             self.prefill_scores.fill(0.0);
             return Vec::new();
         }
-        let mut ranked: Vec<(ExpertId, f32)> = self
+        // Candidates: experts the prompt routed to that are not resident, best value first.
+        let mut ranked: Vec<(ExpertId, f64)> = self
             .prefill_scores
             .iter()
             .enumerate()
             .filter(|(_, &s)| s > 0.0)
-            .map(|(idx, &s)| (self.cache.expert_from_flat(idx), s))
+            .map(|(idx, _)| self.cache.expert_from_flat(idx))
+            .filter(|&id| self.cache.entry(id).vram_slot.is_missing())
+            .map(|id| (id, self.cache.value(id)))
             .collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let mut ops = Vec::new();
         let mut swaps = 0usize;
-        for (id, _) in ranked {
+        let mut floors: [Option<Option<f64>>; 2] = [None, None];
+        for (id, val) in ranked {
             if swaps >= max_swaps {
                 break;
             }
-            if !self.cache.entry(id).vram_slot.is_missing() {
-                continue;
+            let cls = self.cache.expert_class(id);
+            let ci = cls as usize;
+            let need = self.cache.expert_bytes(id);
+            let floor = *floors[ci].get_or_insert_with(|| self.cache.promotion_floor(cls, need));
+            if let Some(f) = floor {
+                if val <= f * crate::cache::SWAP_HYSTERESIS + 1e-9 {
+                    continue;
+                }
             }
-            let pin = self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
+            floors[ci] = None;
+            let pin = !self.cache.has_priors() && self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
             if let Some(op) = self.cache.promote_to_vram(id, pin, true) {
                 self.record_transfer_telemetry(&op, false);
                 ops.push(op);
@@ -211,6 +305,7 @@ impl TideScheduler {
     /// Records `top_k` hits for a 100%-VRAM-resident layer without requiring CPU router readback.
     pub fn record_full_layer_hit(&mut self, layer: PhysicalLayerId, top_k: u64) {
         let l = layer.0 as usize;
+        self.telemetry.routed_weight_total += 1.0;
         if self.model_cfg.is_loop_core_layer(l) {
             self.telemetry.vram_hits_loop += top_k;
         } else if l < self.model_cfg.loop_start_layer {
@@ -242,6 +337,7 @@ impl TideScheduler {
         let total_weight: f32 = topk_weights.iter().sum();
         let inv_total_w = if total_weight > 1e-8 { 1.0 / total_weight } else { 1.0 };
         let mut executed_weight = 0.0f32;
+        self.telemetry.routed_weight_total += 1.0;
 
         for (&exp, &w) in topk_ids.iter().zip(topk_weights.iter()) {
             let id = ExpertId { layer, expert: exp };
@@ -278,7 +374,7 @@ impl TideScheduler {
                 // otherwise use the transient Scratch Rescue Ring so cold 1-off misses
                 // never thrash warm resident experts!
                 if self.cache.should_promote_instead_of_scratch(id) {
-                    let pin = self.model_cfg.is_loop_core_layer(layer.0 as usize);
+                    let pin = !self.cache.has_priors() && self.model_cfg.is_loop_core_layer(layer.0 as usize);
                     if let Some(op) = self.cache.promote_to_vram(id, pin, true) {
                         self.record_transfer_telemetry(&op, true);
                         sync_transfers.push(op);
@@ -291,6 +387,7 @@ impl TideScheduler {
                         executed_weight += w;
                     } else {
                         self.telemetry.stage1_skipped_tail_misses += 1;
+                        self.telemetry.routed_weight_skipped += norm_w as f64;
                     }
                 } else {
                     let op = self.cache.stage_scratch_rescue(id);
@@ -307,7 +404,8 @@ impl TideScheduler {
             } else {
                 // Skip this miss for zero-stall decode and enqueue for paced async promotion!
                 self.telemetry.stage1_skipped_tail_misses += 1;
-                let prio = w * self.cache.loop_priority_multiplier(id);
+                self.telemetry.routed_weight_skipped += norm_w as f64;
+                let prio = norm_w;
                 if entry.ram_slot.is_missing() {
                     *self.pending_async_ram.entry(id).or_insert(0.0) += prio;
                 }
@@ -360,30 +458,62 @@ impl TideScheduler {
             }
         }
 
-        // Stage 1: RAM -> VRAM (paced, only promoting experts whose RAM slot is Ready!)
+        // Stage 1: RAM -> VRAM (paced, only promoting experts whose RAM slot is Ready!).
+        // Candidates in value order; each class's eviction floor is computed once and refreshed
+        // only after a promotion (a full scan per candidate cost ~10 ms of CPU per token).
         if !self.pending_async_vram.is_empty()
             && self.tide_cfg.max_async_vram_promotions_per_token > 0
         {
-            let mut cands: Vec<(ExpertId, f32)> = self.pending_async_vram.drain().collect();
-            cands.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let drained: Vec<(ExpertId, f32)> = self.pending_async_vram.drain().collect();
+            let mut cands: Vec<(ExpertId, f32, f64)> = drained
+                .into_iter()
+                .filter(|(id, _)| {
+                    let e = self.cache.entry(*id);
+                    e.vram_slot.is_missing() || e.is_scratch_slot
+                })
+                .map(|(id, prio)| (id, prio, self.cache.value(id)))
+                .collect();
+            cands.sort_by(|a, b| b.2.total_cmp(&a.2));
+            let mut floors: [Option<Option<f64>>; 2] = [None, None];
             let mut done = 0usize;
-            for (id, prio) in cands {
-                let entry = self.cache.entry(id);
-                if !entry.vram_slot.is_missing() && !entry.is_scratch_slot {
+            for (id, prio, val) in cands {
+                let keep = |s: &mut Self| {
+                    if prio > 0.05 {
+                        s.pending_async_vram.insert(id, prio * 0.9);
+                    }
+                };
+                if done >= self.tide_cfg.max_async_vram_promotions_per_token || !self.cache.is_ram_ready(id) {
+                    keep(self);
                     continue;
                 }
-                if done < self.tide_cfg.max_async_vram_promotions_per_token
-                    && self.cache.is_ram_ready(id)
-                {
-                    let pin = self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
-                    if let Some(op) = self.cache.promote_to_vram(id, pin, false) {
-                        self.record_transfer_telemetry(&op, false);
-                        ops.push(op);
-                        done += 1;
-                    }
-                } else if prio > 0.05 {
-                    self.pending_async_vram.insert(id, prio * 0.9);
+                let cls = self.cache.expert_class(id);
+                let ci = cls as usize;
+                let need = self.cache.expert_bytes(id);
+                let floor = *floors[ci].get_or_insert_with(|| self.cache.promotion_floor(cls, need));
+                let ok = match floor {
+                    None => true,
+                    Some(f) => val > f * self.async_hysteresis + 1e-9,
+                };
+                if !ok {
+                    // Not worth a resident slot (yet): repeated misses raise its heat.
+                    keep(self);
+                    continue;
                 }
+                let pin = !self.cache.has_priors() && self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
+                if let Some(op) = self.cache.promote_to_vram(id, pin, false) {
+                    self.record_transfer_telemetry(&op, false);
+                    self.telemetry.decode_async_promotions += 1;
+                    ops.push(op);
+                    done += 1;
+                    floors[ci] = None;
+                }
+            }
+            // Bound the queue (lowest claims dropped).
+            if self.pending_async_vram.len() > 512 {
+                let mut v: Vec<(ExpertId, f32)> = self.pending_async_vram.drain().collect();
+                v.sort_by(|a, b| b.1.total_cmp(&a.1));
+                v.truncate(512);
+                self.pending_async_vram.extend(v);
             }
         }
 
@@ -405,7 +535,7 @@ impl TideScheduler {
             return Vec::new();
         }
         let heat_snap = self.cache.export_heat_snapshot();
-        let mut cands: Vec<(ExpertId, f32)> = heat_snap
+        let mut cands: Vec<(ExpertId, f64)> = heat_snap
             .iter()
             .enumerate()
             .filter_map(|(idx, &h)| {
@@ -417,24 +547,27 @@ impl TideScheduler {
                 if !e.vram_slot.is_missing() && !e.is_scratch_slot {
                     return None;
                 }
-                Some((id, h))
+                Some((id, self.cache.value(id)))
             })
             .collect();
         cands.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let mut ops = Vec::new();
-        for (id, h) in cands {
+        let mut floors: [Option<Option<f64>>; 2] = [None, None];
+        for (id, val) in cands {
             if ops.len() >= max_swaps {
                 break;
             }
+            let cls = self.cache.expert_class(id);
+            let ci = cls as usize;
             let need = self.cache.expert_bytes(id);
-            let beats_coldest = match self.cache.coldest_resident_vram_heat(need) {
-                None => true,
-                Some(coldest) => h > coldest * 1.25 + 1e-4,
-            };
-            if !beats_coldest {
-                break;
+            let floor = *floors[ci].get_or_insert_with(|| self.cache.promotion_floor(cls, need));
+            if let Some(f) = floor {
+                if val <= f * crate::cache::SWAP_HYSTERESIS + 1e-9 {
+                    continue;
+                }
             }
+            floors[ci] = None;
             if !self.cache.is_ram_ready(id) {
                 // Bug fix: never block decode on NVMe. Queue an async Disk->RAM read (if not
                 // already in flight) and let Mode 3 promote it once it is Ready.
@@ -442,10 +575,10 @@ impl TideScheduler {
                     self.record_transfer_telemetry(&op, false);
                     ops.push(op);
                 }
-                *self.pending_async_vram.entry(id).or_insert(0.0) += h;
+                *self.pending_async_vram.entry(id).or_insert(0.0) += 1.0;
                 continue;
             }
-            let pin = self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
+            let pin = !self.cache.has_priors() && self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
             if let Some(op) = self.cache.promote_to_vram(id, pin, false) {
                 self.record_transfer_telemetry(&op, false);
                 ops.push(op);
@@ -454,10 +587,11 @@ impl TideScheduler {
         ops
     }
 
-    /// Consolidates this session's EWMA expert heat into persisted `TidePriors` at end-of-request.
-    pub fn consolidate_priors(&self, priors: &mut TidePriors, blend_alpha: f32) {
-        let snap = self.cache.export_heat_snapshot();
-        priors.merge_session_heat(&snap, blend_alpha);
+    /// Folds this request's routing demand into `priors` as one vote (see `TidePriors::merge_demand`)
+    /// and resets the per-request demand.
+    pub fn consolidate_priors(&mut self, priors: &mut TidePriors, newest_share: f32) {
+        let demand = self.cache.take_demand();
+        priors.merge_demand(&demand, newest_share);
     }
 
     fn record_hit(&mut self, layer: PhysicalLayerId) {

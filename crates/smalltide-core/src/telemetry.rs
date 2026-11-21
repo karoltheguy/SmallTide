@@ -28,9 +28,33 @@ pub struct TideTelemetry {
 
     pub stage2_disk_reads: u64,
     pub stage2_bytes_read: u64,
+
+    /// Decode routing mass seen (1.0 per token per logical layer) and the part of it that was
+    /// skipped (missing experts, renormalized away): the quality cost of the resident set.
+    #[serde(default)]
+    pub routed_weight_total: f64,
+    #[serde(default)]
+    pub routed_weight_skipped: f64,
+    /// Prefill routing mass (1.0 per prompt token per logical layer) and the part skipped.
+    #[serde(default)]
+    pub prefill_weight_total: f64,
+    #[serde(default)]
+    pub prefill_weight_skipped: f64,
+    /// RAM -> VRAM promotions made during decode by the per-token async planner.
+    #[serde(default)]
+    pub decode_async_promotions: u64,
 }
 
 impl TideTelemetry {
+    /// Share of decode routing weight that was skipped (0 = exact).
+    pub fn skipped_weight_share(&self) -> f64 {
+        if self.routed_weight_total > 0.0 {
+            self.routed_weight_skipped / self.routed_weight_total
+        } else {
+            0.0
+        }
+    }
+
     pub fn total_vram_hit_rate(&self) -> f64 {
         let hits = self.vram_hits_prelude + self.vram_hits_loop + self.vram_hits_coda;
         let misses = self.vram_misses_prelude + self.vram_misses_loop + self.vram_misses_coda;

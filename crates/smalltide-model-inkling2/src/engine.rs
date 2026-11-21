@@ -178,6 +178,9 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     rng_state: u64,
     tokens_decoded: u64,
     pub profile_enabled: bool,
+    /// Prefill under `RescuePolicy::Threshold`: stage a missing expert only if its summed routing
+    /// share over the chunk is at least this many tokens' worth (else skip + renormalize).
+    pub prefill_min_share: f32,
     pub profile: StepProfile,
 }
 
@@ -312,6 +315,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             rng_state: 0x9E37_79B9_7F4A_7C15,
             tokens_decoded: 0,
             profile_enabled: false,
+            prefill_min_share: 1.0,
             profile: StepProfile::default(),
         })
     }

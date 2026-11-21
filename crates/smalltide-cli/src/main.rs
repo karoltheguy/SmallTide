@@ -892,16 +892,23 @@ fn run_generate(args: &[String]) {
         if tot == 0 { 100.0 } else { (h as f64 / tot as f64) * 100.0 }
     };
     println!(
-        "[Tide] Overall VRAM hit: {:.1}% (Prelude {:.1}%, LoopCore {:.1}%, Coda {:.1}%) | Stage1 sync={}, async={}, skipped={} | Stage2 disk->RAM={}",
+        "[Tide] Overall VRAM hit: {:.1}% (Prelude {:.1}%, LoopCore {:.1}%, Coda {:.1}%) | skipped routing weight {:.2}% (prefill {:.2}%) | Stage1 sync={}, async={}, skipped={} | decode async promotions={} | Stage2 disk->RAM={} | RAM-miss disk reads={}",
         tel.total_vram_hit_rate() * 100.0,
         pct(tel.vram_hits_prelude, tel.vram_misses_prelude),
         pct(tel.vram_hits_loop, tel.vram_misses_loop),
         pct(tel.vram_hits_coda, tel.vram_misses_coda),
+        tel.skipped_weight_share() * 100.0,
+        if tel.prefill_weight_total > 0.0 { 100.0 * tel.prefill_weight_skipped / tel.prefill_weight_total } else { 0.0 },
         tel.stage1_sync_rescues,
         tel.stage1_async_promotions,
         tel.stage1_skipped_tail_misses,
+        tel.decode_async_promotions,
         tel.stage2_disk_reads,
+        tel.stage1_ram_fallback_reads,
     );
+    if let Some(line) = engine.tide.scheduler.finish_request() {
+        println!("{line}");
+    }
     if dec_toks > 0 {
         let n = dec_toks as f64;
         println!(

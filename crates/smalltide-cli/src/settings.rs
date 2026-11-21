@@ -12,7 +12,7 @@ use smalltide_io::stide_pack::{ExpertSlabLayout, StidePackReader};
 use smalltide_io::tokenizer::BpeTokenizer;
 use smalltide_model_inkling2::engine::Inkling2Engine;
 use smalltide_model_inkling2::weights::Inkling2DenseGpu;
-use smalltide_tide::TideExecutor;
+use smalltide_tide::{PriorsStore, TideExecutor, TidePriors};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -104,6 +104,11 @@ pub struct Settings {
     pub profile: bool,
     pub host: String,
     pub port: u16,
+    /// Routing priors file (`None` = priors disabled).
+    pub priors_path: Option<PathBuf>,
+    pub priors_update: bool,
+    pub prior_weight: f32,
+    pub priors_newest_share: f32,
 }
 
 impl Settings {
@@ -131,8 +136,18 @@ impl Settings {
             "token" => false,
             other => bad("SMALLTIDE_PREFILL", other, "batched | token"),
         };
+        let model_dir = PathBuf::from(var("SMALLTIDE_MODEL_DIR").unwrap_or_else(|| "models/Inkling-2-Mini".into()));
+        let priors_path = match var("SMALLTIDE_PRIORS").as_deref() {
+            Some("off") | Some("0") => None,
+            Some(path) => Some(PathBuf::from(path)),
+            None => Some(model_dir.join("tide_priors.json")),
+        };
         Self {
-            model_dir: PathBuf::from(var("SMALLTIDE_MODEL_DIR").unwrap_or_else(|| "models/Inkling-2-Mini".into())),
+            priors_path,
+            priors_update: parse::<u8>("SMALLTIDE_PRIORS_UPDATE", 1, "0 or 1") != 0,
+            prior_weight: parse("SMALLTIDE_PRIOR_WEIGHT", 1.0f32, "a number >= 0"),
+            priors_newest_share: parse("SMALLTIDE_PRIORS_NEWEST", 0.1f32, "a number in [0, 0.5)"),
+            model_dir,
             max_ctx: parse("SMALLTIDE_MAX_CTX", 16_384, "a token count"),
             rescue_policy,
             nvfp4_slots: parse_auto("SMALLTIDE_NVFP4_SLOTS"),
@@ -195,8 +210,36 @@ pub fn build_engine(s: &Settings) -> Loaded {
             None => eprintln!("[pools] SMALLTIDE_POOL_BUDGET=resident but no DXGI budget is available; using device free memory"),
         }
     }
+    let priors = s.priors_path.as_ref().map(|path| match TidePriors::load_from_file(path) {
+        Ok(p) => {
+            println!("[priors] loaded {} ({} requests)", path.display(), p.sessions_recorded);
+            p
+        }
+        Err(e) => {
+            if path.exists() {
+                eprintln!("[priors] ignoring {}: {e}", path.display());
+            } else {
+                println!("[priors] none yet at {}; collecting from this session", path.display());
+            }
+            TidePriors::new("Inkling-2-Mini", cfg.num_physical_layers, cfg.n_routed_experts)
+        }
+    });
+    let have_priors = priors.as_ref().is_some_and(|p| !p.is_empty());
     let total_nvfp4 = cfg.mxfp8_start_layer * cfg.n_routed_experts;
     let total_mxfp8 = (cfg.num_physical_layers - cfg.mxfp8_start_layer) * cfg.n_routed_experts;
+    // Resident-budget split of `bytes` between the pools: value per byte with priors, otherwise
+    // NVFP4 first (loop core is placed first), then MXFP8. No floors: missing experts are misses.
+    let split_cfg = cfg.clone();
+    let resident_split = |bytes: usize| -> (usize, usize) {
+        if let Some(p) = priors.as_ref().filter(|p| !p.is_empty()) {
+            let (n4, m8) = p.plan_pool_split(&split_cfg, bytes, nvfp4_slab, mxfp8_slab);
+            (n4.max(1), m8.max(1))
+        } else {
+            let n4 = (bytes / nvfp4_slab).min(total_nvfp4).max(1);
+            let m8 = (bytes.saturating_sub(n4 * nvfp4_slab) / mxfp8_slab).min(total_mxfp8).max(1);
+            (n4, m8)
+        }
+    };
     let (nvfp4_slots, mxfp8_slots) = match (s.nvfp4_slots, s.mxfp8_slots) {
         (Some(n4), Some(m8)) => (n4.min(total_nvfp4), m8.min(total_mxfp8)),
         (Some(n4), None) => {
@@ -207,13 +250,7 @@ pub fn build_engine(s: &Settings) -> Loaded {
             let m8 = m8.min(total_mxfp8);
             ((avail.saturating_sub(m8 * mxfp8_slab) / nvfp4_slab).min(total_nvfp4).max(1536), m8)
         }
-        (None, None) if resident_fit => {
-            // Only what really stays on the card: NVFP4 first (loop core is placed first), then
-            // MXFP8 with what is left. No floors - missing experts are Tide misses.
-            let n4 = (avail / nvfp4_slab).min(total_nvfp4).max(1);
-            let m8 = (avail.saturating_sub(n4 * nvfp4_slab) / mxfp8_slab).min(total_mxfp8).max(1);
-            (n4, m8)
-        }
+        (None, None) if resident_fit => resident_split(avail),
         (None, None) => {
             // Loop core first (1536), then the rest of NVFP4, then MXFP8 with what is left.
             let n4 = (avail.saturating_sub(128 * mxfp8_slab) / nvfp4_slab).min(total_nvfp4).max(1536);
@@ -233,6 +270,7 @@ pub fn build_engine(s: &Settings) -> Loaded {
     let mut tide_cfg = TideConfig::default();
     tide_cfg.pinned_staging_mib = 256;
     tide_cfg.rescue_policy = s.rescue_policy;
+    tide_cfg.max_async_vram_promotions_per_token = parse("SMALLTIDE_ASYNC_PER_TOKEN", tide_cfg.max_async_vram_promotions_per_token, "a count per token");
     let ram_budget_bytes = (s.ram_gb * (1u64 << 30) as f64) as usize;
     let mut tide = TideExecutor::new(backend.clone(), cfg.clone(), tide_cfg, nvfp4_slots, mxfp8_slots, ram_budget_bytes, Some(pack))
         .expect("create TideExecutor");
@@ -242,6 +280,27 @@ pub fn build_engine(s: &Settings) -> Loaded {
     // driver backs allocations beyond the resident budget with system memory, in order.
     let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, s.max_ctx).expect("create Inkling2Engine");
     engine.tide.allocate_pools().expect("allocate expert pools");
+    // Measure instead of trusting the budget estimate: only the part of each pool that the OS
+    // keeps in VRAM is used (Windows silently backs the excess with system memory).
+    let (nvfp4_slots, mxfp8_slots) = if resident_fit || std::env::var_os("SMALLTIDE_POOL_CHECK").is_some() {
+        let (n4, m8, line) = engine.tide.fit_pools_to_resident().expect("pool residency check");
+        println!("{line}");
+        (n4, m8)
+    } else {
+        (nvfp4_slots, mxfp8_slots)
+    };
+    let _ = &resident_split;
+    if let Some(p) = priors {
+        engine.tide.scheduler.install_priors(PriorsStore {
+            priors: p,
+            path: s.priors_path.clone(),
+            newest_share: s.priors_newest_share,
+            prior_weight: s.prior_weight,
+            update: s.priors_update,
+        });
+    }
+    engine.prefill_min_share = parse("SMALLTIDE_PREFILL_MIN_SHARE", 1.0f32, "tokens of routing share");
+    engine.tide.scheduler.async_hysteresis = parse("SMALLTIDE_ASYNC_HYSTERESIS", 1.25f64, "a factor >= 1");
     let preload_ops = engine.tide.scheduler.plan_pre_prefill(None);
     engine.tide.execute_transfers(&preload_ops, true, false).expect("Mode 1 pre-prefill");
     backend.sync_stream(engine.tide.copy_stream).expect("sync prefill DMA");
@@ -263,6 +322,15 @@ pub fn build_engine(s: &Settings) -> Loaded {
         );
     }
     let info = backend.device_info().expect("device_info ready");
+    if have_priors {
+        let sched = &engine.tide.scheduler;
+        let p = &sched.priors_store.as_ref().unwrap().priors;
+        let cov = p.coverage(&cfg_for_log(), |i| {
+            let id = sched.cache.expert_from_flat(i);
+            !sched.cache.entry(id).vram_slot.is_missing()
+        });
+        println!("[priors] resident set covers {:.1}% of the expected routing mass per token", cov * 100.0);
+    }
     let (pre, core, coda) = engine.tide.scheduler.cache.count_vram_resident();
     println!(
         "[Ready in {:.2}s] VRAM free: {:.2}/{:.2} GiB | KV({} ctx): {:.2} GiB | Experts resident: pre={}, core={}/1536, coda={} (slots nvfp4={}, mxfp8={}{}) | RAM warm: {} | Rescue: {:?}",
@@ -281,6 +349,10 @@ pub fn build_engine(s: &Settings) -> Loaded {
         s.rescue_policy,
     );
     Loaded { engine, tok, backend, nvfp4_slots, mxfp8_slots }
+}
+
+fn cfg_for_log() -> Inkling2Config {
+    Inkling2Config::default()
 }
 
 /// Prints where configuration came from (once, at startup).

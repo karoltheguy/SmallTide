@@ -185,9 +185,9 @@ impl<B: ComputeBackend> TideExecutor<B> {
         self.backend.sync_stream(self.compute_stream)?;
         self.backend.free_device(self.vram_pool_nvfp4)?;
         self.backend.free_device(self.vram_pool_mxfp8)?;
-        self.vram_pool_nvfp4 = self
-            .backend
-            .alloc_device((self.pool_slots.0 + scratch) * self.nvfp4_layout.aligned_slab_bytes)?;
+        // MXFP8 first: it is the smaller pool and (with priors) its experts carry the most
+        // routing mass per byte. Windows places the first-allocated memory in VRAM; whatever
+        // follows past the resident cap lands in system memory (see `fit_pools_to_resident`).
         let mx_bytes = (self.pool_slots.1 + scratch) * self.mxfp8_layout.aligned_slab_bytes;
         if self.mxfp8_host_mapped {
             let (view, host) = self.backend.alloc_host_mapped(mx_bytes)?;
@@ -196,8 +196,114 @@ impl<B: ComputeBackend> TideExecutor<B> {
         } else {
             self.vram_pool_mxfp8 = self.backend.alloc_device(mx_bytes)?;
         }
+        self.vram_pool_nvfp4 = self
+            .backend
+            .alloc_device((self.pool_slots.0 + scratch) * self.nvfp4_layout.aligned_slab_bytes)?;
         self.pools_allocated = true;
         Ok(())
+    }
+
+    /// Re-sizes the expert pools. Only valid before the first expert transfer (pools empty).
+    pub fn resize_pools(&mut self, nvfp4_slots: usize, mxfp8_slots: usize) -> Result<()> {
+        let (pre, core, coda) = self.scheduler.cache.count_vram_resident();
+        if pre + core + coda != 0 {
+            return Err(smalltide_core::SmallTideError::Backend {
+                backend: "tide",
+                message: "resize_pools after experts were loaded".into(),
+            });
+        }
+        let (n4, m8) = (nvfp4_slots.max(1), mxfp8_slots.max(1));
+        let scratch = DEFAULT_SCRATCH_RING_SLOTS;
+        // Free the current pools first so the new ones can take their place.
+        self.backend.sync_stream(self.compute_stream)?;
+        self.backend.free_device(self.vram_pool_nvfp4)?;
+        self.backend.free_device(self.vram_pool_mxfp8)?;
+        self.vram_pool_nvfp4 = self.backend.alloc_device((1 + scratch) * self.nvfp4_layout.aligned_slab_bytes)?;
+        self.vram_pool_mxfp8 = self.backend.alloc_device((1 + scratch) * self.mxfp8_layout.aligned_slab_bytes)?;
+        self.pool_slots = (n4, m8);
+        self.scheduler.cache.set_unified_vram_budget(
+            n4 * self.nvfp4_layout.aligned_slab_bytes + m8 * self.mxfp8_layout.aligned_slab_bytes,
+        );
+        self.scheduler.cache.configure_scratch_ring(n4 as u32, m8 as u32, scratch as u32);
+        self.pools_allocated = false;
+        self.allocate_pools()
+    }
+
+    pub fn pool_slots(&self) -> (usize, usize) {
+        self.pool_slots
+    }
+
+    /// Bytes at the start of `pool` that read at VRAM speed, scanning `win`-sized windows
+    /// (device copy of the first half of each window onto its second half).
+    fn fast_prefix_bytes(&self, pool: DeviceBuf, win: usize) -> Result<(usize, f64, f64)> {
+        const REPS: usize = 6;
+        const SLOW_GBS: f64 = 100.0;
+        let s = self.compute_stream;
+        let half = win / 2;
+        let (mut best, mut worst) = (0.0f64, f64::INFINITY);
+        let mut off = 0usize;
+        while off + win <= pool.size_bytes {
+            let src = pool.slice(off, half);
+            let dst = pool.slice(off + half, half);
+            self.backend.vec_copy(dst, src, half / 4, s)?;
+            self.backend.sync_stream(s)?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..REPS {
+                self.backend.vec_copy(dst, src, half / 4, s)?;
+            }
+            self.backend.sync_stream(s)?;
+            let gbs = (2 * REPS * half) as f64 / t0.elapsed().as_secs_f64() / 1e9;
+            best = best.max(gbs);
+            worst = worst.min(gbs);
+            if gbs < SLOW_GBS {
+                return Ok((off, best, gbs));
+            }
+            off += win;
+        }
+        Ok((pool.size_bytes, best, worst))
+    }
+
+    /// Caps each device pool's usable slots to the part the OS keeps in VRAM (measured), so no
+    /// expert ever lives in system-memory-backed "VRAM". The slow tail of an allocation is simply
+    /// left unused; the scratch ring follows the usable slots and so stays fast too.
+    /// Returns `(nvfp4_slots, mxfp8_slots, log line)`. Only valid before the first transfer.
+    pub fn fit_pools_to_resident(&mut self) -> Result<(usize, usize, String)> {
+        let scratch = DEFAULT_SCRATCH_RING_SLOTS;
+        let win = 256usize << 20;
+        let (n4, m8) = self.pool_slots;
+        let s4 = self.nvfp4_layout.aligned_slab_bytes;
+        let s8 = self.mxfp8_layout.aligned_slab_bytes;
+        let mut notes = Vec::new();
+        let m8_fit = if self.mxfp8_host_mapped {
+            m8
+        } else {
+            let (fast, _best, worst) = self.fast_prefix_bytes(self.vram_pool_mxfp8, win.min(self.vram_pool_mxfp8.size_bytes & !0xFFFF))?;
+            let fit = (fast / s8).saturating_sub(scratch).min(m8);
+            if fit < m8 {
+                notes.push(format!("mxfp8 fast {:.2} GiB (then {worst:.0} GB/s)", fast as f64 / (1u64 << 30) as f64));
+            }
+            fit
+        };
+        let (fast4, best4, worst4) = self.fast_prefix_bytes(self.vram_pool_nvfp4, win)?;
+        let n4_fit = (fast4 / s4).saturating_sub(scratch).min(n4);
+        if n4_fit < n4 {
+            notes.push(format!("nvfp4 fast {:.2} GiB (then {worst4:.0} GB/s)", fast4 as f64 / (1u64 << 30) as f64));
+        }
+        let (n4_fit, m8_fit) = (n4_fit.max(1), m8_fit.max(1));
+        if (n4_fit, m8_fit) != (n4, m8) {
+            self.pool_slots = (n4_fit, m8_fit);
+            self.scheduler.cache.set_unified_vram_budget(n4_fit * s4 + m8_fit * s8);
+            self.scheduler.cache.configure_scratch_ring(n4_fit as u32, m8_fit as u32, scratch as u32);
+        }
+        let line = if notes.is_empty() {
+            format!("[pools] residency check: both pools fully at VRAM speed (~{best4:.0} GB/s copy)")
+        } else {
+            format!(
+                "[pools] residency check: {} -> usable slots nvfp4 {n4} -> {n4_fit}, mxfp8 {m8} -> {m8_fit} (the slow tail stays unused)",
+                notes.join(", ")
+            )
+        };
+        Ok((n4_fit, m8_fit, line))
     }
 
     /// Places the MXFP8 expert pool in pinned, device-mapped host memory (call before

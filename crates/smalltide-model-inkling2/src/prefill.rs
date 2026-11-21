@@ -547,9 +547,27 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.tide.scheduler.record_prefill_routing(phys, &ri, &rw);
         }
 
-        // Resident experts address their published slot; missing ones go through scratch waves.
+        // Per-pair normalized routing share (a row's 8 shares sum to 1).
+        let mut row_sum = vec![0f32; m];
+        for r in 0..m {
+            row_sum[r] = (0..8).map(|k| f32::from_bits(word(r * 16 + 8 + k))).sum::<f32>().max(1e-20);
+        }
+        let share = |pr: u32| f32::from_bits(word((pr as usize >> 3) * 16 + 8 + (pr as usize & 7))) / row_sum[pr as usize >> 3];
+
+        // Resident experts address their published slot; missing ones are staged through scratch
+        // waves, or skipped per the rescue policy (renormalizing each affected row).
+        //   exact     - stage every missing expert (prefill is exact)
+        //   threshold - stage a missing expert only if its summed share over this chunk is at
+        //               least `prefill_min_share` tokens' worth (one rare pair costs a full slab copy)
+        //   disabled  - stage nothing
+        let min_share: Option<f32> = match self.tide.scheduler.tide_cfg.rescue_policy {
+            smalltide_core::RescuePolicy::Exact => None,
+            smalltide_core::RescuePolicy::Threshold(_) => Some(self.prefill_min_share),
+            smalltide_core::RescuePolicy::Disabled => Some(f32::INFINITY),
+        };
         let mut resident: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut missing: Vec<(ExpertId, Vec<u32>)> = Vec::new();
+        let mut skipped_pairs: Vec<u32> = Vec::new();
         for (e, prs) in by_expert.into_iter().enumerate() {
             if prs.is_empty() {
                 continue;
@@ -558,10 +576,39 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let slot = self.tide.scheduler.cache.gpu_slot_table()[self.tide.scheduler.cache.flat_index(id)];
             if slot != SlotIndex::MISSING.0 && !self.tide.scheduler.cache.entry(id).is_scratch_slot {
                 resident.push((slot, prs));
+            } else if min_share.is_some_and(|t| prs.iter().map(|&pr| share(pr)).sum::<f32>() < t) {
+                skipped_pairs.extend_from_slice(&prs);
             } else {
                 missing.push((id, prs));
             }
         }
+        let tel = &mut self.tide.scheduler.telemetry;
+        tel.prefill_weight_total += m as f64;
+        tel.prefill_weight_skipped += skipped_pairs.iter().map(|&pr| share(pr) as f64).sum::<f64>();
+        // Skipped pairs: weight 0, the rest of the row rescaled to the original total. The
+        // modified route rides along in every wave's descriptor upload.
+        let route_override: Option<Vec<u32>> = if skipped_pairs.is_empty() {
+            None
+        } else {
+            let mut rw: Vec<u32> = (0..m * 16).map(word).collect();
+            let mut dropped = vec![0f32; m];
+            for &pr in &skipped_pairs {
+                let (r, k) = (pr as usize >> 3, pr as usize & 7);
+                dropped[r] += f32::from_bits(rw[r * 16 + 8 + k]);
+                rw[r * 16 + 8 + k] = 0f32.to_bits();
+            }
+            for r in 0..m {
+                if dropped[r] > 0.0 {
+                    let kept = row_sum[r] - dropped[r];
+                    let scale = if kept > 1e-20 { row_sum[r] / kept } else { 0.0 };
+                    for k in 0..8 {
+                        let w = f32::from_bits(rw[r * 16 + 8 + k]);
+                        rw[r * 16 + 8 + k] = (w * scale).to_bits();
+                    }
+                }
+            }
+            Some(rw)
+        };
         let is_mx = self.cfg.is_mxfp8_layer(ip);
         let (pool, stride, cls) = if is_mx {
             (self.tide.vram_pool_mxfp8, self.tide.mxfp8_layout.aligned_slab_bytes, ExpertClass::Mxfp8)
@@ -574,6 +621,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let pf = self.pf.as_ref().unwrap();
             (pf.moe_out, pf.moe_mid, pf.moe_tmp, pf.moe_norm)
         };
+        if route_override.is_some() {
+            // Skipped pairs are never written by the expert kernels: their tmp rows must be 0.
+            self.backend.zero_f32(tmp, m * 8 * h, s)?;
+        }
         // Wave 0: resident experts plus the first `ring` missing ones (staged into scratch);
         // further waves stage the next `ring` missing experts each.
         let mut next_missing = 0usize;
@@ -605,14 +656,19 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let pairs_off = work.len() * 4;
             let mut words = work;
             words.extend_from_slice(&pairs);
+            let route_off = words.len() * 4;
+            if let Some(rw) = &route_override {
+                words.extend_from_slice(rw);
+            }
             self.upload_desc(&words)?;
             let desc = self.pf.as_ref().unwrap().desc;
+            let route_arg = if route_override.is_some() { desc.slice(route_off, m * 64) } else { route };
             self.backend.moe_grouped(
                 out,
                 mid,
                 tmp,
                 x,
-                route,
+                route_arg,
                 pool,
                 desc.slice(0, words.len() * 4),
                 GroupedMoeParams {

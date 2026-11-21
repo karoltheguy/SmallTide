@@ -18,5 +18,5 @@ pub use io_worker::{CompletedDiskRead, Stage2IoWorker};
 pub use paged_kv::{PagedKvManager, PhysicalPageId, KV_PAGE_TOKENS};
 pub use priors::TidePriors;
 pub use runtime::{TideExecutor, DEFAULT_SCRATCH_RING_SLOTS};
-pub use scheduler::{ActiveExpertSlot, LayerDispatchPlan, TideScheduler};
+pub use scheduler::{ActiveExpertSlot, LayerDispatchPlan, PriorsStore, TideScheduler};
 pub use smalltide_core::{ExpertId, RescuePolicy, SlotIndex, TideConfig, TideTelemetry};

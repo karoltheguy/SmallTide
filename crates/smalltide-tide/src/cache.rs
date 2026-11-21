@@ -132,7 +132,20 @@ pub struct TideCache {
     scratch_occupants_mxfp8: Vec<Option<ExpertId>>,
 
     step: u64,
+
+    /// Raw routing demand of the current request (sum of normalized router shares per expert,
+    /// one touch per logical pass), folded into `TidePriors` at request end.
+    demand: Vec<f32>,
+    /// Prior expected routing mass per token (`TidePriors::rates`), zero without priors.
+    prior_rate: Vec<f32>,
+    /// Weight of the prior in an expert's value, in steady-state heat units (see `value`).
+    prior_heat_equiv: f32,
 }
+
+/// Per-token heat decay (half-life ~46 tokens).
+pub const HEAT_DECAY: f32 = 0.985;
+/// Hysteresis: a candidate must beat the coldest resident of its class by this factor.
+pub const SWAP_HYSTERESIS: f64 = 1.25;
 
 impl TideCache {
     pub fn new(
@@ -174,6 +187,116 @@ impl TideCache {
             scratch_occupants_nvfp4: vec![None; 8],
             scratch_occupants_mxfp8: vec![None; 8],
             step: 0,
+            demand: vec![0.0; total],
+            prior_rate: vec![0.0; total],
+            prior_heat_equiv: 0.0,
+        }
+    }
+
+    /// Installs prior per-token routing rates (`TidePriors::rates`). `prior_weight` is how many
+    /// "heat half-lives" of observation the prior is worth (1.0 = as much as a steady stream).
+    pub fn set_prior_rates(&mut self, rates: Vec<f32>, prior_weight: f32) {
+        if rates.len() == self.prior_rate.len() {
+            self.prior_rate = rates;
+            self.prior_heat_equiv = prior_weight.max(0.0) / (1.0 - HEAT_DECAY);
+        }
+    }
+
+    /// Changes the unified VRAM expert budget (pool re-sizing before any expert is resident).
+    pub fn set_unified_vram_budget(&mut self, bytes: usize) {
+        self.unified_vram_budget_bytes = bytes;
+    }
+
+    pub fn has_priors(&self) -> bool {
+        self.prior_heat_equiv > 0.0
+    }
+
+    pub fn prior_rate(&self, id: ExpertId) -> f32 {
+        self.prior_rate[self.flat_index(id)]
+    }
+
+    /// Demand of the current request (and resets it).
+    pub fn take_demand(&mut self) -> Vec<f32> {
+        let total = self.demand.len();
+        std::mem::replace(&mut self.demand, vec![0.0; total])
+    }
+
+    /// Value of keeping an expert resident: (session heat + prior) per MiB. Heat is the decayed
+    /// sum of routing shares; in steady state it is `rate / (1 - HEAT_DECAY)`, so the prior is
+    /// expressed in the same units.
+    pub fn value(&self, id: ExpertId) -> f64 {
+        let idx = self.flat_index(id);
+        let e = &self.entries[idx];
+        let mib = self.expert_bytes(id) as f64 / (1u64 << 20) as f64;
+        (e.heat as f64 + self.prior_heat_equiv as f64 * self.prior_rate[idx] as f64) / mib.max(1e-6)
+    }
+
+    fn class_full(&self, cls: ExpertClass) -> bool {
+        match cls {
+            ExpertClass::Nvfp4 => self.max_vram_slots_nvfp4.map_or(false, |cap| self.used_vram_slots_nvfp4 >= cap),
+            ExpertClass::Mxfp8 => self.max_vram_slots_mxfp8.map_or(false, |cap| self.used_vram_slots_mxfp8 >= cap),
+        }
+    }
+
+    /// Lowest-value evictable resident of `cls` (not pinned, pending, protected or scratch).
+    fn coldest_in_class(&self, cls: ExpertClass) -> Option<(usize, f64)> {
+        let mut best: Option<(usize, f64)> = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.vram_slot.is_missing() || e.is_scratch_slot || e.vram_pinned || e.vram_pending {
+                continue;
+            }
+            if self.protected.contains(&i) {
+                continue;
+            }
+            let eid = self.expert_from_flat(i);
+            if self.expert_class(eid) != cls {
+                continue;
+            }
+            let age = self.step.saturating_sub(e.last_touch_step) as f64;
+            let v = self.value(eid) - age * 1e-7;
+            if best.map_or(true, |(_, bv)| v < bv) {
+                best = Some((i, v));
+            }
+        }
+        best
+    }
+
+    /// True if `id` would get a resident slot without evicting anything, or is worth more than the
+    /// coldest evictable resident of its pool by `SWAP_HYSTERESIS`.
+    pub fn worth_promoting(&self, id: ExpertId) -> bool {
+        self.worth_promoting_with(id, SWAP_HYSTERESIS)
+    }
+
+    /// `worth_promoting` with an explicit hysteresis factor.
+    pub fn worth_promoting_with(&self, id: ExpertId, hysteresis: f64) -> bool {
+        let cls = self.expert_class(id);
+        let need = self.expert_bytes(id);
+        if !self.class_full(cls) && self.vram_used_bytes + need <= self.vram_expert_budget_bytes() {
+            return true;
+        }
+        match self.eviction_floor(cls) {
+            None => false,
+            Some(coldest) => self.value(id) > coldest * hysteresis + 1e-9,
+        }
+    }
+
+    /// `None` if an expert of `cls` (of `need` bytes) fits without eviction, else the value floor
+    /// it has to beat (before hysteresis). O(experts): compute once per planning pass and only
+    /// recompute after a promotion changes the resident set.
+    pub fn promotion_floor(&self, cls: ExpertClass, need: usize) -> Option<f64> {
+        if !self.class_full(cls) && self.vram_used_bytes + need <= self.vram_expert_budget_bytes() {
+            return None;
+        }
+        Some(self.eviction_floor(cls).unwrap_or(f64::INFINITY))
+    }
+
+    /// Value (per MiB) of what promoting an expert of `cls` would evict: the coldest of its own
+    /// pool when that pool is slot-full, otherwise the coldest resident of any pool (byte budget).
+    fn eviction_floor(&self, cls: ExpertClass) -> Option<f64> {
+        if self.class_full(cls) {
+            self.coldest_in_class(cls).map(|(_, v)| v)
+        } else {
+            self.pick_vram_victim(false, Some(cls)).map(|v| self.value(v))
         }
     }
 
@@ -227,27 +350,20 @@ impl TideCache {
         self.entries.iter().map(|e| e.heat).collect()
     }
 
-    /// Returns the heat score of the coldest non-pinned resident VRAM expert (or `None` if free room exists).
-    pub fn coldest_resident_vram_heat(&self, need_bytes: usize) -> Option<f32> {
-        if self.vram_used_bytes + need_bytes <= self.vram_expert_budget_bytes() {
-            return None; // Free space available — no eviction required
+    /// Value of the coldest evictable resident in `id`'s pool, or `None` if `id` fits for free.
+    pub fn coldest_resident_value_for(&self, id: ExpertId) -> Option<f64> {
+        let cls = self.expert_class(id);
+        if !self.class_full(cls) && self.vram_used_bytes + self.expert_bytes(id) <= self.vram_expert_budget_bytes() {
+            return None;
         }
-        let victim = self.pick_vram_victim(false, None)?;
-        Some(self.entries[self.flat_index(victim)].heat)
+        Some(self.eviction_floor(cls).unwrap_or(f64::INFINITY))
     }
 
     /// Returns true if a sync-rescued miss is hot enough to earn a resident VRAM slot,
     /// or false if it should run transiently in the Scratch Rescue Ring to avoid thrashing.
     pub fn should_promote_instead_of_scratch(&self, id: ExpertId) -> bool {
-        let need = self.expert_bytes(id);
-        match self.coldest_resident_vram_heat(need) {
-            None => true, // Free VRAM room exists
-            Some(coldest) => {
-                let candidate_heat = self.entries[self.flat_index(id)].heat;
-                // Hysteresis margin (1.15x) prevents cold 1-off misses from thrashing warm slots
-                candidate_heat > coldest * 1.15 + 1e-4
-            }
-        }
+        // Cold 1-off misses run from the scratch ring instead of thrashing warm residents.
+        self.worth_promoting(id)
     }
 
     /// Stages a cold 1-off sync miss into the transient Scratch Rescue Ring without evicting
@@ -374,19 +490,21 @@ impl TideCache {
     pub fn advance_step(&mut self) {
         self.step += 1;
         // Mild global EWMA decay so heat adapts quickly to topic/domain shifts.
-        const DECAY: f32 = 0.985;
         for e in &mut self.entries {
             if e.heat > 1e-6 {
-                e.heat *= DECAY;
+                e.heat *= HEAT_DECAY;
             }
         }
     }
 
-    pub fn touch_expert(&mut self, id: ExpertId, router_weight: f32) {
+    /// Records one routing observation with the expert's *normalized* share of its token's top-k
+    /// (shares of one token's top-k sum to 1). Loop-core experts are touched once per pass, so
+    /// their 3x use per token is counted naturally (no extra multiplier).
+    pub fn touch_expert(&mut self, id: ExpertId, router_share: f32) {
         let idx = self.flat_index(id);
-        let mult = self.loop_priority_multiplier(id);
+        self.demand[idx] += router_share;
         let e = &mut self.entries[idx];
-        e.heat += router_weight * mult;
+        e.heat += router_share;
         e.last_touch_step = self.step;
     }
 
@@ -435,13 +553,12 @@ impl TideCache {
             // Lower score = colder victim. Loop Core gets natural multiplier protection.
             // Prefer matching slot class ONLY as a tiny tie-breaker (never evict a hot
             // same-class expert over a cold other-class expert!).
-            let mult = self.loop_priority_multiplier(id) as f64;
             let age = self.step.saturating_sub(e.last_touch_step) as f64;
             let class_tiebreak = match prefer_class {
-                Some(cls) if self.expert_class(id) == cls => -1e-6,
+                Some(cls) if self.expert_class(id) == cls => -1e-9,
                 _ => 0.0,
             };
-            let score = (e.heat as f64 * mult) - (age * 1e-4) + class_tiebreak;
+            let score = self.value(id) - (age * 1e-7) + class_tiebreak;
             if score < best_score {
                 best_score = score;
                 best_idx = Some(idx);
@@ -467,7 +584,7 @@ impl TideCache {
                 Some(cls) if self.expert_class(id) == cls => -1e-6,
                 _ => 0.0,
             };
-            let score = (e.heat as f64) + in_vram_bonus - (age * 1e-4) + class_tiebreak;
+            let score = self.value(id) + in_vram_bonus - (age * 1e-7) + class_tiebreak;
             if score < best_score {
                 best_score = score;
                 best_idx = Some(idx);
@@ -607,38 +724,10 @@ impl TideCache {
 
         let mut evicted_last = None;
         let cls = self.expert_class(id);
-        let class_full = |this: &Self| -> bool {
-            match cls {
-                ExpertClass::Nvfp4 => this
-                    .max_vram_slots_nvfp4
-                    .map_or(false, |cap| this.used_vram_slots_nvfp4 >= cap),
-                ExpertClass::Mxfp8 => this
-                    .max_vram_slots_mxfp8
-                    .map_or(false, |cap| this.used_vram_slots_mxfp8 >= cap),
-            }
-        };
 
         // First ensure physical slot capacity of this expert's pool (must evict same class!)
-        while class_full(self) {
-            let mut best: Option<(usize, f64)> = None;
-            for (i, e) in self.entries.iter().enumerate() {
-                if e.vram_slot.is_missing() || e.is_scratch_slot || e.vram_pinned || e.vram_pending {
-                    continue;
-                }
-                if self.protected.contains(&i) {
-                    continue;
-                }
-                let eid = self.expert_from_flat(i);
-                if self.expert_class(eid) != cls {
-                    continue;
-                }
-                let score = (e.heat as f64) * (self.loop_priority_multiplier(eid) as f64)
-                    - (self.step.saturating_sub(e.last_touch_step) as f64 * 1e-4);
-                if best.map_or(true, |(_, bs)| score < bs) {
-                    best = Some((i, score));
-                }
-            }
-            let (v_idx, _) = best?;
+        while self.class_full(cls) {
+            let (v_idx, _) = self.coldest_in_class(cls)?;
             let victim = self.expert_from_flat(v_idx);
             self.evict_from_vram(victim);
             evicted_last = Some(victim);

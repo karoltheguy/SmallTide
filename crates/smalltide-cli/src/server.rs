@@ -278,6 +278,12 @@ fn engine_worker_loop(
                     "stage1_async_promotions": tel.stage1_async_promotions,
                     "stage1_skipped_tail_misses": tel.stage1_skipped_tail_misses,
                     "stage2_disk_reads": tel.stage2_disk_reads,
+                    "stage1_bytes_transferred": tel.stage1_bytes_transferred,
+                    "routed_weight_total": tel.routed_weight_total,
+                    "routed_weight_skipped": tel.routed_weight_skipped,
+                    "prefill_weight_total": tel.prefill_weight_total,
+                    "prefill_weight_skipped": tel.prefill_weight_skipped,
+                    "decode_async_promotions": tel.decode_async_promotions,
                     "experts_vram_resident": { "prelude": pre, "loop_core": core, "coda": coda },
                     "experts_ram_warm": ram,
                     "prefix_cache": {
@@ -553,6 +559,9 @@ fn engine_worker_loop(
                     last_decode_tok_s = generated.len() as f64 / dec_secs.max(1e-6);
                 }
                 let hit_rate = engine.telemetry().total_vram_hit_rate();
+                if let Some(line) = engine.tide.scheduler.finish_request() {
+                    println!("{line}");
+                }
                 let _ = event_tx.send(StreamEvent::Done {
                     finish_reason,
                     cached_tokens: reuse_len,

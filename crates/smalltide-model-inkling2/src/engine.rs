@@ -10,7 +10,7 @@
 //!   for 100%-VRAM-resident layers (e.g., all 36 Loop Core layers on RX 9070 XT).
 
 use crate::weights::{DenseLayerGpu, Fp8MatrixGpu, Inkling2DenseGpu, LoopControllerGpu};
-use smalltide_core::backend::{AttnPrepParams, FlashDecodeParams, GemvSegment, MoeDispatchParams};
+use smalltide_core::backend::{AttnPrepParams, FlashDecodeParams, FusedMixParams, GemvSegment, MoeDispatchParams};
 use smalltide_core::{
     ComputeBackend, DType, DeviceBuf, Inkling2Config, PhysicalLayerId, PinnedBuf, Result, Stream,
     TideTelemetry,
@@ -651,48 +651,44 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let is_local = layer.is_local;
         let has_msg = messages.is_some();
 
-        // Save inpSA = cur
-        self.backend.vec_copy(self.scratch.inp_sa, self.scratch.cur, h, s)?;
-
-        // 1. Attention Residual Mix -> inputs[0..3]
-        let (in0, in1, in2) = if let Some(attn_q) = layer.attn_res_query {
-            let blocks_view = Some(self.scratch.blocks.slice(0, (*num_blocks) * h_bytes));
-            if is_local {
-                let dst0 = self.scratch.in_qkv.slice(0, h_bytes);
-                self.backend.attn_res_mix_rows(
-                    dst0,
-                    blocks_view,
-                    self.scratch.cur,
-                    attn_q,
-                    *num_blocks,
-                    1,
-                    h,
-                    eps,
-                    1,
-                    s,
-                )?;
-                (dst0, dst0, dst0)
-            } else {
-                self.backend.attn_res_mix_rows(
-                    self.scratch.in_qkv,
-                    blocks_view,
-                    self.scratch.cur,
-                    attn_q,
-                    *num_blocks,
-                    3,
-                    h,
-                    eps,
-                    1,
-                    s,
-                )?;
-                (
-                    self.scratch.in_qkv.slice(0, h_bytes),
-                    self.scratch.in_qkv.slice(h_bytes, h_bytes),
-                    self.scratch.in_qkv.slice(2 * h_bytes, h_bytes),
-                )
-            }
+        // inpSA = cur, attention-residual mix -> inputs[0..3] and, without controllers, the input
+        // norms: one fused launch.
+        let nq_mix = if is_local { 1 } else { 3 };
+        let norm_w = if has_msg {
+            [None; 3]
+        } else if is_local {
+            [Some(layer.attn_norm.expect("local layer attn_norm")), None, None]
         } else {
-            (self.scratch.cur, self.scratch.cur, self.scratch.cur)
+            [layer.q_input_norm, layer.k_input_norm, layer.v_input_norm]
+        };
+        self.backend.fused_mix_decode(
+            FusedMixParams {
+                cur: self.scratch.cur,
+                sconv: None,
+                residual: self.scratch.cur,
+                blocks: self.scratch.blocks,
+                nb: *num_blocks,
+                boundary: false,
+                copy_out: Some(self.scratch.inp_sa),
+                queries: layer.attn_res_query,
+                nq: nq_mix,
+                mix_out: if has_msg { Some(self.scratch.in_qkv) } else { None },
+                norm_w,
+                norm_out: self.scratch.norm_qkv,
+                hidden: h,
+                eps,
+            },
+            s,
+        )?;
+        let (in0, in1, in2) = if is_local {
+            let d0 = self.scratch.in_qkv.slice(0, h_bytes);
+            (d0, d0, d0)
+        } else {
+            (
+                self.scratch.in_qkv.slice(0, h_bytes),
+                self.scratch.in_qkv.slice(h_bytes, h_bytes),
+                self.scratch.in_qkv.slice(2 * h_bytes, h_bytes),
+            )
         };
 
         // 2. Cross-Pass Loop Controllers for Q, K, V (pass > 0)
@@ -717,8 +713,15 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             (in0, in1, in2)
         };
 
-        // 3. Attention Input Norms (`inkling2.cpp:313-324`)
-        let (nq, nk, nv) = if is_local {
+        // 3. Attention Input Norms (`inkling2.cpp:313-324`); already fused above without controllers.
+        let (nq, nk, nv) = if !has_msg {
+            let n0 = self.scratch.norm_qkv.slice(0, h_bytes);
+            if is_local {
+                (n0, n0, n0)
+            } else {
+                (n0, self.scratch.norm_qkv.slice(h_bytes, h_bytes), self.scratch.norm_qkv.slice(2 * h_bytes, h_bytes))
+            }
+        } else if is_local {
             let norm_w = layer.attn_norm.expect("local layer attn_norm");
             if has_msg {
                 let n0 = self.scratch.norm_qkv.slice(0, h_bytes);
@@ -872,52 +875,38 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             s,
         )?;
         self.fp8_mm(self.scratch.o_raw, self.scratch.attn_out, &layer.wo, s)?;
-        self.backend.sconv_k4_decode(
-            self.scratch.sconv_tmp,
-            st.sconv_attn,
-            self.scratch.o_raw,
-            layer.attn_sconv,
-            None,
-            h,
-            0,
+        // 8./9. Attention short conv + block residual boundary (`inkling2.cpp:381-388`) + ffn_inp
+        // copy + MLP residual mix (+ MLP norm without a controller): one fused launch.
+        let boundary = ip % self.cfg.n_layers_per_attn_res_block == 0;
+        let has_ctrl = messages.is_some();
+        self.backend.fused_mix_decode(
+            FusedMixParams {
+                cur: self.scratch.cur,
+                sconv: Some((self.scratch.o_raw, st.sconv_attn, layer.attn_sconv)),
+                residual: self.scratch.inp_sa,
+                blocks: self.scratch.blocks,
+                nb: *num_blocks,
+                boundary,
+                copy_out: Some(self.scratch.ffn_inp),
+                queries: Some(layer.mlp_res_query),
+                nq: 1,
+                mix_out: if has_ctrl { Some(self.scratch.moe_in) } else { None },
+                norm_w: if has_ctrl { [None; 3] } else { [Some(layer.mlp_norm), None, None] },
+                norm_out: self.scratch.moe_norm,
+                hidden: h,
+                eps,
+            },
             s,
         )?;
-
-        // 8. Block Residual Boundary (`inkling2.cpp:381-388`)
-        if ip % self.cfg.n_layers_per_attn_res_block == 0 {
-            let dst_blk = self.scratch.blocks.slice((*num_blocks) * h_bytes, h_bytes);
-            self.backend.vec_copy(dst_blk, self.scratch.inp_sa, h, s)?;
+        if boundary {
             *num_blocks += 1;
-            self.backend.vec_copy(self.scratch.cur, self.scratch.sconv_tmp, h, s)?;
-        } else {
-            self.backend
-                .vec_add(self.scratch.cur, self.scratch.inp_sa, self.scratch.sconv_tmp, h, s)?;
         }
-        self.backend.vec_copy(self.scratch.ffn_inp, self.scratch.cur, h, s)?;
-
-        // 9. MoE Block: Mix -> Optional Loop Controller -> RMSNorm -> Router -> Tide -> Indirect MoE -> Short Conv
-        let blocks_view = Some(self.scratch.blocks.slice(0, (*num_blocks) * h_bytes));
-        self.backend.attn_res_mix_rows(
-            self.scratch.moe_in,
-            blocks_view,
-            self.scratch.cur,
-            layer.mlp_res_query,
-            *num_blocks,
-            1,
-            h,
-            eps,
-            1,
-            s,
-        )?;
-        let moe_in_final = if let Some(msgs) = messages {
+        if let Some(msgs) = messages {
             let ctrls = layer.controllers.as_ref().unwrap();
             self.run_controls(&[(self.scratch.moe_ctrl, self.scratch.moe_in, msgs.slice(3 * h_bytes, h_bytes), &ctrls[3])], s)?;
-            self.scratch.moe_ctrl
-        } else {
-            self.scratch.moe_in
-        };
-        self.backend
-            .rms_norm(self.scratch.moe_norm, moe_in_final, layer.mlp_norm, 1, h, eps, s)?;
+            self.backend
+                .rms_norm(self.scratch.moe_norm, self.scratch.moe_ctrl, layer.mlp_norm, 1, h, eps, s)?;
+        }
         let dt_ao = self.prof_end(t_ao, s);
         if self.profile_enabled { self.profile.attn_out_ms += dt_ao; }
 

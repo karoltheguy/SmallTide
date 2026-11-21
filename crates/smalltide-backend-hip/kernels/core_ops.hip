@@ -488,3 +488,177 @@ extern "C" __global__ void smalltide_attn_prep_decode(AttnPrepArgs a) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused single-workgroup decode mix (Block: 1024 threads, hidden <= 3072, <= 15 blocks):
+//   A (o_raw != null): x = sconv(o_raw); boundary ? (blocks[nb] = residual, cur = x)
+//                                                 : cur = residual + x          -> writes cur
+//   B (copy_out != null): copy_out = cur
+//   C: m_q = attn-residual mix of [blocks[0..nb'], cur] with query q (identity if queries null)
+//   D: mix_out[q] = m_q (optional); norm_out[q] = rmsnorm(m_q) * norm_w[q] (if norm_w0 != null)
+// ---------------------------------------------------------------------------
+struct FusedMixArgs {
+    float* cur;
+    const float* o_raw;
+    float* sconv_state;
+    const float* sconv_w;
+    const float* residual;
+    float* blocks;
+    float* copy_out;
+    const float* queries;
+    float* mix_out;
+    const float* norm_w0;
+    const float* norm_w1;
+    const float* norm_w2;
+    float* norm_out;
+    uint32_t nb;
+    uint32_t boundary;
+    uint32_t nq;
+    uint32_t hidden;
+    float eps;
+};
+
+__device__ __forceinline__ void fm_reduce4(float v0, float v1, float v2, float v3, float (*red)[32], float* out) {
+    uint32_t lane = threadIdx.x & 31u, w = threadIdx.x >> 5;
+    v0 = wave32_sum(v0); v1 = wave32_sum(v1); v2 = wave32_sum(v2); v3 = wave32_sum(v3);
+    if (lane == 0u) { red[0][w] = v0; red[1][w] = v1; red[2][w] = v2; red[3][w] = v3; }
+    __syncthreads();
+    if (threadIdx.x < 4u) {
+        float s = 0.0f;
+        for (uint32_t k = 0u; k < (blockDim.x >> 5); ++k) s += red[threadIdx.x][k];
+        out[threadIdx.x] = s;
+    }
+    __syncthreads();
+}
+
+extern "C" __global__ void smalltide_fused_mix_decode(FusedMixArgs a) {
+    __shared__ float red[4][32];
+    __shared__ float tot[4];
+    __shared__ float s_inv[16];
+    __shared__ float s_w[16][3];
+    const uint32_t H = a.hidden, nt = blockDim.x, t = threadIdx.x;
+    float c[3];
+    #pragma unroll
+    for (uint32_t e = 0u; e < 3u; ++e) {
+        uint32_t h = t + e * nt;
+        c[e] = (h < H) ? a.cur[h] : 0.0f;
+    }
+    uint32_t nbm = a.nb;
+    if (a.o_raw != nullptr) {
+        #pragma unroll
+        for (uint32_t e = 0u; e < 3u; ++e) {
+            uint32_t h = t + e * nt;
+            if (h < H) {
+                float s0 = a.sconv_state[h], s1 = a.sconv_state[H + h], s2 = a.sconv_state[2u * H + h];
+                float xin = a.o_raw[h];
+                const float4 w = reinterpret_cast<const float4*>(a.sconv_w)[h];
+                float y = fmaf(s0, w.x, fmaf(s1, w.y, fmaf(s2, w.z, xin * w.w)));
+                y = (xin + y) * 0.4472135954999579f;
+                a.sconv_state[h] = s1; a.sconv_state[H + h] = s2; a.sconv_state[2u * H + h] = xin;
+                float res = a.residual[h];
+                if (a.boundary != 0u) {
+                    a.blocks[static_cast<size_t>(a.nb) * H + h] = res;
+                    c[e] = y;
+                } else {
+                    c[e] = res + y;
+                }
+                a.cur[h] = c[e];
+            }
+        }
+        if (a.boundary != 0u) nbm = a.nb + 1u;
+    }
+    if (a.copy_out != nullptr) {
+        #pragma unroll
+        for (uint32_t e = 0u; e < 3u; ++e) {
+            uint32_t h = t + e * nt;
+            if (h < H) a.copy_out[h] = c[e];
+        }
+    }
+    const uint32_t nq = a.nq;
+    float m[3][3];
+    if (a.queries == nullptr) {
+        #pragma unroll
+        for (uint32_t q = 0u; q < 3u; ++q) {
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) m[q][e] = c[e];
+        }
+    } else {
+        float inv_sqrt_h = rsqrtf(static_cast<float>(H));
+        float qv[3][3];
+        #pragma unroll
+        for (uint32_t q = 0u; q < 3u; ++q) {
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                qv[q][e] = (q < nq && h < H) ? a.queries[static_cast<size_t>(q) * H + h] : 0.0f;
+            }
+        }
+        for (uint32_t s = 0u; s <= nbm; ++s) {
+            float sq = 0.0f, d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                float x = (h < H) ? ((s < nbm) ? a.blocks[static_cast<size_t>(s) * H + h] : c[e]) : 0.0f;
+                sq = fmaf(x, x, sq);
+                d0 = fmaf(x, qv[0][e], d0); d1 = fmaf(x, qv[1][e], d1); d2 = fmaf(x, qv[2][e], d2);
+            }
+            fm_reduce4(sq, d0, d1, d2, red, tot);
+            if (t == 0u) {
+                float ir = rsqrtf(tot[0] / static_cast<float>(H) + a.eps);
+                s_inv[s] = ir;
+                s_w[s][0] = tot[1] * ir * inv_sqrt_h;
+                s_w[s][1] = tot[2] * ir * inv_sqrt_h;
+                s_w[s][2] = tot[3] * ir * inv_sqrt_h;
+            }
+            __syncthreads();
+        }
+        if (t < nq) {
+            float mx = s_w[0][t];
+            for (uint32_t s = 1u; s <= nbm; ++s) mx = fmaxf(mx, s_w[s][t]);
+            float sum = 0.0f;
+            for (uint32_t s = 0u; s <= nbm; ++s) { float e_ = expf(s_w[s][t] - mx); s_w[s][t] = e_; sum += e_; }
+            float inv = 1.0f / fmaxf(sum, 1e-12f);
+            for (uint32_t s = 0u; s <= nbm; ++s) s_w[s][t] *= inv;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (uint32_t q = 0u; q < 3u; ++q) {
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) m[q][e] = 0.0f;
+        }
+        for (uint32_t s = 0u; s <= nbm; ++s) {
+            float ir = s_inv[s];
+            float w0 = s_w[s][0], w1 = s_w[s][1], w2 = s_w[s][2];
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                float x = (h < H) ? ((s < nbm) ? a.blocks[static_cast<size_t>(s) * H + h] : c[e]) * ir : 0.0f;
+                m[0][e] = fmaf(w0, x, m[0][e]); m[1][e] = fmaf(w1, x, m[1][e]); m[2][e] = fmaf(w2, x, m[2][e]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint32_t q = 0u; q < 3u; ++q) {
+        if (q >= nq) break;
+        if (a.mix_out != nullptr) {
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                if (h < H) a.mix_out[static_cast<size_t>(q) * H + h] = m[q][e];
+            }
+        }
+        const float* nw = (q == 0u) ? a.norm_w0 : ((q == 1u) ? a.norm_w1 : a.norm_w2);
+        if (nw != nullptr) {
+            float sq = 0.0f;
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) sq = fmaf(m[q][e], m[q][e], sq);
+            fm_reduce4(sq, 0.0f, 0.0f, 0.0f, red, tot);
+            float ir = rsqrtf(tot[0] / static_cast<float>(H) + a.eps);
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                if (h < H) a.norm_out[static_cast<size_t>(q) * H + h] = m[q][e] * ir * nw[h];
+            }
+        }
+    }
+}

@@ -9,7 +9,7 @@ use crate::ffi::{
     HIP_MEMCPY_DEVICE_TO_DEVICE, HIP_MEMCPY_DEVICE_TO_HOST,
     HIP_MEMCPY_HOST_TO_DEVICE, HIP_STREAM_CAPTURE_MODE_GLOBAL, HIP_STREAM_NON_BLOCKING,
 };
-use smalltide_core::backend::{AttnPrepParams, FlashDecodeParams, GemvSegment, GroupedMoeParams, MoeDispatchParams, PrefillAttnParams};
+use smalltide_core::backend::{AttnPrepParams, FlashDecodeParams, FusedMixParams, GemvSegment, GroupedMoeParams, MoeDispatchParams, PrefillAttnParams};
 use smalltide_core::{
     ComputeBackend, DType, DeviceBuf, DeviceInfo, Event, Graph, PinnedBuf, QueueKind, Result,
     SmallTideError, Stream,
@@ -1794,6 +1794,63 @@ impl ComputeBackend for HipBackend {
         let blocks = (pp.n_kv_heads + 2 * pp.n_q_heads) as u32;
         let mut args = [p(&mut a)];
         self.launch(self.kernels.attn_prep_decode, (blocks, 1, 1), 128, &mut args, stream, "launch(attn_prep_decode)")
+    }
+
+    fn fused_mix_decode(&self, pp: FusedMixParams, stream: Stream) -> Result<()> {
+        #[repr(C)]
+        struct ArgsC {
+            cur: *mut c_void,
+            o_raw: *mut c_void,
+            sconv_state: *mut c_void,
+            sconv_w: *mut c_void,
+            residual: *mut c_void,
+            blocks: *mut c_void,
+            copy_out: *mut c_void,
+            queries: *mut c_void,
+            mix_out: *mut c_void,
+            norm_w0: *mut c_void,
+            norm_w1: *mut c_void,
+            norm_w2: *mut c_void,
+            norm_out: *mut c_void,
+            nb: u32,
+            boundary: u32,
+            nq: u32,
+            hidden: u32,
+            eps: f32,
+        }
+        if pp.hidden > 3 * 1024 || pp.nq == 0 || pp.nq > 3 || pp.nb + 1 >= 16 {
+            return Err(SmallTideError::Backend {
+                backend: "hip",
+                message: format!("fused_mix_decode: unsupported hidden={} nq={} nb={}", pp.hidden, pp.nq, pp.nb),
+            });
+        }
+        let (o_raw, st, w) = match pp.sconv {
+            Some((x, st, w)) => (Some(x), Some(st), Some(w)),
+            None => (None, None, None),
+        };
+        let nw = if pp.norm_w[0].is_some() { pp.norm_w } else { [None; 3] };
+        let mut a = ArgsC {
+            cur: self.dev_ptr(pp.cur)?,
+            o_raw: self.opt_dev_ptr(o_raw)?,
+            sconv_state: self.opt_dev_ptr(st)?,
+            sconv_w: self.opt_dev_ptr(w)?,
+            residual: self.dev_ptr(pp.residual)?,
+            blocks: self.dev_ptr(pp.blocks)?,
+            copy_out: self.opt_dev_ptr(pp.copy_out)?,
+            queries: self.opt_dev_ptr(pp.queries)?,
+            mix_out: self.opt_dev_ptr(pp.mix_out)?,
+            norm_w0: self.opt_dev_ptr(nw[0])?,
+            norm_w1: self.opt_dev_ptr(nw[1])?,
+            norm_w2: self.opt_dev_ptr(nw[2])?,
+            norm_out: self.dev_ptr(pp.norm_out)?,
+            nb: pp.nb as u32,
+            boundary: pp.boundary as u32,
+            nq: pp.nq as u32,
+            hidden: pp.hidden as u32,
+            eps: pp.eps,
+        };
+        let mut args = [p(&mut a)];
+        self.launch(self.kernels.fused_mix_decode, (1, 1, 1), 1024, &mut args, stream, "launch(fused_mix_decode)")
     }
 
     fn gemv_multi(&self, segs: &[GemvSegment], stream: Stream) -> Result<()> {

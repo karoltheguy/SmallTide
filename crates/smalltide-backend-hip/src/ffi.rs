@@ -172,6 +172,7 @@ pub struct CoreKernels {
     pub moe_w2_decode3: HipFunction,
     pub gemv_multi: HipFunction,
     pub attn_prep_decode: HipFunction,
+    pub fused_mix_decode: HipFunction,
 }
 
 pub struct HipRuntime {
@@ -376,6 +377,7 @@ impl HipRuntime {
             moe_w2_decode3: get_fn("smalltide_moe_w2_decode3")?,
             gemv_multi: get_fn("smalltide_gemv_multi")?,
             attn_prep_decode: get_fn("smalltide_attn_prep_decode")?,
+            fused_mix_decode: get_fn("smalltide_fused_mix_decode")?,
         })
     }
 

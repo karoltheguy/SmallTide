@@ -167,6 +167,33 @@ pub struct AttnPrepParams {
     pub eps: f32,
 }
 
+/// Fused decode residual / attention-residual mix / RMSNorm (see `ComputeBackend::fused_mix_decode`).
+#[derive(Debug, Clone, Copy)]
+pub struct FusedMixParams {
+    /// `[H]` current residual stream (read; written when `sconv` is set).
+    pub cur: DeviceBuf,
+    /// `(x, state [3*H], weight [H*4])`: `cur = (boundary ? 0 : residual) + sconv(x)`.
+    pub sconv: Option<(DeviceBuf, DeviceBuf, DeviceBuf)>,
+    pub residual: DeviceBuf,
+    /// `[max_blocks][H]` block states; on a boundary `blocks[nb] = residual`.
+    pub blocks: DeviceBuf,
+    pub nb: usize,
+    pub boundary: bool,
+    /// Optional copy of the (updated) `cur`.
+    pub copy_out: Option<DeviceBuf>,
+    /// `[nq][H]` mix queries (None = identity mix).
+    pub queries: Option<DeviceBuf>,
+    pub nq: usize,
+    /// `[nq][H]` mix outputs.
+    pub mix_out: Option<DeviceBuf>,
+    /// RMSNorm weights per query (norm skipped when `norm_w[0]` is None).
+    pub norm_w: [Option<DeviceBuf>; 3],
+    /// `[nq][H]` normed outputs.
+    pub norm_out: DeviceBuf,
+    pub hidden: usize,
+    pub eps: f32,
+}
+
 /// Minimal backend-agnostic compute & async-transfer abstraction.
 pub trait ComputeBackend: Send + Sync {
     fn device_info(&self) -> Result<DeviceInfo>;
@@ -601,6 +628,10 @@ pub trait ComputeBackend: Send + Sync {
     /// One decode token's attention prep: K/V short convs (+dynamic taps), K L2 clip, V unit
     /// RMS norm, FP8 KV store at `slot`, Q/R scaled L2 clip (+tau) and the relative-bias table.
     fn attn_prep_decode(&self, p: AttnPrepParams, stream: Stream) -> Result<()>;
+
+    /// One-workgroup decode fusion of: attention-output short conv + residual / block boundary,
+    /// copy of the residual, attention-residual mix with up to 3 queries, per-query RMSNorm.
+    fn fused_mix_decode(&self, p: FusedMixParams, stream: Stream) -> Result<()>;
 
     /// Several independent GEMVs in as few launches as possible (8 segments per launch).
     fn gemv_multi(&self, segs: &[GemvSegment], stream: Stream) -> Result<()>;

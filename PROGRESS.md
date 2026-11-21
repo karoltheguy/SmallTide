@@ -81,6 +81,10 @@
     id-based BPE merges, `ignore_merges`, `Utf8Stream` incremental decoding for streaming.
   - `tools/test_tokenizer.py` (HF tokenizers 0.23.3): 20/20 adversarial cases + 59 repo files
     (268K tokens) identical.
+* **Config moved to `.env`** (`crates/smalltide-cli/src/settings.rs`, `.env.example`): model dir,
+  context, pool sizes, MXFP8 host pool, RAM tier, rescue policy, prefill mode, host/port and the
+  diagnostic toggles. Process env overrides `.env`; invalid values exit with a message; old
+  config flags are rejected with the variable to set. `run`/`serve` share one engine builder.
 * **R4c — Host-mapped MXFP8 pool: every expert resident, exact routing, sync-free decode: DONE**
   - `--mxfp8-host auto|on|off` (auto: on when the device pool cannot hold all 512 MXFP8
     experts). The MXFP8 pool is pinned, device-mapped host memory (`alloc_host_mapped`,
@@ -182,7 +186,7 @@
 1. **Swappable Backend Trait:** ZERO ROCm/HIP types, pointers, or DLL calls outside `crates/smalltide-backend-hip`. All engine/tide/server code depends solely on `smalltide_core::ComputeBackend`.
 2. **Precision Policy:** Native experts (`NVFP4` layers `0..19`, `MXFP8` layers `20..23`) + **FP8 E4M3FN** dense layers & `lm_head` (`--fp8-dense` default ON) + **FP8 KV Cache** (default up to 256K).
 3. **API Contract:** OpenAI Completion & Chat Completion API on **port `8000`**, served model name **`inkling-2-mini`**.
-4. **Rescue Tuning Policy:** Start with minimal Stage 1 RAM→VRAM sync rescue (`Threshold(0.25)`), tunable via CLI (`--rescue-mode`, `--rescue-threshold`) or live HTTP (`POST /v1/tide/config`).
+4. **Rescue Tuning Policy:** Start with minimal Stage 1 RAM→VRAM sync rescue (`Threshold(0.25)`), tunable via `.env` (`SMALLTIDE_RESCUE_MODE`, `SMALLTIDE_RESCUE_THRESHOLD`) or live HTTP (`POST /v1/tide/config`).
 
 ---
 
@@ -197,11 +201,12 @@
   C:\Users\raspb\.cargo\bin\cargo.exe test --offline --release --workspace
   C:\Users\raspb\.cargo\bin\cargo.exe build --offline --release -p smalltide-cli
 
-  # Run live CLI generation (tunable rescue knob)
-  .\target\release\smalltide-cli.exe run --rescue-mode threshold --rescue-threshold 0.25 --prompt "Your prompt"
+  # Configuration lives in .env (copy .env.example); only per-request inputs are flags
+  .\target\release\smalltide-cli.exe run -p "Your prompt" -n 128 --temp 0
 
-  # Start OpenAI API server on port 8000 (model: inkling-2-mini)
-  .\target\release\smalltide-cli.exe serve --port 8000 --rescue-mode threshold --rescue-threshold 0.25
+  # OpenAI API server (host/port/rescue/pools from .env; model: inkling-2-mini)
+  .\target\release\smalltide-cli.exe serve
+  .\target\release\smalltide-cli.exe vram-probe   # resident vs system-memory-backed VRAM
 
   # Benchmarks & diagnostics
   .\target\release\smalltide-cli.exe probe

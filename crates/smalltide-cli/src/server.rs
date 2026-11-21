@@ -12,19 +12,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use smalltide_backend_hip::HipBackend;
-use smalltide_core::{ComputeBackend, DType, Inkling2Config, RescuePolicy, TideConfig};
-use smalltide_io::dense_loader::Inkling2DenseHost;
-use smalltide_io::stide_pack::{ExpertSlabLayout, StidePackReader};
+use smalltide_core::{ComputeBackend, RescuePolicy};
 use smalltide_io::tokenizer::BpeTokenizer;
 use crate::chat_format::{self, AnswerEvent, AnswerParser, OJson, StopMatcher};
 use crate::prefix_cache::{PrefixCache, PrefixPlan};
 use smalltide_io::tokenizer::Utf8Stream;
 use smalltide_model_inkling2::engine::{Inkling2Engine, SamplingParams, SeqSnapshot};
-use smalltide_model_inkling2::weights::Inkling2DenseGpu;
-use smalltide_tide::TideExecutor;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -215,152 +210,15 @@ fn render_chat_request(body: &OJson) -> Result<(String, Option<String>, bool), S
 }
 
 pub fn run_serve(args: &[String]) {
-    let mut model_dir = r"models\Inkling-2-Mini".to_string();
-    let mut host = "0.0.0.0".to_string();
-    let mut port: u16 = 8000;
-    let mut max_ctx: usize = 32_768;
-    let mut rescue_mode = "threshold".to_string();
-    let mut rescue_threshold: f32 = 0.25;
-    let mut nvfp4_slots_override: Option<usize> = None;
-    let mut mxfp8_slots_override: Option<usize> = None;
-    let mut ram_gb: f64 = 10.0;
-    let mut mxfp8_host = "auto".to_string();
-
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--model" if i + 1 < args.len() => { model_dir = args[i + 1].clone(); i += 2; }
-            "--host" if i + 1 < args.len() => { host = args[i + 1].clone(); i += 2; }
-            "--port" if i + 1 < args.len() => { port = args[i + 1].parse().unwrap_or(8000); i += 2; }
-            "--max-ctx" if i + 1 < args.len() => { max_ctx = args[i + 1].parse().unwrap_or(32_768); i += 2; }
-            "--rescue-mode" if i + 1 < args.len() => { rescue_mode = args[i + 1].clone(); i += 2; }
-            "--rescue-threshold" if i + 1 < args.len() => { rescue_threshold = args[i + 1].parse().unwrap_or(0.25); i += 2; }
-            "--nvfp4-slots" if i + 1 < args.len() => { nvfp4_slots_override = args[i + 1].parse().ok(); i += 2; }
-            "--mxfp8-slots" if i + 1 < args.len() => { mxfp8_slots_override = args[i + 1].parse().ok(); i += 2; }
-            "--ram-gb" if i + 1 < args.len() => { ram_gb = args[i + 1].parse().unwrap_or(10.0); i += 2; }
-            "--mxfp8-host" if i + 1 < args.len() => { mxfp8_host = args[i + 1].clone(); i += 2; }
-            other => { eprintln!("Unknown serve flag: {other}"); i += 1; }
-        }
+    if let Some(flag) = args.first() {
+        crate::reject_config_flag(flag);
     }
-
-    let cfg = Inkling2Config::default();
-    let dir = Path::new(&model_dir);
-    let t_start = Instant::now();
+    let s = crate::settings::Settings::from_env();
+    let (host, port) = (s.host.clone(), s.port);
     println!("=== SmallTide OpenAI API Server (model: {SERVED_MODEL_NAME}) ===");
-    println!("Loading tokenizer, FP8 dense weights, and TideLM 2-stage expert pools from {} ...", dir.display());
-
-    let tok = Arc::new(BpeTokenizer::from_file(&dir.join("tokenizer.json")).expect("load tokenizer.json"));
-    let dense_host = Inkling2DenseHost::load_from_safetensors(
-        &cfg,
-        &dir.join("model-00001-of-00001.safetensors"),
-    )
-    .expect("load dense weights");
-    let pack = StidePackReader::open(&dir.join("experts.stide")).expect("open experts.stide");
-    let backend = Arc::new(HipBackend::new(0).expect("init HipBackend"));
-
-    let dense_gpu = Inkling2DenseGpu::upload(backend.clone(), dense_host).expect("upload dense GPU");
-    let info_after_dense = backend.device_info().expect("device_info");
-
-    let nvfp4_slab = ExpertSlabLayout::for_inkling2(&cfg, DType::NVFP4).aligned_slab_bytes;
-    let mxfp8_slab = ExpertSlabLayout::for_inkling2(&cfg, DType::MXFP8).aligned_slab_bytes;
-    let est_kv_bytes = 40 * (2 * 8 * cfg.local_window_size * 128 + 2 * 8 * cfg.local_window_size * 4)
-        + 8 * (2 * 8 * max_ctx * 128 + 2 * 8 * max_ctx * 4)
-        + 64 * 1024 * 1024;
-    let headroom_bytes = 900 * 1024 * 1024usize;
-    let scratch_ring_bytes = 8 * (nvfp4_slab + mxfp8_slab);
-    let avail_expert_vram = info_after_dense
-        .free_vram_bytes
-        .saturating_sub(est_kv_bytes + headroom_bytes + scratch_ring_bytes);
-
-    let total_nvfp4 = cfg.mxfp8_start_layer * cfg.n_routed_experts;
-    let total_mxfp8 = (cfg.num_physical_layers - cfg.mxfp8_start_layer) * cfg.n_routed_experts;
-    let (nvfp4_slots, mxfp8_slots) = match (nvfp4_slots_override, mxfp8_slots_override) {
-        (Some(n4), Some(m8)) => (n4.min(total_nvfp4), m8.min(total_mxfp8)),
-        (Some(n4), None) => {
-            let n4 = n4.min(total_nvfp4);
-            let rem = avail_expert_vram.saturating_sub(n4 * nvfp4_slab);
-            (n4, (rem / mxfp8_slab).min(total_mxfp8).max(16))
-        }
-        (None, Some(m8)) => {
-            let m8 = m8.min(total_mxfp8);
-            let rem = avail_expert_vram.saturating_sub(m8 * mxfp8_slab);
-            ((rem / nvfp4_slab).min(total_nvfp4).max(1536), m8)
-        }
-        (None, None) => {
-            let min_mxfp8 = 128usize;
-            let max_n4_budget = avail_expert_vram.saturating_sub(min_mxfp8 * mxfp8_slab);
-            let n4 = (max_n4_budget / nvfp4_slab).min(total_nvfp4).max(1536);
-            let rem = avail_expert_vram.saturating_sub(n4 * nvfp4_slab);
-            let m8 = (rem / mxfp8_slab).min(total_mxfp8).max(16);
-            (n4, m8)
-        }
-    };
-
-    // MXFP8 pool in pinned host memory holding every MXFP8 expert ("auto": when the device pool
-    // could not hold them all). Device memory past the resident budget is system memory anyway.
-    let mxfp8_host_mapped = match mxfp8_host.as_str() {
-        "on" => true,
-        "off" => false,
-        _ => mxfp8_slots < total_mxfp8,
-    };
-    let mxfp8_slots = if mxfp8_host_mapped { total_mxfp8 } else { mxfp8_slots };
-    let rescue_policy = match rescue_mode.as_str() {
-        "exact" => RescuePolicy::Exact,
-        "disabled" | "none" => RescuePolicy::Disabled,
-        _ => RescuePolicy::Threshold(rescue_threshold),
-    };
-    let mut tide_cfg = TideConfig::default();
-    tide_cfg.pinned_staging_mib = 256;
-    tide_cfg.rescue_policy = rescue_policy;
-
-    let ram_budget_bytes = (ram_gb * 1024.0 * 1024.0 * 1024.0) as usize;
-    let tide = TideExecutor::new(
-        backend.clone(),
-        cfg.clone(),
-        tide_cfg,
-        nvfp4_slots,
-        mxfp8_slots,
-        ram_budget_bytes,
-        Some(pack),
-    )
-    .expect("create TideExecutor");
-    let mut tide = tide;
-    tide.set_mxfp8_host_mapped(mxfp8_host_mapped);
-
-    // Engine buffers before the expert pools (see TideExecutor::allocate_pools).
-    let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, max_ctx).expect("create Inkling2Engine");
-    engine.tide.allocate_pools().expect("allocate expert pools");
-    let preload_ops = engine.tide.scheduler.plan_pre_prefill(None);
-    engine.tide.execute_transfers(&preload_ops, true, false)
-        .expect("Mode 1 pre-prefill");
-    backend.sync_stream(engine.tide.copy_stream).expect("sync prefill DMA");
-    if let Some((usage, resident)) = backend.resident_vram_info() {
-        let gib = (1u64 << 30) as f64;
-        println!(
-            "[VRAM residency] process usage {:.2} GiB vs resident budget {:.2} GiB (DXGI){}",
-            usage as f64 / gib,
-            resident as f64 / gib,
-            if usage > resident {
-                format!(" -> ~{:.2} GiB of 'VRAM' is backed by system memory (read over PCIe); close other GPU apps or lower --nvfp4-slots/--mxfp8-slots", (usage - resident) as f64 / gib)
-            } else {
-                String::new()
-            }
-        );
-    }
-    let info_ready = backend.device_info().expect("device_info ready");
-    let (pre_r, core_r, coda_r) = engine.tide.scheduler.cache.count_vram_resident();
-    println!(
-        "[Ready in {:.2}s] VRAM free: {:.2}/{:.2} GiB | KV({} ctx): {:.2} GiB | Experts VRAM: pre={}, core={}/1536, coda={} | Rescue: {:?}",
-        t_start.elapsed().as_secs_f64(),
-        info_ready.free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        info_ready.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        max_ctx,
-        engine.kv_vram_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-        pre_r,
-        core_r,
-        coda_r,
-        rescue_policy,
-    );
+    println!("Loading tokenizer, FP8 dense weights, and expert pools from {} ...", s.model_dir.display());
+    let crate::settings::Loaded { engine, tok, .. } = crate::settings::build_engine(&s);
+    let tok = Arc::new(tok);
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>();
     let tok_worker = tok.clone();

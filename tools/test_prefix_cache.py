@@ -1,4 +1,4 @@
-"""End-to-end prefix-cache check against a running `smalltide-cli serve --rescue-mode exact`.
+"""End-to-end prefix-cache check against a running `smalltide-cli serve` with SMALLTIDE_RESCUE_MODE=exact.
 
 Sends a sequence of greedy chat requests that exercise every prefix-cache path (pure extension,
 restore at the shared system-prompt boundary, restore at the previous prompt end) and verifies

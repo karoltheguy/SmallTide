@@ -60,7 +60,18 @@ pub struct HipBackend {
     stat_sync_ns: AtomicU64,
     stat_syncs: AtomicU64,
     kernel_timer: Mutex<Option<KernelTimer>>,
+    seg_timer: Mutex<Option<SegTimer>>,
+    #[cfg(windows)]
+    wddm: Option<crate::wddm::Adapter>,
 }
+
+/// Coarse GPU timeline segments (timing events at `seg_mark` points); dev profiling only.
+struct SegTimer {
+    events: Vec<HipEvent>,
+    marks: Vec<&'static str>,
+    totals: HashMap<&'static str, (u64, f64)>,
+}
+unsafe impl Send for SegTimer {}
 
 /// Per-kernel GPU timing (timing events around every launch); dev/profiling only.
 struct KernelTimer {
@@ -103,7 +114,81 @@ impl HipBackend {
             stat_sync_ns: AtomicU64::new(0),
             stat_syncs: AtomicU64::new(0),
             kernel_timer: Mutex::new(None),
+            seg_timer: Mutex::new(None),
+            #[cfg(windows)]
+            wddm: {
+                let a = crate::wddm::Adapter::open_amd();
+                // Ask the OS to keep what it can of our working set resident (best effort).
+                if let Some(a) = &a {
+                    if let Some(i) = a.local_info() {
+                        let _ = a.reserve_local(i.available_for_reservation);
+                    }
+                }
+                a
+            },
         })
+    }
+
+    /// Windows: `(process local usage, reservable/resident budget)` in bytes from DXGI. On this
+    /// driver, device allocations beyond roughly the reservable amount are silently backed by
+    /// system memory (GPU reads over PCIe, ~28 GB/s) although `hipMemGetInfo` counts them as VRAM.
+    pub fn resident_vram_info(&self) -> Option<(u64, u64)> {
+        #[cfg(windows)]
+        {
+            let i = self.wddm.as_ref()?.local_info()?;
+            Some((i.current_usage, i.current_reservation.max(i.available_for_reservation)))
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// Enables coarse segment timing (see `ComputeBackend::seg_mark`).
+    pub fn set_segment_timing(&self, on: bool) -> Result<()> {
+        let mut g = self.seg_timer.lock().unwrap();
+        if on && g.is_none() {
+            let mut events = Vec::with_capacity(4096);
+            for _ in 0..4096 {
+                let mut e: HipEvent = ptr::null_mut();
+                unsafe { check_hip((self.rt.hip_event_create_with_flags)(&mut e, 0), "hipEventCreateWithFlags")? };
+                events.push(e);
+            }
+            *g = Some(SegTimer { events, marks: Vec::new(), totals: HashMap::new() });
+        }
+        Ok(())
+    }
+
+    fn flush_segments(&self, t: &mut SegTimer) {
+        let n = t.marks.len();
+        if n >= 2 {
+            unsafe { let _ = (self.rt.hip_event_synchronize)(t.events[n - 1]); }
+            for i in 0..n - 1 {
+                let mut ms = 0.0f32;
+                unsafe { let _ = (self.rt.hip_event_elapsed_time)(&mut ms, t.events[i], t.events[i + 1]); }
+                let e = t.totals.entry(t.marks[i]).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += ms as f64;
+            }
+        }
+        // keep the last mark as the start of the next batch
+        if n > 0 {
+            let last = t.marks[n - 1];
+            t.events.swap(0, n - 1);
+            t.marks.clear();
+            t.marks.push(last);
+        }
+    }
+
+    /// Returns and resets `(segment, count, total GPU ms)` sorted by time (drops the open segment).
+    pub fn take_segment_times(&self) -> Vec<(&'static str, u64, f64)> {
+        let mut g = self.seg_timer.lock().unwrap();
+        let Some(t) = g.as_mut() else { return Vec::new() };
+        self.flush_segments(t);
+        t.marks.clear();
+        let mut v: Vec<_> = t.totals.drain().map(|(k, (n, ms))| (k, n, ms)).collect();
+        v.sort_by(|a, b| b.2.total_cmp(&a.2));
+        v
     }
 
     fn kernel_name(&self, f: crate::ffi::HipFunction) -> &'static str {
@@ -453,6 +538,19 @@ impl ComputeBackend for HipBackend {
             0 => Ok(true),
             HIP_ERROR_NOT_READY => Ok(false),
             other => check_hip(other, "hipEventQuery").map(|_| false),
+        }
+    }
+
+    fn seg_mark(&self, label: &'static str, stream: Stream) {
+        let mut g = self.seg_timer.lock().unwrap();
+        let Some(t) = g.as_mut() else { return };
+        if t.marks.len() + 1 >= t.events.len() {
+            self.flush_segments(t);
+        }
+        if let Ok(s) = self.raw_stream(stream) {
+            let i = t.marks.len();
+            unsafe { let _ = (self.rt.hip_event_record)(t.events[i], s); }
+            t.marks.push(label);
         }
     }
 
@@ -1556,6 +1654,34 @@ impl ComputeBackend for HipBackend {
             self.moe_reduce_rows(out, tmp, gp.hidden_size, gp.rows, stream)?;
         }
         Ok(())
+    }
+
+    fn moe_decode_experts(&self, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, pool: DeviceBuf,
+        slot_table: DeviceBuf, topk_ids: DeviceBuf, mp: MoeDispatchParams, stream: Stream) -> Result<()> {
+        let (mut a, mut bx, mut c, mut d, mut e) =
+            (self.dev_ptr(mid)?, self.dev_ptr(x)?, self.dev_ptr(pool)?, self.dev_ptr(slot_table)?, self.dev_ptr(topk_ids)?);
+        let (mut st, mut h, mut i, mut gc, mut uc) =
+            (mp.expert_stride_bytes as u64, mp.hidden_size as u32, mp.intermediate_size as u32, 4.0f32, 25.0f32);
+        let k = mp.top_k as u32;
+        let mut args = [p(&mut a), p(&mut bx), p(&mut c), p(&mut d), p(&mut e), p(&mut st), p(&mut h), p(&mut i), p(&mut gc), p(&mut uc)];
+        self.launch(self.kernels.moe_w13_decode, (i.div_ceil(8), k, 1), 256, &mut args, stream, "launch(moe_w13_decode)")?;
+        let (mut a, mut bm) = (self.dev_ptr(tmp)?, self.dev_ptr(mid)?);
+        let mut args = [p(&mut a), p(&mut bm), p(&mut c), p(&mut d), p(&mut e), p(&mut st), p(&mut h), p(&mut i)];
+        self.launch(self.kernels.moe_w2_decode, (h.div_ceil(8), k, 1), 256, &mut args, stream, "launch(moe_w2_decode)")
+    }
+
+    fn moe_decode_post(&self, out: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, topk_ids: DeviceBuf,
+        topk_weights: DeviceBuf, top_k: usize, sconv: Option<(DeviceBuf, DeviceBuf, DeviceBuf)>,
+        hidden: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut bt, mut c, mut d, mut e) = (self.dev_ptr(out)?, self.dev_ptr(tmp)?, self.dev_ptr(slot_table)?,
+            self.dev_ptr(topk_ids)?, self.dev_ptr(topk_weights)?);
+        let (mut f, mut g, mut r) = match sconv {
+            Some((state, w, residual)) => (self.dev_ptr(state)?, self.dev_ptr(w)?, self.dev_ptr(residual)?),
+            None => (ptr::null_mut(), ptr::null_mut(), ptr::null_mut()),
+        };
+        let (mut k, mut h) = (top_k as u32, hidden as u32);
+        let mut args = [p(&mut a), p(&mut bt), p(&mut c), p(&mut d), p(&mut e), p(&mut k), p(&mut f), p(&mut g), p(&mut r), p(&mut h)];
+        self.launch(self.kernels.moe_post_decode, (h.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(moe_post_decode)")
     }
 
     fn moe_reduce_rows(&self, out: DeviceBuf, tmp: DeviceBuf, hidden: usize, rows: usize, stream: Stream) -> Result<()> {

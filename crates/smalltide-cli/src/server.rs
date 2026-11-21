@@ -304,7 +304,7 @@ pub fn run_serve(args: &[String]) {
     tide_cfg.rescue_policy = rescue_policy;
 
     let ram_budget_bytes = (ram_gb * 1024.0 * 1024.0 * 1024.0) as usize;
-    let mut tide = TideExecutor::new(
+    let tide = TideExecutor::new(
         backend.clone(),
         cfg.clone(),
         tide_cfg,
@@ -315,12 +315,26 @@ pub fn run_serve(args: &[String]) {
     )
     .expect("create TideExecutor");
 
-    let preload_ops = tide.scheduler.plan_pre_prefill(None);
-    tide.execute_transfers(&preload_ops, true, false)
+    // Engine buffers before the expert pools (see TideExecutor::allocate_pools).
+    let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, max_ctx).expect("create Inkling2Engine");
+    engine.tide.allocate_pools().expect("allocate expert pools");
+    let preload_ops = engine.tide.scheduler.plan_pre_prefill(None);
+    engine.tide.execute_transfers(&preload_ops, true, false)
         .expect("Mode 1 pre-prefill");
-    backend.sync_stream(tide.copy_stream).expect("sync prefill DMA");
-
-    let engine = Inkling2Engine::new(cfg, dense_gpu, tide, max_ctx).expect("create Inkling2Engine");
+    backend.sync_stream(engine.tide.copy_stream).expect("sync prefill DMA");
+    if let Some((usage, resident)) = backend.resident_vram_info() {
+        let gib = (1u64 << 30) as f64;
+        println!(
+            "[VRAM residency] process usage {:.2} GiB vs resident budget {:.2} GiB (DXGI){}",
+            usage as f64 / gib,
+            resident as f64 / gib,
+            if usage > resident {
+                format!(" -> ~{:.2} GiB of 'VRAM' is backed by system memory (read over PCIe); close other GPU apps or lower --nvfp4-slots/--mxfp8-slots", (usage - resident) as f64 / gib)
+            } else {
+                String::new()
+            }
+        );
+    }
     let info_ready = backend.device_info().expect("device_info ready");
     let (pre_r, core_r, coda_r) = engine.tide.scheduler.cache.count_vram_resident();
     println!(

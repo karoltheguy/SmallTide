@@ -164,6 +164,9 @@ pub struct CoreKernels {
     pub moe_w13_grouped: HipFunction,
     pub moe_w2_grouped: HipFunction,
     pub moe_reduce_rows: HipFunction,
+    pub moe_w13_decode: HipFunction,
+    pub moe_w2_decode: HipFunction,
+    pub moe_post_decode: HipFunction,
 }
 
 pub struct HipRuntime {
@@ -359,6 +362,9 @@ impl HipRuntime {
             moe_w13_grouped: get_fn("smalltide_moe_w13_grouped")?,
             moe_w2_grouped: get_fn("smalltide_moe_w2_grouped")?,
             moe_reduce_rows: get_fn("smalltide_moe_reduce_rows")?,
+            moe_w13_decode: get_fn("smalltide_moe_w13_decode")?,
+            moe_w2_decode: get_fn("smalltide_moe_w2_decode")?,
+            moe_post_decode: get_fn("smalltide_moe_post_decode")?,
         })
     }
 

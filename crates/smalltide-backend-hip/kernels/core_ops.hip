@@ -10,28 +10,45 @@
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ float decode_fp4_e2m1(uint32_t nibble) {
-    // 1 sign bit, 2 exp bits (bias 1), 1 mantissa bit
-    // Magnitudes: 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
-    static constexpr float kMag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    float v = kMag[nibble & 7u];
+    // 1 sign bit, 2 exp bits (bias 1), 1 mantissa bit: {0, .5, 1, 1.5, 2, 3, 4, 6}, from a
+    // packed-register LUT (an indexed local array compiles to a per-lane memory lookup).
+    float v = static_cast<float>((0xC8643210u >> ((nibble & 7u) << 2)) & 0xFu) * 0.5f;
     return (nibble & 8u) ? -v : v;
 }
 
 __device__ __forceinline__ float decode_fp8_e4m3fn(uint32_t b) {
+    // gfx12 converts OCP FP8 E4M3FN in hardware (v_cvt_f32_fp8). Producers never emit the NaN
+    // codes 0x7F/0xFF (the encoders saturate at 0x7E), so no NaN guard is needed.
+    return __builtin_amdgcn_cvt_f32_fp8(static_cast<int>(b & 0xFFu), 0);
+}
+
+/// Software reference decoder (kept for parity tests).
+__device__ __forceinline__ float decode_fp8_e4m3fn_sw(uint32_t b) {
     uint32_t sign = (b & 0x80u) << 24;
     uint32_t exp  = (b >> 3) & 0x0Fu;
     uint32_t mant = b & 0x07u;
     if (exp == 0u) {
-        // Subnormal: (-1)^s * mant * 2^-9
         float val = static_cast<float>(mant) * (1.0f / 512.0f);
         return sign ? -val : val;
     }
     if (exp == 15u && mant == 7u) {
-        return 0.0f; // NaN guard
+        return 0.0f;
     }
-    // Normal: bias 7 -> IEEE f32 bias 127 => +120
     uint32_t f32_bits = sign | ((exp + 120u) << 23) | (mant << 20);
     return __uint_as_float(f32_bits);
+}
+
+/// 4 FP8 E4M3FN bytes of a word -> 4 floats (2x v_cvt_pk_f32_fp8).
+__device__ __forceinline__ float4 decode_fp8x4(uint32_t w) {
+    auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(static_cast<int>(w), false);
+    auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(static_cast<int>(w), true);
+    return make_float4(lo[0], lo[1], hi[0], hi[1]);
+}
+
+/// FP4 E2M1 magnitude x2 from a packed register LUT (no memory lookup): {0,1,2,3,4,6,8,12}.
+__device__ __forceinline__ float fp4x2(uint32_t n) {
+    float v = static_cast<float>((0xC8643210u >> ((n & 7u) << 2)) & 0xFu);
+    return (n & 8u) ? -v : v;
 }
 
 __device__ __forceinline__ float decode_ue8m0(uint32_t e) {

@@ -71,6 +71,9 @@ pub struct TideExecutor<B: ComputeBackend> {
     pub compute_stream: Stream,
     pub copy_stream: Stream,
     pub dma_event: Event,
+    /// Resident slots (excluding the scratch ring) the full pools are allocated with.
+    pool_slots: (usize, usize),
+    pools_allocated: bool,
     /// Recorded on the compute stream after a table upload that unmaps slots about to be reused.
     compute_fence: Event,
 }
@@ -96,10 +99,12 @@ impl<B: ComputeBackend> TideExecutor<B> {
         let unified_resident_vram_bytes = resident_nvfp4 * nvfp4_layout.aligned_slab_bytes
             + resident_mxfp8 * mxfp8_layout.aligned_slab_bytes;
 
-        let vram_pool_nvfp4 =
-            backend.alloc_device((resident_nvfp4 + scratch) * nvfp4_layout.aligned_slab_bytes)?;
-        let vram_pool_mxfp8 =
-            backend.alloc_device((resident_mxfp8 + scratch) * mxfp8_layout.aligned_slab_bytes)?;
+        // Placeholder pools: the real ones are allocated by `allocate_pools` once the engine's
+        // hot buffers (activations, KV, scratch) exist. On Windows the driver backs whatever does
+        // not fit the resident local budget with system memory, in allocation order, so the
+        // large expert pools must come last (and fill hottest experts first).
+        let vram_pool_nvfp4 = backend.alloc_device((1 + scratch) * nvfp4_layout.aligned_slab_bytes)?;
+        let vram_pool_mxfp8 = backend.alloc_device((1 + scratch) * mxfp8_layout.aligned_slab_bytes)?;
 
         let total_experts = model_cfg.num_physical_layers * model_cfg.n_routed_experts;
         let gpu_slot_table = backend.alloc_device(total_experts * 4)?;
@@ -157,9 +162,31 @@ impl<B: ComputeBackend> TideExecutor<B> {
             copy_stream,
             dma_event,
             compute_fence,
+            pool_slots: (resident_nvfp4, resident_mxfp8),
+            pools_allocated: false,
         };
         exec.upload_table_on_compute()?;
         Ok(exec)
+    }
+
+    /// Allocates the full NVFP4 / MXFP8 expert pools (idempotent). Call after every other
+    /// long-lived device buffer exists and before the first transfer.
+    pub fn allocate_pools(&mut self) -> Result<()> {
+        if self.pools_allocated {
+            return Ok(());
+        }
+        let scratch = DEFAULT_SCRATCH_RING_SLOTS;
+        self.backend.sync_stream(self.compute_stream)?;
+        self.backend.free_device(self.vram_pool_nvfp4)?;
+        self.backend.free_device(self.vram_pool_mxfp8)?;
+        self.vram_pool_nvfp4 = self
+            .backend
+            .alloc_device((self.pool_slots.0 + scratch) * self.nvfp4_layout.aligned_slab_bytes)?;
+        self.vram_pool_mxfp8 = self
+            .backend
+            .alloc_device((self.pool_slots.1 + scratch) * self.mxfp8_layout.aligned_slab_bytes)?;
+        self.pools_allocated = true;
+        Ok(())
     }
 
     /// Non-blocking drain of completed background Stage 2 NVMe -> RAM reads.
@@ -242,6 +269,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
         if ops.is_empty() {
             return Ok(());
         }
+        self.allocate_pools()?;
 
         let writes_vram = ops
             .iter()

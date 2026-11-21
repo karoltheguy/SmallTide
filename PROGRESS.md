@@ -69,6 +69,31 @@
     id-based BPE merges, `ignore_merges`, `Utf8Stream` incremental decoding for streaming.
   - `tools/test_tokenizer.py` (HF tokenizers 0.23.3): 20/20 adversarial cases + 59 repo files
     (268K tokens) identical.
+* **R4b — Decode profiling + fixes; VRAM residency finding** (decode 41.3 -> ~37 ms/tok default config)
+  - **Finding (dominant):** on this desktop the process gets only ~7.6 GiB of *resident* VRAM
+    (DXGI `AvailableForReservation`; other apps hold ~5 GiB). The driver silently backs every
+    device allocation beyond that with system memory, which the GPU then reads over PCIe at
+    ~28.6 GB/s, while `hipMemGetInfo` still reports it as VRAM. `smalltide-cli vram-probe`
+    (512 MiB chunks: 290 GB/s for the first ~4-7 GiB, then 28.6 GB/s) and
+    `tools/dxgi_budget.py` show it; `run`/`serve` now print a `[VRAM residency]` warning.
+    With the default auto-sized pools, loop-core experts (slots 0..1535) are resident and
+    prelude/coda/MXFP8 experts are effectively a zero-copy host tier: per-layer MoE 0.18 ms
+    (loop core) vs 1.3 ms (NVFP4 outer) / 2.2 ms (MXFP8) -> ~16 ms/token of PCIe reads.
+    That layout is still the best exact-quality one here (fast-only pools: exact 9.3 tok/s,
+    threshold 32 tok/s at 59.6% hit rate vs over-committed exact 23.8 tok/s).
+  - Router: single-workgroup kernel (one thread per expert, serial top-8; ~430 us) replaced by
+    multi-workgroup f32 logits GEMV + block-parallel top-8 (shared with prefill): -8 ms/tok.
+  - FP8 decode via gfx12 `v_cvt_f32_fp8` / `v_cvt_pk_f32_fp8`; FP4 E2M1 via a packed-register
+    LUT (an indexed local array compiled to per-lane memory loads): -2.3 ms/tok.
+  - Decode MoE v2 (`moe_w13_decode` / `moe_w2_decode` / `moe_post_decode`): 16 B loads, 8
+    experts in parallel, renorm + post-MLP sconv + residual fused (-48 launches/token).
+  - Engine buffers (activations, KV, prefill scratch) allocated before the expert pools;
+    post-decode Tide CPU work deferred to overlap the next token's prelude; routing log read
+    back synchronously when the stream is idle (an async D2H + event completed ~30 ms late).
+  - Profiling: `SMALLTIDE_SEGTIME=1` coarse GPU timeline segments (reliable),
+    `SMALLTIDE_KTIMING=1` per-kernel events (WDDM inflates each by ~40 us), `[Host/tok]` line,
+    `SMALLTIDE_BENCH_MOE=1` per-pool-region MoE timing. Kernel *ablation* was misleading
+    (skipping kernels changes routing/data and hides latency); use segment timing.
 * **R4a — Rows-batched chunked prefill: DONE** (`crates/smalltide-model-inkling2/src/prefill.rs`,
   `kernels/prefill_ops.hip`)
   - Chunks of <= 128 tokens: FP8 rows GEMMs (BM=8), rows attn-res mix / clips (+tau) / sconv scan /
@@ -170,6 +195,9 @@
 | **R2 prefix cache E2E** (5 chat turns, 60-98 tok prompts, greedy, exact) | cached 50/60, 60/79, 79/98 tok; warm 3.0-4.8 s vs cold 5.1-7.4 s | 5/5 byte-identical to cold; snapshot 86 MiB pinned |
 | **R4a prefill 1668 tok** (exact) | batched **120.9 tok/s** (13.8 s) vs token **12.2 tok/s** (137.3 s) | 9.9x; 20-tok prompt 52.6 vs 22.4 tok/s |
 | Decode host profile (64 tok) | 41.3 ms/tok: 2051 launches (1.36 ms CPU), 5 syncs **35.9 ms blocked** | GPU-bound: kernel count/shape, not CPU launch cost |
+| **R4b decode** (default auto pools, threshold 0.25, 56-64 tok) | **26.5-27.1 tok/s** (~37 ms/tok, was 41.3) | GPU segments: MoE outer 16.0 ms (PCIe-backed experts), loop MoE 6.4, router 3.6, out/mix 3.4, pre-attn 2.0, proj 1.6, lm_head 1.5, attn 1.2 |
+| VRAM residency probe (`vram-probe`) | first ~4 GiB (512 MiB chunks) / ~6.5 GiB (one 12 GiB alloc) at ~290 GB/s copy, rest **28.6 GB/s** | DXGI: budget 15.06 GiB, AvailableForReservation 7.65 GiB; other apps ~5 GiB |
+| R4b verification | reference (forced routes) identical: layer err 1.7e-3 -> 1.2e-2, argmax 6/6; stress (8.7% skipped) argmax 40/40; bench-gpu parity unchanged | |
 | **Tide stress** (`--nvfp4-slots 1600 --mxfp8-slots 96`, threshold 0.25, 68 pos) | 15.3% experts skipped, 267 sync rescues, async churn every token; layer rel-err <= 4.0e-2, cos >= 0.9995, argmax 46/48 (2 near-ties) | GPU computed exactly the CPU-published expert set (no stale-slot reads) |
 | **Live 48-Layer Decode (`exact`, RX 9070 XT)** | **18.74 tok/s** (`99.5%` VRAM hit: Pre 100%, Core 100%, Coda 95.8%) | Coherent English + thinking format, `253` Stage 1 sync rescues |
 | **Live 48-Layer Decode (`threshold=0.25`, RX 9070 XT)** | **19.80 tok/s** (`99.4%` VRAM hit: Pre 100%, Core 100%, Coda 95.1%) | Coherent 2-sentence answer, clean EOS, only `26` Stage 1 sync rescues (10× fewer!) |

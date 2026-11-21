@@ -135,7 +135,9 @@ pub(crate) struct ActivationScratch {
     /// Per-logical-layer router output log: `[48][16]` u32 words = 8 ids then 8 f32 weights.
     /// One combined D2H per partial layer, one async D2H per token for heat bookkeeping.
     route_log: DeviceBuf,
+    router_logits: DeviceBuf, // [128] f32
     moe_mid: DeviceBuf,     // [8 * 1152] f32
+    moe_tmp: DeviceBuf,     // [8 * H] per-expert outputs
     moe_out: DeviceBuf,     // [H]
 
     pub(crate) logits: DeviceBuf, // [unpadded_vocab_size] f32
@@ -162,9 +164,9 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// Rows-batched activation buffers for chunked prefill (allocated on first use).
     pub(crate) pf: Option<crate::prefill::PrefillScratch>,
     embed_pinned: PinnedBuf,
-    route_log_host: PinnedBuf,
-    route_log_event: smalltide_core::Event,
     pub(crate) route_log_inflight: bool,
+    /// A post-decode Tide step deferred into the next forward (see `post_decode_tide_step`).
+    pub(crate) tide_step_pending: bool,
     route_log_is_prefill: bool,
     /// Logical layers whose routing the scheduler already saw this token (partial layers).
     layer_planned: Vec<bool>,
@@ -264,16 +266,18 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             moe_ctrl: alloc_f32(h)?,
             moe_norm: alloc_f32(h)?,
             route_log: backend.alloc_device(num_logical * ROUTE_WORDS * 4)?,
+            router_logits: alloc_f32(cfg.n_routed_experts)?,
             moe_mid: alloc_f32(cfg.num_experts_per_tok * cfg.intermediate_size)?,
+            moe_tmp: alloc_f32(cfg.num_experts_per_tok * h)?,
             moe_out: alloc_f32(h)?,
             logits: alloc_f32(cfg.unpadded_vocab_size)?,
             argmax_buf: backend.alloc_device(128 * 4)?,
         };
         backend.zero_f32(scratch.route_log, num_logical * ROUTE_WORDS, stream)?;
 
+        // Prefill scratch is allocated eagerly (before the expert pools) so it is resident VRAM.
+        let pf = crate::prefill::PrefillScratch::new(&*backend, &cfg)?;
         let embed_pinned = backend.alloc_pinned(h * 4)?;
-        let route_log_host = backend.alloc_pinned(num_logical * ROUTE_WORDS * 4)?;
-        let route_log_event = backend.create_event()?;
         backend.sync_stream(stream)?;
         let dump = std::env::var_os("SMALLTIDE_DUMP_DIR").map(|d| {
             let dir = std::path::PathBuf::from(d);
@@ -293,11 +297,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             global_max_seq,
             layer_states,
             scratch,
-            pf: None,
+            pf: Some(pf),
             embed_pinned,
-            route_log_host,
-            route_log_event,
             route_log_inflight: false,
+            tide_step_pending: false,
             route_log_is_prefill: false,
             layer_planned: vec![false; num_logical],
             dump,
@@ -400,6 +403,58 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         Ok(())
     }
 
+    /// Dev benchmark: wall time of the decode MoE kernels (w13+w2) reading 8 experts at the given
+    /// pool `slots` (NVFP4 pool unless `mxfp8`), optionally after evicting the GPU caches.
+    pub fn debug_bench_moe(&mut self, slots: &[u32], mxfp8: bool, iters: usize, flush: bool) -> Result<f64> {
+        let s = self.tide.compute_stream;
+        let b = self.backend.clone();
+        let h = self.cfg.hidden_size;
+        let n = self.cfg.n_routed_experts;
+        let table = b.alloc_device(n * 4)?;
+        let ids = b.alloc_device(8 * 4)?;
+        let host = b.alloc_pinned(n * 4 + 64)?;
+        unsafe {
+            let hb = b.pinned_as_mut_slice(host)?;
+            let words = std::slice::from_raw_parts_mut(hb.as_mut_ptr() as *mut u32, n + 16);
+            for w in words.iter_mut() { *w = u32::MAX; }
+            for (i, &sl) in slots.iter().enumerate() { words[i] = sl; }
+            for i in 0..8 { words[n + i] = i as u32; }
+        }
+        b.memcpy_h2d_async(table, 0, host, 0, n * 4, s)?;
+        b.memcpy_h2d_async(ids, 0, host, n * 4, 32, s)?;
+        let flush_buf = b.alloc_device(256 << 20)?;
+        let (pool, stride) = if mxfp8 {
+            (self.tide.vram_pool_mxfp8, self.tide.mxfp8_layout.aligned_slab_bytes)
+        } else {
+            (self.tide.vram_pool_nvfp4, self.tide.nvfp4_layout.aligned_slab_bytes)
+        };
+        let params = MoeDispatchParams {
+            batch_size: 1,
+            hidden_size: h,
+            intermediate_size: self.cfg.intermediate_size,
+            top_k: 8,
+            weight_dtype: if mxfp8 { DType::MXFP8 } else { DType::NVFP4 },
+            expert_stride_bytes: stride,
+        };
+        b.sync_stream(s)?;
+        let mut total = 0.0;
+        for _ in 0..iters {
+            if flush {
+                b.vec_copy(flush_buf.slice(128 << 20, 128 << 20), flush_buf.slice(0, 128 << 20), 32 << 20, s)?;
+            }
+            b.sync_stream(s)?;
+            let t0 = Instant::now();
+            b.moe_decode_experts(self.scratch.moe_mid, self.scratch.moe_tmp, self.scratch.moe_norm, pool, table, ids, params, s)?;
+            b.sync_stream(s)?;
+            total += t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        b.free_device(flush_buf)?;
+        b.free_device(table)?;
+        b.free_device(ids)?;
+        b.free_pinned(host)?;
+        Ok(total / iters as f64)
+    }
+
     /// Mode 2: Prefill -> Decode Boundary Tide Rebalance.
     pub fn rebalance_after_prefill(&mut self, max_swaps: usize) -> Result<usize> {
         let ops = self.tide.scheduler.plan_prefill_decode_rebalance(max_swaps);
@@ -411,15 +466,30 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     }
 
     /// Mode 3 + Periodic Rebalance: Called once after each decoded token.
+    ///
+    /// Only the cheap part runs here (routing-log readback while the stream is idle after
+    /// sampling); the CPU-heavy part (staging memcpys for async promotions, rebalance) is
+    /// deferred into the next `forward_token`, after the prelude layers are enqueued, so it
+    /// overlaps GPU work instead of leaving the GPU idle between tokens.
     pub fn post_decode_tide_step(&mut self) -> Result<()> {
         self.consume_route_log()?;
+        self.tokens_decoded += 1;
+        self.tide_step_pending = true;
+        Ok(())
+    }
+
+    /// Runs a deferred `post_decode_tide_step` (no-op if none is pending).
+    pub fn run_deferred_tide_step(&mut self) -> Result<()> {
+        if !self.tide_step_pending {
+            return Ok(());
+        }
+        self.tide_step_pending = false;
         let _ = self.tide.poll_stage2_completions()?;
         let async_ops = self.tide.scheduler.plan_async_step();
         if !async_ops.is_empty() {
             // Stage 2 Disk->RAM runs asynchronously on dedicated OS thread; Stage 1 RAM->VRAM on copy stream
             self.tide.execute_transfers(&async_ops, false, true)?;
         }
-        self.tokens_decoded += 1;
         let reb_ops = self
             .tide
             .scheduler
@@ -436,16 +506,17 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if !self.route_log_inflight {
             return Ok(());
         }
-        self.backend.sync_event(self.route_log_event)?;
         self.route_log_inflight = false;
         let num_logical = self.layer_planned.len();
-        let words: Vec<u32> = unsafe {
-            let bytes = self.backend.pinned_as_mut_slice(self.route_log_host)?;
-            bytes[..num_logical * ROUTE_WORDS * 4]
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
-        };
+        // Synchronous readback: called right after sampling, when the compute stream is idle.
+        // (An async D2H + event here completed tens of ms late on Windows.)
+        let mut bytes = vec![0u8; num_logical * ROUTE_WORDS * 4];
+        self.backend
+            .memcpy_d2h_sync(&mut bytes, self.scratch.route_log, 0, self.tide.compute_stream)?;
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         for il in 0..num_logical {
             if self.layer_planned[il] {
                 continue;
@@ -551,6 +622,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let kv_dim = self.cfg.num_key_value_heads * self.cfg.head_dim;
         let eps = self.cfg.rms_norm_eps;
 
+        self.backend.seg_mark("pre_attn(mix,ctrl,norm)", s);
         let t_rc = self.prof_mark(s);
         let layer: &DenseLayerGpu = &self.dense.layers[ip];
         let is_local = layer.is_local;
@@ -649,6 +721,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if self.profile_enabled { self.profile.res_and_ctrl_ms += dt_rc; }
 
         // 4. Q, K, V, R Projections + Causal Short Convolutions on K & V
+        self.backend.seg_mark("qkvr_proj", s);
         let t_ap = self.prof_mark(s);
         let layer = &self.dense.layers[ip];
         self.fp8_mm(self.scratch.q, nq, &layer.wq, s)?;
@@ -658,6 +731,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let dt_ap = self.prof_end(t_ap, s);
         if self.profile_enabled { self.profile.attn_proj_ms += dt_ap; }
 
+        self.backend.seg_mark("sconv,clip,sink,rel,kv", s);
         let t_sc = self.prof_mark(s);
         let layer = &self.dense.layers[ip];
         let st = &self.layer_states[il];
@@ -765,6 +839,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let dt_sc = self.prof_end(t_sc, s);
         if self.profile_enabled { self.profile.sconv_clip_rel_ms += dt_sc; }
 
+        self.backend.seg_mark("attention", s);
         let t_fa = self.prof_mark(s);
         let st = &self.layer_states[il];
         let n_valid = if is_local {
@@ -802,6 +877,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if self.profile_enabled { self.profile.flash_attn_ms += dt_fa; }
 
         // 7. Output Gate + Wo + Post-Attention Short Conv
+        self.backend.seg_mark("gate,wo,sconv,mlp_mix,norm", s);
         let t_ao = self.prof_mark(s);
         let layer = &self.dense.layers[ip];
         let st = &self.layer_states[il];
@@ -869,19 +945,30 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let dt_ao = self.prof_end(t_ao, s);
         if self.profile_enabled { self.profile.attn_out_ms += dt_ao; }
 
+        self.backend.seg_mark("router", s);
         let t_rt = self.prof_mark(s);
         let layer = &self.dense.layers[ip];
         let topk_ids = self.scratch.route_log.slice(il * ROUTE_WORDS * 4, 32);
         let topk_weights = self.scratch.route_log.slice(il * ROUTE_WORDS * 4 + 32, 32);
         let route_row = self.scratch.route_log.slice(il * ROUTE_WORDS * 4, ROUTE_WORDS * 4);
-        self.backend.router_topk8(
-            topk_ids,
-            topk_weights,
+        // Parallel router: multi-workgroup logits GEMV + block-parallel top-8 (the old single-
+        // workgroup kernel cost ~430 us per layer, ~20 ms per token).
+        self.backend.gemm_f32_rows(
+            self.scratch.router_logits,
             self.scratch.moe_norm,
             layer.router_weight,
-            Some(layer.router_bias),
+            1,
+            self.cfg.n_routed_experts,
             h,
+            s,
+        )?;
+        self.backend.router_topk8_rows(
+            route_row,
+            self.scratch.router_logits,
+            Some(layer.router_bias),
             self.cfg.route_scale,
+            1,
+            ROUTE_WORDS,
             s,
         )?;
 
@@ -963,6 +1050,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.profile.tide_rescue_ms += rescue_ms_local;
         }
 
+        self.backend.seg_mark(if self.cfg.is_loop_core_layer(ip) { "moe(loop core)" } else { "moe(prelude/coda)" }, s);
         let t_moe = self.prof_mark(s);
         let is_mxfp8 = self.cfg.is_mxfp8_layer(ip);
         let (pool, stride, dtype) = if is_mxfp8 {
@@ -982,38 +1070,37 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             ip * self.cfg.n_routed_experts * 4,
             self.cfg.n_routed_experts * 4,
         );
-        self.backend.moe_swiglu_indirect_with_scratch(
-            self.scratch.moe_out,
+        let params = MoeDispatchParams {
+            batch_size: 1,
+            hidden_size: h,
+            intermediate_size: self.cfg.intermediate_size,
+            top_k: self.cfg.num_experts_per_tok,
+            weight_dtype: dtype,
+            expert_stride_bytes: stride,
+        };
+        self.backend.moe_decode_experts(
             self.scratch.moe_mid,
+            self.scratch.moe_tmp,
             self.scratch.moe_norm,
             pool,
             layer_slot_table,
             topk_ids,
-            topk_weights,
-            MoeDispatchParams {
-                batch_size: 1,
-                hidden_size: h,
-                intermediate_size: self.cfg.intermediate_size,
-                top_k: self.cfg.num_experts_per_tok,
-                weight_dtype: dtype,
-                expert_stride_bytes: stride,
-            },
+            params,
             s,
         )?;
-
+        // Weighted/renormalized expert sum + post-MLP short conv + residual in one kernel.
         let st = &self.layer_states[il];
-        self.backend.sconv_k4_decode(
-            self.scratch.sconv_tmp,
-            st.sconv_mlp,
-            self.scratch.moe_out,
-            self.dense.layers[ip].mlp_sconv,
-            None,
+        self.backend.moe_decode_post(
+            self.scratch.cur,
+            self.scratch.moe_tmp,
+            layer_slot_table,
+            topk_ids,
+            topk_weights,
+            self.cfg.num_experts_per_tok,
+            Some((st.sconv_mlp, self.dense.layers[ip].mlp_sconv, self.scratch.ffn_inp)),
             h,
-            0,
             s,
         )?;
-        self.backend
-            .vec_add(self.scratch.cur, self.scratch.ffn_inp, self.scratch.sconv_tmp, h, s)?;
         let dt_moe = self.prof_end(t_moe, s);
         if self.profile_enabled { self.profile.moe_ms += dt_moe; }
         if self.dump.is_some() {
@@ -1079,6 +1166,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.layer_planned.iter_mut().for_each(|p| *p = false);
         self.dump_token = (token_id, pos);
 
+        self.backend.seg_mark("token_start(embed,tables)", s);
         // 0. Host RAM BF16 Embedding Lookup -> Pinned -> GPU -> Embed RMSNorm
         let tok = (token_id as usize).min(self.cfg.vocab_size - 1);
         let row_off = tok * h * 2;
@@ -1112,6 +1200,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         for ip in 0..start {
             self.forward_layer(ip, ip, pos, is_prefill, &mut num_blocks, None)?;
         }
+
+        // The previous token's deferred Tide work runs here, overlapping the GPU's prelude.
+        self.run_deferred_tide_step()?;
 
         // Save prelude output & prelude block count for all 3 loop passes (`inkling2-loop.cpp:88-89`)
         self.backend
@@ -1186,10 +1277,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
 
         // Async routing-log readback (consumed at the next token boundary).
-        let log_bytes = self.layer_planned.len() * ROUTE_WORDS * 4;
-        self.backend
-            .memcpy_d2h_async(self.route_log_host, 0, self.scratch.route_log, 0, log_bytes, s)?;
-        self.backend.record_event(self.route_log_event, s)?;
+        // Routing log is read back at the next token boundary (stream idle by then).
         self.route_log_inflight = true;
         self.route_log_is_prefill = is_prefill;
 
@@ -1201,6 +1289,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
 
         // 4. Output Head (`inkling2.cpp:421-445`)
+        self.backend.seg_mark("lm_head", s);
         let t_lm = self.prof_mark(s);
         let blocks_view = Some(self.scratch.blocks.slice(0, num_blocks * h_bytes));
         self.backend.attn_res_mix(
@@ -1262,6 +1351,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let s = self.tide.compute_stream;
         let vocab = self.cfg.unpadded_vocab_size;
 
+        self.backend.seg_mark("sample", s);
         // Fast GPU argmax path when greedy and no repetition penalty (~5 µs, 512 B D2H!)
         if params.temperature <= 0.0 && (params.repetition_penalty - 1.0).abs() < 1e-6 {
             self.backend.argmax_partial_f32(
@@ -1375,8 +1465,6 @@ impl<B: ComputeBackend> Drop for Inkling2Engine<B> {
             pf.free(&*self.backend);
         }
         let _ = self.backend.free_pinned(self.embed_pinned);
-        let _ = self.backend.free_pinned(self.route_log_host);
-        let _ = self.backend.destroy_event(self.route_log_event);
         for st in &self.layer_states {
             let _ = self.backend.free_device(st.k_cache);
             let _ = self.backend.free_device(st.k_scales);
@@ -1393,7 +1481,7 @@ impl<B: ComputeBackend> Drop for Inkling2Engine<B> {
             s.messages, s.in_qkv, s.ctrl_qkv, s.norm_qkv, s.ctrl_prep, s.ctrl_gate, s.ctrl_gain,
             s.ctrl_forget, s.q, s.k_raw, s.k, s.v_raw, s.v, s.k_dyn, s.v_dyn, s.r, s.sinks,
             s.rel_table, s.partial_out, s.partial_m, s.partial_l, s.attn_out, s.gate_out, s.o_raw,
-            s.sconv_tmp, s.moe_in, s.moe_ctrl, s.moe_norm, s.route_log, s.moe_mid,
+            s.sconv_tmp, s.moe_in, s.moe_ctrl, s.moe_norm, s.route_log, s.router_logits, s.moe_mid, s.moe_tmp,
             s.moe_out, s.logits, s.argmax_buf,
         ] {
             let _ = self.backend.free_device(buf);

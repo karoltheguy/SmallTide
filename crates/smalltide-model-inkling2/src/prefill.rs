@@ -69,7 +69,7 @@ pub(crate) struct PrefillScratch {
 }
 
 impl PrefillScratch {
-    fn new<B: ComputeBackend>(b: &B, cfg: &smalltide_core::Inkling2Config) -> Result<Self> {
+    pub(crate) fn new<B: ComputeBackend>(b: &B, cfg: &smalltide_core::Inkling2Config) -> Result<Self> {
         let m = PREFILL_CHUNK;
         let h = cfg.hidden_size;
         let qd = cfg.num_attention_heads * cfg.head_dim;
@@ -161,6 +161,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.pf = Some(PrefillScratch::new(&*self.backend, &self.cfg)?);
         }
         // Token boundary bookkeeping (same as forward_token) and a free scratch ring.
+        self.run_deferred_tide_step()?;
         let published = self.tide.poll_pending()?;
         self.tide.scheduler.telemetry.stage1_async_published += published as u64;
         self.tide.release_scratch_ring()?;

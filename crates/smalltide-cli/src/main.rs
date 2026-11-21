@@ -24,6 +24,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("probe") => run_probe(),
+        Some("vram-probe") => run_vram_probe(),
         Some("bench-gpu") => run_bench_gpu(),
         Some("bench-nvme") => run_bench_nvme(),
         Some("load-test") => {
@@ -432,6 +433,76 @@ fn run_bench_nvme() {
     let _ = std::fs::remove_file(&temp_path);
 }
 
+/// Allocates VRAM in 512 MiB chunks and measures read bandwidth of each, revealing where the
+/// driver silently backs "device" allocations with system memory (WDDM over-commit).
+fn run_vram_probe() {
+    let backend = HipBackend::new(0).expect("init HipBackend");
+    let s = backend.create_stream(smalltide_core::QueueKind::Compute).expect("stream");
+    let chunk = 512usize << 20;
+    let scratch = backend.alloc_device(chunk).expect("scratch");
+    let mut bufs = Vec::new();
+    #[cfg(windows)]
+    let _wddm = {
+        let a = smalltide_backend_hip::wddm::Adapter::open_amd();
+        if let Some(a) = &a {
+            let gib = (1u64 << 30) as f64;
+            if let Some(i) = a.local_info() {
+                println!("DXGI local: budget {:.2} GiB, usage {:.2}, available-for-reservation {:.2}",
+                    i.budget as f64 / gib, i.current_usage as f64 / gib, i.available_for_reservation as f64 / gib);
+                let want = std::env::var("SMALLTIDE_RESERVE_GB").ok().and_then(|v| v.parse::<f64>().ok())
+                    .map(|g| (g * gib) as u64).unwrap_or(i.available_for_reservation);
+                if want > 0 {
+                    let ok = a.reserve_local(want);
+                    println!("SetVideoMemoryReservation({:.2} GiB) -> {}", want as f64 / gib, if ok { "ok" } else { "failed" });
+                }
+                if let Some(i) = a.local_info() {
+                    println!("DXGI local after: reserved {:.2} GiB", i.current_reservation as f64 / gib);
+                }
+            }
+        }
+        a
+    };
+    let info0 = backend.device_info().expect("info");
+    println!("free before: {:.2} GiB", info0.free_vram_bytes as f64 / (1u64 << 30) as f64);
+    if let Some(big_gb) = std::env::var("SMALLTIDE_PROBE_BIG_GB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let big = backend.alloc_device(big_gb << 30).expect("big alloc");
+        backend.zero_f32(big, (big_gb << 30) / 4, s).expect("zero");
+        backend.sync_stream(s).expect("sync");
+        for w in 0..(big_gb * 2) {
+            let t0 = Instant::now();
+            for _ in 0..4 {
+                backend.vec_copy(scratch, big.slice(w * chunk, chunk), chunk / 4, s).expect("copy");
+            }
+            backend.sync_stream(s).expect("sync");
+            let gbs = (4 * chunk) as f64 / t0.elapsed().as_secs_f64() / 1e9;
+            println!("big alloc window {w:2} ({:5.1} GiB offset): read {gbs:7.1} GB/s", w as f64 * 0.5);
+        }
+        let _ = backend.free_device(big);
+        return;
+    }
+    for i in 0..30 {
+        let Ok(b) = backend.alloc_device(chunk) else { println!("alloc failed at chunk {i}"); break };
+        let _ = backend.zero_f32(b, chunk / 4, s);
+        let _ = backend.sync_stream(s);
+        let t0 = Instant::now();
+        for _ in 0..4 {
+            backend.vec_copy(scratch, b, chunk / 4, s).expect("copy");
+        }
+        backend.sync_stream(s).expect("sync");
+        let gbs = (4 * chunk) as f64 / t0.elapsed().as_secs_f64() / 1e9;
+        let free = backend.device_info().map(|d| d.free_vram_bytes as f64 / (1u64 << 30) as f64).unwrap_or(0.0);
+        println!("chunk {i:2} ({:5.1} GiB allocated): read {gbs:7.1} GB/s | reported free {free:.2} GiB", (i + 1) as f64 * 0.5);
+        bufs.push(b);
+    }
+    if let Some(secs) = std::env::var("SMALLTIDE_PROBE_HOLD").ok().and_then(|v| v.parse::<u64>().ok()) {
+        println!("holding allocations for {secs}s (pid {})", std::process::id());
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
+    for b in bufs {
+        let _ = backend.free_device(b);
+    }
+}
+
 fn run_load_test(model_dir: &Path) {
     let cfg = Inkling2Config::default();
     println!("=== SmallTide Step 2 Live Model Load Test ({}) ===", model_dir.display());
@@ -625,7 +696,7 @@ fn run_generate(args: &[String]) {
     tide_cfg.rescue_policy = rescue_policy;
 
     let ram_budget_bytes = (ram_gb * 1024.0 * 1024.0 * 1024.0) as usize;
-    let mut tide = TideExecutor::new(
+    let tide = TideExecutor::new(
         backend.clone(),
         cfg.clone(),
         tide_cfg,
@@ -636,15 +707,45 @@ fn run_generate(args: &[String]) {
     )
     .expect("create TideExecutor");
 
-    let preload_ops = tide.scheduler.plan_pre_prefill(None);
-    tide.execute_transfers(&preload_ops, true, false).expect("Mode 1 pre-prefill");
-    backend.sync_stream(tide.copy_stream).expect("sync prefill DMA");
-
+    // Engine buffers (activations, KV, prefill scratch) before the expert pools: on Windows the
+    // driver backs allocations beyond the resident budget with system memory, in order.
     let mut engine = Inkling2Engine::new(cfg.clone(), dense_gpu, tide, max_ctx)
         .expect("create Inkling2Engine");
+    engine.tide.allocate_pools().expect("allocate expert pools");
+    let preload_ops = engine.tide.scheduler.plan_pre_prefill(None);
+    engine.tide.execute_transfers(&preload_ops, true, false).expect("Mode 1 pre-prefill");
+    backend.sync_stream(engine.tide.copy_stream).expect("sync prefill DMA");
 
+    if std::env::var_os("SMALLTIDE_BENCH_MOE").is_some() {
+        let n4 = nvfp4_slots as u32;
+        let m8 = mxfp8_slots as u32;
+        let mut sets: Vec<(String, Vec<u32>, bool)> = Vec::new();
+        for st in (0..n4.saturating_sub(8)).step_by(128) {
+            sets.push((format!("nvfp4 slots {st}..{}", st + 8), (st..st + 8).collect(), false));
+        }
+        for st in (0..m8.saturating_sub(8)).step_by(32) {
+            sets.push((format!("mxfp8 slots {st}..{}", st + 8), (st..st + 8).collect(), true));
+        }
+        for (label, slots, mx) in sets {
+            let cold = engine.debug_bench_moe(&slots, mx, 10, true).expect("bench");
+            println!("[bench-moe] {label:<24} cold {cold:.3} ms");
+        }
+    }
     let (pre_r, core_r, coda_r) = engine.tide.scheduler.cache.count_vram_resident();
     let ram_r = engine.tide.scheduler.cache.count_ram_resident();
+    if let Some((usage, resident)) = backend.resident_vram_info() {
+        let gib = (1u64 << 30) as f64;
+        println!(
+            "[VRAM residency] process usage {:.2} GiB vs resident budget {:.2} GiB (DXGI){}",
+            usage as f64 / gib,
+            resident as f64 / gib,
+            if usage > resident {
+                format!(" -> ~{:.2} GiB of 'VRAM' is backed by system memory (read over PCIe); close other GPU apps or lower --nvfp4-slots/--mxfp8-slots", (usage - resident) as f64 / gib)
+            } else {
+                String::new()
+            }
+        );
+    }
     let info_ready = backend.device_info().expect("device_info ready");
     println!(
         "[Ready in {:.2}s] VRAM free: {:.2}/{:.2} GiB | KV({} ctx): {:.2} GiB | Experts VRAM: pre={}, core={}/1536, coda={} (slots nvfp4={}, mxfp8={}) | RAM warm: {} | Rescue: {:?}",
@@ -707,7 +808,13 @@ fn run_generate(args: &[String]) {
         engine.profile_enabled = true;
     }
     let _ = backend.take_host_stats();
+    let mut post_ms = 0.0f64;
     let ktiming = std::env::var_os("SMALLTIDE_KTIMING").is_some();
+    let segtiming = std::env::var_os("SMALLTIDE_SEGTIME").is_some();
+    if segtiming {
+        backend.set_segment_timing(true).expect("segment timing");
+        let _ = backend.take_segment_times();
+    }
     if ktiming {
         backend.set_kernel_timing(true).expect("kernel timing");
         let _ = backend.take_kernel_times();
@@ -734,7 +841,9 @@ fn run_generate(args: &[String]) {
         engine
             .forward_token(next_tok, pos, false, true)
             .expect("decode forward_token");
+        let tp = Instant::now();
         engine.post_decode_tide_step().expect("post_decode_tide_step");
+        post_ms += tp.elapsed().as_secs_f64() * 1000.0;
         pos += 1;
         next_tok = engine
             .sample_next_token(&sampling, &generated)
@@ -774,14 +883,24 @@ fn run_generate(args: &[String]) {
     if dec_toks > 0 {
         let n = dec_toks as f64;
         println!(
-            "[Host/tok] {:.2} ms total | {:.0} launches ({:.2} ms CPU in hipModuleLaunchKernel) | {:.1} syncs ({:.2} ms blocked) | {:.2} ms other CPU",
+            "[Host/tok] {:.2} ms total | {:.0} launches ({:.2} ms CPU in hipModuleLaunchKernel) | {:.1} syncs ({:.2} ms blocked) | {:.2} ms other CPU (post-decode Tide {:.2} ms)",
             dec_secs * 1000.0 / n,
             hs.launches as f64 / n,
             hs.launch_ms / n,
             hs.syncs as f64 / n,
             hs.sync_wait_ms / n,
             (dec_secs * 1000.0 - hs.launch_ms - hs.sync_wait_ms) / n,
+            post_ms / n,
         );
+    }
+    if segtiming && dec_toks > 0 {
+        let n = dec_toks as f64;
+        let st = backend.take_segment_times();
+        let total: f64 = st.iter().map(|k| k.2).sum();
+        println!("[GPU segments/tok] total {:.2} ms", total / n);
+        for (name, cnt, ms) in st {
+            println!("  {:<32} {:>6.1}x  {:>7.3} ms  ({:>6.1} us avg)", name, cnt as f64 / n, ms / n, ms * 1000.0 / cnt as f64);
+        }
     }
     if ktiming && dec_toks > 0 {
         let n = dec_toks as f64;

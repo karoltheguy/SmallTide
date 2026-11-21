@@ -154,6 +154,10 @@ pub trait ComputeBackend: Send + Sync {
     fn query_event(&self, event: Event) -> Result<bool>;
     fn sync_stream(&self, stream: Stream) -> Result<()>;
 
+    /// Dev profiling: marks the start of a GPU timeline segment named `label` on `stream`
+    /// (the segment ends at the next mark). No-op unless the backend enabled segment timing.
+    fn seg_mark(&self, _label: &'static str, _stream: Stream) {}
+
     /// Non-blocking D2H DMA from device buffer into a pinned host buffer (ordered on `stream`).
     fn memcpy_d2h_async(
         &self,
@@ -529,6 +533,19 @@ pub trait ComputeBackend: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn moe_grouped(&self, out: DeviceBuf, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, route: DeviceBuf,
         pool: DeviceBuf, desc: DeviceBuf, params: GroupedMoeParams, reduce: bool, stream: Stream) -> Result<()>;
+
+    /// Decode MoE (v2): `mid[k][I]` then unweighted per-expert outputs `tmp[k][H]` for the
+    /// routed experts (skipped experts write 0).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_decode_experts(&self, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, pool: DeviceBuf,
+        slot_table: DeviceBuf, topk_ids: DeviceBuf, params: MoeDispatchParams, stream: Stream) -> Result<()>;
+
+    /// `out = residual + sconv(sum_k w_k*renorm*tmp[k])` (or just the weighted sum when
+    /// `sconv` is None), renormalized over the experts present in `slot_table`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_decode_post(&self, out: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, topk_ids: DeviceBuf,
+        topk_weights: DeviceBuf, top_k: usize, sconv: Option<(DeviceBuf, DeviceBuf, DeviceBuf)>,
+        hidden: usize, stream: Stream) -> Result<()>;
 
     /// Final fixed-order reduce of `tmp[M*8][H]` into `out[M][H]`.
     fn moe_reduce_rows(&self, out: DeviceBuf, tmp: DeviceBuf, hidden: usize, rows: usize, stream: Stream) -> Result<()>;

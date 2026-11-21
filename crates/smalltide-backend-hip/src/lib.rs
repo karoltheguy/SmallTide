@@ -6,6 +6,8 @@
 
 pub mod backend;
 pub mod ffi;
+#[cfg(windows)]
+pub mod wddm;
 
 pub use backend::HipBackend;
 pub use ffi::{HipProbeReport, HipRuntime};

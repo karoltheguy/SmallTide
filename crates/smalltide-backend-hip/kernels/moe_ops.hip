@@ -273,3 +273,148 @@ extern "C" __global__ void smalltide_moe_w2_accum_indirect(
         out[row] = total_out;
     }
 }
+
+// ===========================================================================
+// Decode MoE v2 (bandwidth-oriented): one warp per weight row, 16-byte loads per lane,
+// all 8 experts in parallel (grid.y), unweighted per-expert outputs + fused reduce/post.
+// ===========================================================================
+
+// dot of a 16-byte NVFP4 chunk (32 values, 2 scale blocks) with 32 consecutive activations.
+__device__ __forceinline__ float nvfp4_chunk_dot(uint4 w, float s0, float s1, const float4* __restrict__ x8) {
+    uint32_t wd[4] = {w.x, w.y, w.z, w.w};
+    float acc0 = 0.0f, acc1 = 0.0f;
+    #pragma unroll
+    for (uint32_t j = 0u; j < 4u; ++j) {
+        float4 xa = x8[2u * j], xb = x8[2u * j + 1u];
+        uint32_t v = wd[j];
+        float a = 0.0f;
+        a = fmaf(fp4x2(v), xa.x, a);         a = fmaf(fp4x2(v >> 4), xa.y, a);
+        a = fmaf(fp4x2(v >> 8), xa.z, a);    a = fmaf(fp4x2(v >> 12), xa.w, a);
+        a = fmaf(fp4x2(v >> 16), xb.x, a);   a = fmaf(fp4x2(v >> 20), xb.y, a);
+        a = fmaf(fp4x2(v >> 24), xb.z, a);   a = fmaf(fp4x2(v >> 28), xb.w, a);
+        if (j < 2u) acc0 += a; else acc1 += a;
+    }
+    // fp4x2 returns 2x the E2M1 value: fold the 0.5 into the block scales.
+    return 0.5f * (acc0 * s0 + acc1 * s1);
+}
+
+// dot of a 16-byte MXFP8 chunk (16 values; one UE8M0 scale per 32) with 16 activations.
+__device__ __forceinline__ float mxfp8_chunk_dot(uint4 w, const float4* __restrict__ x4) {
+    float4 a = decode_fp8x4(w.x), b = decode_fp8x4(w.y), c = decode_fp8x4(w.z), d = decode_fp8x4(w.w);
+    float4 xa = x4[0], xb = x4[1], xc = x4[2], xd = x4[3];
+    float s = a.x * xa.x;
+    s = fmaf(a.y, xa.y, s); s = fmaf(a.z, xa.z, s); s = fmaf(a.w, xa.w, s);
+    s = fmaf(b.x, xb.x, s); s = fmaf(b.y, xb.y, s); s = fmaf(b.z, xb.z, s); s = fmaf(b.w, xb.w, s);
+    s = fmaf(c.x, xc.x, s); s = fmaf(c.y, xc.y, s); s = fmaf(c.z, xc.z, s); s = fmaf(c.w, xc.w, s);
+    s = fmaf(d.x, xd.x, s); s = fmaf(d.y, xd.y, s); s = fmaf(d.z, xd.z, s); s = fmaf(d.w, xd.w, s);
+    return s;
+}
+
+// Row dot over k_cols activations (one warp), NVFP4 or MXFP8 per the slab header tag.
+__device__ __forceinline__ float moe_row_dot(uint32_t dtype_tag, const uint8_t* __restrict__ w_row,
+    const uint8_t* __restrict__ s_row, const float* __restrict__ x, uint32_t k_cols, uint32_t lane) {
+    float acc = 0.0f;
+    const uint4* wv = reinterpret_cast<const uint4*>(w_row);
+    const float4* xv = reinterpret_cast<const float4*>(x);
+    if (dtype_tag == 0u) {
+        uint32_t n16 = k_cols >> 5; // 32 values per 16-byte chunk
+        for (uint32_t c = lane; c < n16; c += 32u) {
+            float s0 = decode_fp8_e4m3fn(s_row[2u * c]);
+            float s1 = decode_fp8_e4m3fn(s_row[2u * c + 1u]);
+            acc += nvfp4_chunk_dot(wv[c], s0, s1, xv + 8u * c);
+        }
+    } else {
+        uint32_t n16 = k_cols >> 4; // 16 values per chunk, scale per 32
+        for (uint32_t c = lane; c < n16; c += 32u) {
+            float sc = decode_ue8m0(s_row[c >> 1]);
+            acc = fmaf(mxfp8_chunk_dot(wv[c], xv + 4u * c), sc, acc);
+        }
+    }
+    return wave32_sum(acc);
+}
+
+//   mid[k][r] = SiTU(gate_r . x, up_r . x) for routed expert k (rows interleaved 2r / 2r+1).
+//   Grid: (ceil(I / 8), top_k), Block: 256 (8 warps, one intermediate row each)
+extern "C" __global__ void smalltide_moe_w13_decode(
+    float* __restrict__ mid, const float* __restrict__ x, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ slot_table, const uint32_t* __restrict__ topk_ids,
+    uint64_t slab_stride, uint32_t hidden, uint32_t inter, float gate_cap, float up_cap
+) {
+    uint32_t k = blockIdx.y;
+    uint32_t slot = slot_table[topk_ids[k]];
+    if (slot == 0xFFFFFFFFu) return;
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t r = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (r >= inter) return;
+    const uint8_t* slab = pool + static_cast<size_t>(slot) * slab_stride;
+    const ExpertSlabHeaderGpu* hdr = reinterpret_cast<const ExpertSlabHeaderGpu*>(slab);
+    const uint8_t* w = slab + hdr->w13_weight_offset;
+    const uint8_t* sc = slab + hdr->w13_scale_offset;
+    size_t wrow = (hdr->dtype_tag == 0u) ? (hidden >> 1) : hidden;
+    size_t srow = (hdr->dtype_tag == 0u) ? (hidden >> 4) : (hidden >> 5);
+    float g = moe_row_dot(hdr->dtype_tag, w + (2u * r) * wrow, sc + (2u * r) * srow, x, hidden, lane);
+    float u = moe_row_dot(hdr->dtype_tag, w + (2u * r + 1u) * wrow, sc + (2u * r + 1u) * srow, x, hidden, lane);
+    if (hdr->dtype_tag == 0u) { g *= hdr->w13_outer_scale; u *= hdr->w13_outer_scale; }
+    if (lane == 0u) mid[static_cast<size_t>(k) * inter + r] = situ_f32(g, u, gate_cap, up_cap);
+}
+
+//   tmp[k][h] = w2_h . mid[k] (unweighted; 0 for a skipped expert).
+//   Grid: (ceil(H / 8), top_k), Block: 256
+extern "C" __global__ void smalltide_moe_w2_decode(
+    float* __restrict__ tmp, const float* __restrict__ mid, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ slot_table, const uint32_t* __restrict__ topk_ids,
+    uint64_t slab_stride, uint32_t hidden, uint32_t inter
+) {
+    uint32_t k = blockIdx.y;
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t h = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (h >= hidden) return;
+    uint32_t slot = slot_table[topk_ids[k]];
+    if (slot == 0xFFFFFFFFu) {
+        if (lane == 0u) tmp[static_cast<size_t>(k) * hidden + h] = 0.0f;
+        return;
+    }
+    const uint8_t* slab = pool + static_cast<size_t>(slot) * slab_stride;
+    const ExpertSlabHeaderGpu* hdr = reinterpret_cast<const ExpertSlabHeaderGpu*>(slab);
+    const uint8_t* w = slab + hdr->w2_weight_offset;
+    const uint8_t* sc = slab + hdr->w2_scale_offset;
+    size_t wrow = (hdr->dtype_tag == 0u) ? (inter >> 1) : inter;
+    size_t srow = (hdr->dtype_tag == 0u) ? (inter >> 4) : (inter >> 5);
+    float v = moe_row_dot(hdr->dtype_tag, w + h * wrow, sc + h * srow, mid + static_cast<size_t>(k) * inter, inter, lane);
+    if (hdr->dtype_tag == 0u) v *= hdr->w2_outer_scale;
+    if (lane == 0u) tmp[static_cast<size_t>(k) * hidden + h] = v;
+}
+
+//   moe = sum_k w_k * renorm * tmp[k] (renorm over present experts); optionally fused with the
+//   post-MLP short conv and residual: out = residual + sconv(moe) (sconv_state non-null).
+//   Grid: ceil(H / 256), Block: 256
+extern "C" __global__ void smalltide_moe_post_decode(
+    float* __restrict__ out, const float* __restrict__ tmp, const uint32_t* __restrict__ slot_table,
+    const uint32_t* __restrict__ topk_ids, const float* __restrict__ topk_w, uint32_t top_k,
+    float* __restrict__ sconv_state, const float* __restrict__ sconv_w, const float* __restrict__ residual,
+    uint32_t hidden
+) {
+    uint32_t h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    float tot = 0.0f, ex = 0.0f;
+    for (uint32_t k = 0u; k < top_k; ++k) {
+        float w = topk_w[k];
+        tot += w;
+        if (slot_table[topk_ids[k]] != 0xFFFFFFFFu) ex += w;
+    }
+    float renorm = (ex > 1e-8f) ? (tot / ex) : 0.0f;
+    float acc = 0.0f;
+    for (uint32_t k = 0u; k < top_k; ++k) {
+        if (slot_table[topk_ids[k]] != 0xFFFFFFFFu) acc = fmaf(topk_w[k] * renorm, tmp[static_cast<size_t>(k) * hidden + h], acc);
+    }
+    if (sconv_state != nullptr) {
+        float s0 = sconv_state[h], s1 = sconv_state[hidden + h], s2 = sconv_state[2u * hidden + h];
+        const float4 w = reinterpret_cast<const float4*>(sconv_w)[h];
+        float y = fmaf(s0, w.x, fmaf(s1, w.y, fmaf(s2, w.z, acc * w.w)));
+        y = (acc + y) * 0.4472135954999579f;
+        sconv_state[h] = s1; sconv_state[hidden + h] = s2; sconv_state[2u * hidden + h] = acc;
+        out[h] = residual[h] + y;
+    } else {
+        out[h] = acc;
+    }
+}

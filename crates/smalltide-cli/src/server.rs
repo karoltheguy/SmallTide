@@ -83,6 +83,7 @@ enum EngineCommand {
         max_tokens: usize,
         sampling: SamplingParams,
         stop_strings: Vec<String>,
+        cache_prompt: bool,
         event_tx: Sender<StreamEvent>,
     },
     GetStats {
@@ -108,6 +109,8 @@ struct ChatCompletionReq {
     top_k: Option<usize>,
     #[serde(default)]
     repetition_penalty: Option<f32>,
+    /// llama.cpp-style: `false` bypasses the prompt prefix cache for this request.
+    cache_prompt: Option<bool>,
     #[serde(default)]
     stream: Option<bool>,
     #[serde(default)]
@@ -128,6 +131,8 @@ struct CompletionReq {
     top_k: Option<usize>,
     #[serde(default)]
     repetition_penalty: Option<f32>,
+    /// llama.cpp-style: `false` bypasses the prompt prefix cache for this request.
+    cache_prompt: Option<bool>,
     #[serde(default)]
     stream: Option<bool>,
     #[serde(default)]
@@ -250,7 +255,9 @@ fn engine_worker_loop(
     cmd_rx: Receiver<EngineCommand>,
 ) {
     // Prompt prefix cache: live-sequence extension + rewind to pinned-RAM state snapshots.
-    let mut pc: PrefixCache<SeqSnapshot> = PrefixCache::new(4);
+    let env_usize = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(d);
+    let mut pc: PrefixCache<SeqSnapshot> =
+        PrefixCache::new(env_usize("SMALLTIDE_PREFIX_SNAPSHOTS", 12), env_usize("SMALLTIDE_PREFIX_TOKENS", 65_536));
     let mut last_decode_tok_s: f64 = 0.0;
     let mut last_prefill_tok_s: f64 = 0.0;
 
@@ -290,6 +297,9 @@ fn engine_worker_loop(
                         "requests": pc.stats.requests,
                         "extend_hits": pc.stats.extend_hits,
                         "restore_hits": pc.stats.restore_hits,
+                        "cross_restores": pc.stats.cross_restores,
+                        "evictions": pc.stats.evictions,
+                        "snapshot_tokens": pc.snapshot_tokens(),
                         "misses": pc.stats.misses,
                         "reused_tokens": pc.stats.reused_tokens,
                         "prefilled_tokens": pc.stats.prefilled_tokens,
@@ -323,6 +333,7 @@ fn engine_worker_loop(
                 max_tokens,
                 sampling,
                 stop_strings,
+                cache_prompt,
                 event_tx,
             } => {
                 let prompt_ids = tok.encode(&prompt_text);
@@ -340,7 +351,7 @@ fn engine_worker_loop(
                 }
 
                 let t_pf = Instant::now();
-                let plan = pc.plan(&prompt_ids);
+                let plan = if cache_prompt { pc.plan(&prompt_ids) } else { PrefixPlan::Reset };
                 if std::env::var_os("SMALLTIDE_PREFIX_DEBUG").is_some() {
                     let lcp = pc.cached.iter().zip(&prompt_ids).take_while(|(a, b)| a == b).count();
                     let show = |ids: &[u32]| -> String {
@@ -357,8 +368,8 @@ fn engine_worker_loop(
                 }
                 let rewind = match &plan {
                     PrefixPlan::Extend { from } => Ok(*from),
-                    PrefixPlan::Restore { snap_idx, pos } => {
-                        engine.restore_state(pc.snapshot(*snap_idx)).map(|_| *pos)
+                    PrefixPlan::Restore { snap_idx, pos, global } => {
+                        engine.restore_state(pc.snapshot(*snap_idx), *global).map(|_| *pos)
                     }
                     PrefixPlan::Reset => engine.reset_sequence().map(|_| 0),
                 };
@@ -372,34 +383,39 @@ fn engine_worker_loop(
                 };
                 pc.rewound_to(&plan, reuse_len);
 
-                // Snapshot points: first user-message boundary (shared system/tool prefix) and
-                // the prompt end (multi-turn divergence right after the previous prompt).
-                let boundary = prompt_ids
-                    .iter()
-                    .position(|&t| t == TOK_MESSAGE_USER)
-                    .filter(|&b| b > reuse_len && b >= 16);
-                // Batched prefill in segments so the boundary snapshot lands at the right position.
-                let mut pf_err = None;
-                let mut segs: Vec<(usize, usize)> = Vec::new();
-                match boundary {
-                    Some(bd) if bd < prompt_ids.len() => {
-                        segs.push((reuse_len, bd));
-                        segs.push((bd, prompt_ids.len()));
+                // Snapshot points: the first user-message boundary (shared system/tool prefix) and
+                // one token before the prompt end (the last token is always re-processed, so this
+                // serves exact repeats and follow-up turns alike). Prefill runs in segments so each
+                // snapshot lands exactly on its point.
+                let end = prompt_ids.len();
+                let mut points: Vec<usize> = Vec::new();
+                if let Some(bd) = prompt_ids.iter().position(|&t| t == TOK_MESSAGE_USER) {
+                    if bd > reuse_len && bd >= 16 {
+                        points.push(bd);
                     }
-                    _ => segs.push((reuse_len, prompt_ids.len())),
                 }
-                for (a, b) in segs {
+                if end >= 2 && end - 1 > reuse_len {
+                    points.push(end - 1);
+                }
+                points.sort_unstable();
+                points.dedup();
+                let mut cuts = vec![reuse_len];
+                cuts.extend(points.iter().copied());
+                cuts.push(end);
+                let mut pf_err = None;
+                for w in cuts.windows(2) {
+                    let (a, b) = (w[0], w[1]);
                     if a >= b {
                         continue;
                     }
-                    if Some(a) == boundary && !pc.has_snapshot_at(a) {
-                        let mut slot = pc.take_payload();
+                    if cache_prompt && points.contains(&a) && !pc.has_snapshot_of(&prompt_ids[..a]) {
+                        let mut slot = pc.take_payload(a);
                         match engine.snapshot_state(a, &mut slot) {
                             Ok(()) => pc.insert(a, slot.unwrap()),
                             Err(e) => eprintln!("[prefix-cache] snapshot at {a} failed: {e}"),
                         }
                     }
-                    let is_last = b == prompt_ids.len();
+                    let is_last = b == end;
                     if let Err(e) = engine.prefill(&prompt_ids[a..b], a, is_last) {
                         pf_err = Some(format!("prefill error at pos {a}..{b}: {e}"));
                         break;
@@ -410,14 +426,6 @@ fn engine_worker_loop(
                     pc.invalidate();
                     let _ = event_tx.send(StreamEvent::Error(err));
                     continue;
-                }
-                let end = prompt_ids.len();
-                if !pc.has_snapshot_at(end) {
-                    let mut slot = pc.take_payload();
-                    match engine.snapshot_state(end, &mut slot) {
-                        Ok(()) => pc.insert(end, slot.unwrap()),
-                        Err(e) => eprintln!("[prefix-cache] snapshot at {end} failed: {e}"),
-                    }
                 }
                 let pf_secs = t_pf.elapsed().as_secs_f64();
                 let new_pf_toks = prompt_ids.len() - reuse_len;
@@ -762,6 +770,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     max_tokens,
                     sampling,
                     stop_strings,
+                    cache_prompt: req.cache_prompt.unwrap_or(true),
                     event_tx: ev_tx,
                 })
                 .is_err()
@@ -988,6 +997,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     max_tokens,
                     sampling,
                     stop_strings,
+                    cache_prompt: req.cache_prompt.unwrap_or(true),
                     event_tx: ev_tx,
                 })
                 .is_err()

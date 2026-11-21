@@ -72,6 +72,13 @@ pub struct SeqSnapshot {
     host: PinnedBuf,
 }
 
+impl SeqSnapshot {
+    /// Pinned host bytes this snapshot holds.
+    pub fn host_bytes(&self) -> usize {
+        self.host.size_bytes
+    }
+}
+
 /// Per-logical-layer FP8 KV cache + 4-channel causal short-convolution state (`k = 4`, history `3`).
 pub(crate) struct LogicalLayerState {
     pub(crate) _is_local: bool,
@@ -351,22 +358,48 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         v
     }
 
-    /// Bytes one `SeqSnapshot` occupies in pinned host RAM.
+    /// Per head, per global layer: `(tensor, bytes per position)` regions of the global KV.
+    fn global_kv_regions(&self) -> Vec<(DeviceBuf, usize, usize)> {
+        // (buffer, per-head stride in bytes, bytes per position)
+        let hd = self.cfg.head_dim;
+        let mut v = Vec::new();
+        for st in &self.layer_states {
+            if !st._is_local {
+                v.push((st.k_cache, st.max_seq * hd, hd));
+                v.push((st.k_scales, st.max_seq * 4, 4));
+                v.push((st.v_cache, st.max_seq * hd, hd));
+                v.push((st.v_scales, st.max_seq * 4, 4));
+            }
+        }
+        v
+    }
+
+    /// Bytes of the fixed part of a `SeqSnapshot` (local KV rings + short-conv histories).
     pub fn snapshot_bytes(&self) -> usize {
         self.snapshot_regions().iter().map(|b| b.size_bytes).sum()
     }
 
-    /// Captures the rewindable state after `pos` tokens into `snap` (allocating its pinned buffer
-    /// on first use). Stream-ordered on the compute stream: no CPU stall.
+    /// Bytes of a `SeqSnapshot` of `pos` tokens (fixed part + the global KV of the prefix).
+    pub fn snapshot_bytes_at(&self, pos: usize) -> usize {
+        let heads = self.cfg.num_key_value_heads;
+        self.snapshot_bytes() + self.global_kv_regions().iter().map(|r| heads * pos * r.2).sum::<usize>()
+    }
+
+    /// Captures the state after `pos` tokens into `snap` (allocating or growing its pinned buffer):
+    /// local KV rings, short-conv histories and the global KV of positions `< pos`, so the
+    /// snapshot can be restored after other sequences overwrote the device KV.
+    /// Stream-ordered on the compute stream: no CPU stall.
     pub fn snapshot_state(&mut self, pos: usize, snap: &mut Option<SeqSnapshot>) -> Result<()> {
         let s = self.tide.compute_stream;
-        let total = self.snapshot_bytes();
+        let total = self.snapshot_bytes_at(pos);
         if snap.as_ref().map_or(true, |x| x.host.size_bytes < total) {
             if let Some(old) = snap.take() {
                 self.backend.sync_stream(s)?;
                 self.backend.free_pinned(old.host)?;
             }
-            *snap = Some(SeqSnapshot { pos, host: self.backend.alloc_pinned(total)? });
+            // A little headroom so a recycled buffer fits the next, slightly longer prefix.
+            let alloc = total + total / 8;
+            *snap = Some(SeqSnapshot { pos, host: self.backend.alloc_pinned(alloc)? });
         }
         let sn = snap.as_mut().unwrap();
         sn.pos = pos;
@@ -375,17 +408,42 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.backend.memcpy_d2h_async(sn.host, off, b, 0, b.size_bytes, s)?;
             off += b.size_bytes;
         }
+        let heads = self.cfg.num_key_value_heads;
+        for (buf, stride, per_pos) in self.global_kv_regions() {
+            let len = pos * per_pos;
+            if len == 0 {
+                continue;
+            }
+            for hh in 0..heads {
+                self.backend.memcpy_d2h_async(sn.host, off, buf.slice(hh * stride, len), 0, len, s)?;
+                off += len;
+            }
+        }
         Ok(())
     }
 
     /// Restores a snapshot taken by `snapshot_state`; the next token to process is `snap.pos`.
-    /// Valid only if the global KV for positions `< snap.pos` still holds the same tokens.
-    pub fn restore_state(&mut self, snap: &SeqSnapshot) -> Result<()> {
+    /// With `global = false` the device global KV is assumed to still hold this prefix (the live
+    /// sequence starts with it) and is not copied back.
+    pub fn restore_state(&mut self, snap: &SeqSnapshot, global: bool) -> Result<()> {
         let s = self.tide.compute_stream;
         let mut off = 0usize;
         for b in self.snapshot_regions() {
             self.backend.memcpy_h2d_async(b, 0, snap.host, off, b.size_bytes, s)?;
             off += b.size_bytes;
+        }
+        if global {
+            let heads = self.cfg.num_key_value_heads;
+            for (buf, stride, per_pos) in self.global_kv_regions() {
+                let len = snap.pos * per_pos;
+                if len == 0 {
+                    continue;
+                }
+                for hh in 0..heads {
+                    self.backend.memcpy_h2d_async(buf.slice(hh * stride, len), 0, snap.host, off, len, s)?;
+                    off += len;
+                }
+            }
         }
         Ok(())
     }

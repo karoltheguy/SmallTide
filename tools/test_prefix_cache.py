@@ -18,9 +18,9 @@ SYSTEM = ("You are a concise assistant for a geography quiz show. Answer in one 
           "never add trivia, never ask follow-up questions, and always name the country.")
 
 
-def chat(port, messages, max_tokens=160, effort=0):
+def chat(port, messages, max_tokens=160, effort=0, cache=True):
     body = {"messages": messages, "max_tokens": max_tokens, "temperature": 0,
-            "reasoning_effort": effort}
+            "reasoning_effort": effort, "cache_prompt": cache}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     t0 = time.time()
@@ -59,16 +59,22 @@ def main():
     plan.append(("q3 (multi-turn, reasoning dropped -> prompt-end restore)", q3, f3, u3, t3))
     q4 = q3 + [{"role": "assistant", "content": c3},
                {"role": "user", "content": "And of Brazil?"}]
+    # A chat UI's side request (title generation) between turns: another sequence runs in between.
+    chat(a.port, [{"role": "user", "content": "Write a 3-word title for a chat about world capitals."}], max_tokens=40)
     c4, f4, u4, t4 = chat(a.port, q4)
-    plan.append(("q4 (multi-turn again)", q4, f4, u4, t4))
+    plan.append(("q4 (multi-turn after an unrelated side request -> cross-sequence restore)", q4, f4, u4, t4))
     c5, f5, u5, t5 = chat(a.port, q4)
     plan.append(("q5 (identical repeat -> rewind)", q4, f5, u5, t5))
     print("prefix cache after warm sequence:", json.dumps(stats(a.port)))
 
     ok = True
+    # Every request after the cold start must have reused something.
+    for name, _, _, usage, _ in plan[1:]:
+        if usage["prompt_tokens_details"]["cached_tokens"] == 0:
+            ok = False
+            print(f"BAD {name}: no prefix reuse")
     for name, msgs, warm, usage, dt in plan:
-        chat(a.port, [{"role": "user", "content": "Say hi."}], max_tokens=4)  # evict: nothing shared
-        _, cold, cu, cdt = chat(a.port, msgs)
+        _, cold, cu, cdt = chat(a.port, msgs, cache=False)
         same = warm == cold
         ok &= same
         print(f"{'OK ' if same else 'BAD'} {name}: cached={usage['prompt_tokens_details']['cached_tokens']}"

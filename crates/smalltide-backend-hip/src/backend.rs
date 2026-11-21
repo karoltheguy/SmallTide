@@ -9,7 +9,7 @@ use crate::ffi::{
     HIP_MEMCPY_DEVICE_TO_DEVICE, HIP_MEMCPY_DEVICE_TO_HOST,
     HIP_MEMCPY_HOST_TO_DEVICE, HIP_STREAM_CAPTURE_MODE_GLOBAL, HIP_STREAM_NON_BLOCKING,
 };
-use smalltide_core::backend::{FlashDecodeParams, GroupedMoeParams, MoeDispatchParams, PrefillAttnParams};
+use smalltide_core::backend::{FlashDecodeParams, GemvSegment, GroupedMoeParams, MoeDispatchParams, PrefillAttnParams};
 use smalltide_core::{
     ComputeBackend, DType, DeviceBuf, DeviceInfo, Event, Graph, PinnedBuf, QueueKind, Result,
     SmallTideError, Stream,
@@ -1726,6 +1726,50 @@ impl ComputeBackend for HipBackend {
         let (mut k, mut h) = (top_k as u32, hidden as u32);
         let mut args = [p(&mut a), p(&mut bt), p(&mut c), p(&mut d), p(&mut e), p(&mut k), p(&mut f), p(&mut g), p(&mut r), p(&mut h)];
         self.launch(self.kernels.moe_post_decode, (h.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(moe_post_decode)")
+    }
+
+    fn gemv_multi(&self, segs: &[GemvSegment], stream: Stream) -> Result<()> {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SegC {
+            w: *const c_void,
+            scale: *const c_void,
+            x: *const c_void,
+            y: *mut c_void,
+            n_rows: u32,
+            k_cols: u32,
+            is_f32: u32,
+            row_start: u32,
+        }
+        #[repr(C)]
+        struct ArgsC {
+            seg: [SegC; 8],
+            n_seg: u32,
+            total_rows: u32,
+        }
+        let empty = SegC { w: ptr::null(), scale: ptr::null(), x: ptr::null(), y: ptr::null_mut(), n_rows: 0, k_cols: 0, is_f32: 0, row_start: u32::MAX };
+        for chunk in segs.chunks(8) {
+            let mut a = ArgsC { seg: [empty; 8], n_seg: chunk.len() as u32, total_rows: 0 };
+            for (i, sg) in chunk.iter().enumerate() {
+                if sg.k_cols % 16 != 0 {
+                    return Err(SmallTideError::Backend { backend: "hip", message: format!("gemv_multi: k_cols {} not a multiple of 16", sg.k_cols) });
+                }
+                a.seg[i] = SegC {
+                    w: self.dev_ptr(sg.w)? as *const c_void,
+                    scale: match sg.row_scales { Some(r) => self.dev_ptr(r)? as *const c_void, None => ptr::null() },
+                    x: self.dev_ptr(sg.x)? as *const c_void,
+                    y: self.dev_ptr(sg.y)?,
+                    n_rows: sg.n_rows as u32,
+                    k_cols: sg.k_cols as u32,
+                    is_f32: sg.row_scales.is_none() as u32,
+                    row_start: a.total_rows,
+                };
+                a.total_rows += sg.n_rows as u32;
+            }
+            let mut args = [p(&mut a)];
+            self.launch(self.kernels.gemv_multi, (a.total_rows.div_ceil(4), 1, 1), 128, &mut args, stream, "launch(gemv_multi)")?;
+        }
+        Ok(())
     }
 
     fn moe_reduce_rows(&self, out: DeviceBuf, tmp: DeviceBuf, hidden: usize, rows: usize, stream: Stream) -> Result<()> {

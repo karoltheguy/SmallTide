@@ -298,3 +298,70 @@ extern "C" __global__ void smalltide_gemv_mxfp8_f32(
 #include "inkling2_ops.hip"
 #include "batched_ops.hip"
 #include "prefill_ops.hip"
+
+// ---------------------------------------------------------------------------
+// Multi-segment GEMV: up to 8 independent y_s = W_s . x_s in one launch (FP8 E4M3 row-scaled or
+// F32 weights per segment). One warp per output row; the warp finds its segment by row prefix.
+//    Grid: ceil(total_rows / 4), Block: 128
+// ---------------------------------------------------------------------------
+struct GemvSeg {
+    const uint8_t* w;
+    const float* scale; // FP8 row scales (unused for F32)
+    const float* x;
+    float* y;
+    uint32_t n_rows;
+    uint32_t k_cols;
+    uint32_t is_f32;
+    uint32_t row_start;
+};
+struct GemvMultiArgs {
+    GemvSeg seg[8];
+    uint32_t n_seg;
+    uint32_t total_rows;
+};
+
+extern "C" __global__ void smalltide_gemv_multi(GemvMultiArgs a) {
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t grow = blockIdx.x * 4u + warp;
+    if (grow >= a.total_rows) return;
+    uint32_t si = 0u;
+    #pragma unroll
+    for (uint32_t i = 1u; i < 8u; ++i) {
+        if (i < a.n_seg && grow >= a.seg[i].row_start) si = i;
+    }
+    const GemvSeg sg = a.seg[si];
+    uint32_t row = grow - sg.row_start;
+    const float4* xv = reinterpret_cast<const float4*>(sg.x);
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    if (sg.is_f32 != 0u) {
+        const float4* wv = reinterpret_cast<const float4*>(reinterpret_cast<const float*>(sg.w) + static_cast<size_t>(row) * sg.k_cols);
+        for (uint32_t i = lane; i < (sg.k_cols >> 2); i += 32u) {
+            float4 w4 = wv[i], x4 = xv[i];
+            a0 = fmaf(w4.x, x4.x, a0); a1 = fmaf(w4.y, x4.y, a1); a2 = fmaf(w4.z, x4.z, a2); a3 = fmaf(w4.w, x4.w, a3);
+        }
+        float s = wave32_sum((a0 + a1) + (a2 + a3));
+        if (lane == 0u) sg.y[row] = s;
+        return;
+    }
+    const uint4* w_vec = reinterpret_cast<const uint4*>(sg.w + static_cast<size_t>(row) * sg.k_cols);
+    uint32_t k16 = sg.k_cols >> 4;
+    auto dot16 = [&](uint4 w16, uint32_t c) {
+        uint32_t b4 = c << 2;
+        float4 x0 = xv[b4 + 0], x1 = xv[b4 + 1], x2 = xv[b4 + 2], x3 = xv[b4 + 3];
+        float4 d0 = decode_fp8x4(w16.x), d1 = decode_fp8x4(w16.y), d2 = decode_fp8x4(w16.z), d3 = decode_fp8x4(w16.w);
+        a0 = fmaf(d0.x, x0.x, a0); a0 = fmaf(d0.y, x0.y, a0); a0 = fmaf(d0.z, x0.z, a0); a0 = fmaf(d0.w, x0.w, a0);
+        a1 = fmaf(d1.x, x1.x, a1); a1 = fmaf(d1.y, x1.y, a1); a1 = fmaf(d1.z, x1.z, a1); a1 = fmaf(d1.w, x1.w, a1);
+        a2 = fmaf(d2.x, x2.x, a2); a2 = fmaf(d2.y, x2.y, a2); a2 = fmaf(d2.z, x2.z, a2); a2 = fmaf(d2.w, x2.w, a2);
+        a3 = fmaf(d3.x, x3.x, a3); a3 = fmaf(d3.y, x3.y, a3); a3 = fmaf(d3.z, x3.z, a3); a3 = fmaf(d3.w, x3.w, a3);
+    };
+    uint32_t c = lane;
+    for (; c + 32u < k16; c += 64u) {
+        uint4 wa = w_vec[c];
+        uint4 wb = w_vec[c + 32u];
+        dot16(wa, c);
+        dot16(wb, c + 32u);
+    }
+    if (c < k16) dot16(w_vec[c], c);
+    float s = wave32_sum((a0 + a1) + (a2 + a3));
+    if (lane == 0u) sg.y[row] = s * sg.scale[row];
+}

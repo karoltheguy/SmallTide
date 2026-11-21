@@ -10,7 +10,7 @@
 //!   for 100%-VRAM-resident layers (e.g., all 36 Loop Core layers on RX 9070 XT).
 
 use crate::weights::{DenseLayerGpu, Fp8MatrixGpu, Inkling2DenseGpu, LoopControllerGpu};
-use smalltide_core::backend::{FlashDecodeParams, MoeDispatchParams};
+use smalltide_core::backend::{FlashDecodeParams, GemvSegment, MoeDispatchParams};
 use smalltide_core::{
     ComputeBackend, DType, DeviceBuf, Inkling2Config, PhysicalLayerId, PinnedBuf, Result, Stream,
     TideTelemetry,
@@ -244,10 +244,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             in_qkv: alloc_f32(3 * h)?,
             ctrl_qkv: alloc_f32(3 * h)?,
             norm_qkv: alloc_f32(3 * h)?,
-            ctrl_prep: alloc_f32(2 * h)?,
-            ctrl_gate: alloc_f32(cfg.loop_gate_rank)?,
-            ctrl_gain: alloc_f32(h)?,
-            ctrl_forget: alloc_f32(h)?,
+            ctrl_prep: alloc_f32(4 * 2 * h)?,
+            ctrl_gate: alloc_f32(4 * cfg.loop_gate_rank)?,
+            ctrl_gain: alloc_f32(4 * h)?,
+            ctrl_forget: alloc_f32(4 * h)?,
             q: alloc_f32(q_dim)?,
             k_raw: alloc_f32(kv_dim)?,
             k: alloc_f32(kv_dim)?,
@@ -578,29 +578,35 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     }
 
     /// Exact rank-64 cross-pass controller (`inkling2.cpp:241-249`).
-    fn run_control(
-        &self,
-        out: DeviceBuf,
-        cur: DeviceBuf,
-        msg: DeviceBuf,
-        ctrl: &LoopControllerGpu,
-        s: Stream,
-    ) -> Result<()> {
+    fn seg(&self, m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf) -> GemvSegment {
+        GemvSegment { w: m.data, row_scales: Some(m.row_scales), x, y, n_rows: m.n_rows, k_cols: m.k_cols }
+    }
+
+    /// Rank-64 cross-pass controllers (`inkling2.cpp:241-249`) for up to 4 inputs at once:
+    /// `(out, cur, msg, controller)`. Down / gain+forget projections are batched launches.
+    fn run_controls(&self, items: &[(DeviceBuf, DeviceBuf, DeviceBuf, &LoopControllerGpu)], s: Stream) -> Result<()> {
         let h = self.cfg.hidden_size;
-        self.backend
-            .loop_control_prep_rows(self.scratch.ctrl_prep, cur, msg, h, self.cfg.rms_norm_eps, 1, s)?;
-        self.fp8_mm(self.scratch.ctrl_gate, self.scratch.ctrl_prep, &ctrl.down, s)?;
-        self.fp8_mm(self.scratch.ctrl_gain, self.scratch.ctrl_gate, &ctrl.gain, s)?;
-        self.fp8_mm(self.scratch.ctrl_forget, self.scratch.ctrl_gate, &ctrl.forget, s)?;
-        self.backend.loop_control_apply(
-            out,
-            cur,
-            msg,
-            self.scratch.ctrl_gain,
-            self.scratch.ctrl_forget,
-            h,
-            s,
-        )
+        let r = self.cfg.loop_gate_rank;
+        let sl = |buf: DeviceBuf, i: usize, n: usize| buf.slice(i * n * 4, n * 4);
+        for (i, (_, cur, msg, _)) in items.iter().enumerate() {
+            self.backend.loop_control_prep_rows(sl(self.scratch.ctrl_prep, i, 2 * h), *cur, *msg, h, self.cfg.rms_norm_eps, 1, s)?;
+        }
+        let downs: Vec<GemvSegment> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, _, c))| self.seg(&c.down, sl(self.scratch.ctrl_prep, i, 2 * h), sl(self.scratch.ctrl_gate, i, r)))
+            .collect();
+        self.backend.gemv_multi(&downs, s)?;
+        let mut gf = Vec::with_capacity(2 * items.len());
+        for (i, (_, _, _, c)) in items.iter().enumerate() {
+            gf.push(self.seg(&c.gain, sl(self.scratch.ctrl_gate, i, r), sl(self.scratch.ctrl_gain, i, h)));
+            gf.push(self.seg(&c.forget, sl(self.scratch.ctrl_gate, i, r), sl(self.scratch.ctrl_forget, i, h)));
+        }
+        self.backend.gemv_multi(&gf, s)?;
+        for (i, (out, cur, msg, _)) in items.iter().enumerate() {
+            self.backend.loop_control_apply(*out, *cur, *msg, sl(self.scratch.ctrl_gain, i, h), sl(self.scratch.ctrl_forget, i, h), h, s)?;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -699,9 +705,14 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let c0 = self.scratch.ctrl_qkv.slice(0, h_bytes);
             let c1 = self.scratch.ctrl_qkv.slice(h_bytes, h_bytes);
             let c2 = self.scratch.ctrl_qkv.slice(2 * h_bytes, h_bytes);
-            self.run_control(c0, in0, msgs.slice(0, h_bytes), &ctrls[0], s)?;
-            self.run_control(c1, in1, msgs.slice(h_bytes, h_bytes), &ctrls[1], s)?;
-            self.run_control(c2, in2, msgs.slice(2 * h_bytes, h_bytes), &ctrls[2], s)?;
+            self.run_controls(
+                &[
+                    (c0, in0, msgs.slice(0, h_bytes), &ctrls[0]),
+                    (c1, in1, msgs.slice(h_bytes, h_bytes), &ctrls[1]),
+                    (c2, in2, msgs.slice(2 * h_bytes, h_bytes), &ctrls[2]),
+                ],
+                s,
+            )?;
             (c0, c1, c2)
         } else {
             (in0, in1, in2)
@@ -742,10 +753,25 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.backend.seg_mark("qkvr_proj", s);
         let t_ap = self.prof_mark(s);
         let layer = &self.dense.layers[ip];
-        self.fp8_mm(self.scratch.q, nq, &layer.wq, s)?;
-        self.fp8_mm(self.scratch.k_raw, nk, &layer.wk, s)?;
-        self.fp8_mm(self.scratch.v_raw, nv, &layer.wv, s)?;
-        self.fp8_mm(self.scratch.r, nq, &layer.wr, s)?;
+        // One launch for every projection of the normed inputs: Q, K, V, R, the output gate
+        // (FP8) and the attention sinks / dynamic conv taps (F32).
+        let nh = self.cfg.num_attention_heads;
+        let taps = self.cfg.num_key_value_heads * self.cfg.sconv_kernel_size;
+        let mut segs = vec![
+            self.seg(&layer.wq, nq, self.scratch.q),
+            self.seg(&layer.wk, nk, self.scratch.k_raw),
+            self.seg(&layer.wv, nv, self.scratch.v_raw),
+            self.seg(&layer.wr, nq, self.scratch.r),
+            self.seg(&layer.gate_attn, nq, self.scratch.gate_out),
+            GemvSegment { w: layer.attn_sink, row_scales: None, x: nq, y: self.scratch.sinks, n_rows: nh, k_cols: h },
+        ];
+        if let Some(w) = layer.k_sconv_dyn_proj {
+            segs.push(GemvSegment { w, row_scales: None, x: nk, y: self.scratch.k_dyn, n_rows: taps, k_cols: h });
+        }
+        if let Some(w) = layer.v_sconv_dyn_proj {
+            segs.push(GemvSegment { w, row_scales: None, x: nv, y: self.scratch.v_dyn, n_rows: taps, k_cols: h });
+        }
+        self.backend.gemv_multi(&segs, s)?;
         let dt_ap = self.prof_end(t_ap, s);
         if self.profile_enabled { self.profile.attn_proj_ms += dt_ap; }
 
@@ -753,12 +779,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let t_sc = self.prof_mark(s);
         let layer = &self.dense.layers[ip];
         let st = &self.layer_states[il];
-        let k_dyn = if let Some(dyn_w) = layer.k_sconv_dyn_proj {
-            self.backend.gemv_f32(self.scratch.k_dyn, nk, dyn_w, 32, h, s)?;
-            Some(self.scratch.k_dyn)
-        } else {
-            None
-        };
+        let k_dyn = layer.k_sconv_dyn_proj.map(|_| self.scratch.k_dyn);
         self.backend.sconv_k4_decode(
             self.scratch.k,
             st.sconv_k,
@@ -769,12 +790,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.cfg.head_dim,
             s,
         )?;
-        let v_dyn = if let Some(dyn_w) = layer.v_sconv_dyn_proj {
-            self.backend.gemv_f32(self.scratch.v_dyn, nv, dyn_w, 32, h, s)?;
-            Some(self.scratch.v_dyn)
-        } else {
-            None
-        };
+        let v_dyn = layer.v_sconv_dyn_proj.map(|_| self.scratch.v_dyn);
         self.backend.sconv_k4_decode(
             self.scratch.v,
             st.sconv_v,
@@ -830,8 +846,6 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
 
         // 6. Attention Sinks + Relative Bias Table + FP8 KV Store + Split-K FlashDecoding
-        self.backend
-            .gemv_f32(self.scratch.sinks, nq, layer.attn_sink, self.cfg.num_attention_heads, h, s)?;
         self.backend.rel_table(
             self.scratch.rel_table,
             self.scratch.r,
@@ -899,7 +913,6 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let t_ao = self.prof_mark(s);
         let layer = &self.dense.layers[ip];
         let st = &self.layer_states[il];
-        self.fp8_mm(self.scratch.gate_out, nq, &layer.gate_attn, s)?;
         self.backend.gate_attn_sigmoid_mul(
             self.scratch.attn_out,
             self.scratch.attn_out,
@@ -947,13 +960,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         )?;
         let moe_in_final = if let Some(msgs) = messages {
             let ctrls = layer.controllers.as_ref().unwrap();
-            self.run_control(
-                self.scratch.moe_ctrl,
-                self.scratch.moe_in,
-                msgs.slice(3 * h_bytes, h_bytes),
-                &ctrls[3],
-                s,
-            )?;
+            self.run_controls(&[(self.scratch.moe_ctrl, self.scratch.moe_in, msgs.slice(3 * h_bytes, h_bytes), &ctrls[3])], s)?;
             self.scratch.moe_ctrl
         } else {
             self.scratch.moe_in

@@ -123,6 +123,18 @@ pub struct GroupedMoeParams {
     pub pairs_offset_bytes: usize,
 }
 
+/// One output segment of `ComputeBackend::gemv_multi`: `y = W . x` with FP8 E4M3 row-scaled
+/// weights (`row_scales` = Some) or F32 weights (`row_scales` = None).
+#[derive(Debug, Clone, Copy)]
+pub struct GemvSegment {
+    pub w: DeviceBuf,
+    pub row_scales: Option<DeviceBuf>,
+    pub x: DeviceBuf,
+    pub y: DeviceBuf,
+    pub n_rows: usize,
+    pub k_cols: usize,
+}
+
 /// Minimal backend-agnostic compute & async-transfer abstraction.
 pub trait ComputeBackend: Send + Sync {
     fn device_info(&self) -> Result<DeviceInfo>;
@@ -553,6 +565,9 @@ pub trait ComputeBackend: Send + Sync {
     fn moe_decode_post(&self, out: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, topk_ids: DeviceBuf,
         topk_weights: DeviceBuf, top_k: usize, sconv: Option<(DeviceBuf, DeviceBuf, DeviceBuf)>,
         hidden: usize, stream: Stream) -> Result<()>;
+
+    /// Several independent GEMVs in as few launches as possible (8 segments per launch).
+    fn gemv_multi(&self, segs: &[GemvSegment], stream: Stream) -> Result<()>;
 
     /// Final fixed-order reduce of `tmp[M*8][H]` into `out[M][H]`.
     fn moe_reduce_rows(&self, out: DeviceBuf, tmp: DeviceBuf, hidden: usize, rows: usize, stream: Stream) -> Result<()>;

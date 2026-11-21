@@ -361,6 +361,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let backend = self.backend.clone();
         let b = &*backend;
 
+        b.seg_mark("pf: mix,ctrl,norm", s);
         b.vec_copy(pf.inp_sa, pf.cur, m * h, s)?;
         let blocks_view = (*nb > 0).then(|| pf.blocks.slice(0, *nb * hb));
 
@@ -412,6 +413,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             (n[0], n[1], n[2])
         };
         // 4. projections
+        b.seg_mark("pf: qkvr proj,conv,clip", s);
         self.mm_rows(pf.q, nq, &layer.wq, m, s)?;
         self.mm_rows(pf.k_raw, nk, &layer.wk, m, s)?;
         self.mm_rows(pf.v_raw, nv, &layer.wv, m, s)?;
@@ -441,6 +443,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         b.value_norm_no_gamma(pf.v, m * nkv, hd, eps, s)?;
         b.head_l2_clip_rows(pf.r, Some(layer.rel_l2_clip_scale), m * nqh, cfg.d_rel, nqh, cfg.rel_l2_clip_threshold, tau, s)?;
         // 6. sinks, relative bias, KV store, attention
+        b.seg_mark("pf: sinks,rel,kv,attention", s);
         b.gemm_f32_rows(pf.sinks, nq, layer.attn_sink, m, nqh, h, s)?;
         b.rel_table(pf.rel_table, pf.r, layer.rel_logits_proj, m * nqh, cfg.rel_extent, s)?;
         b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, s)?;
@@ -460,6 +463,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             s,
         )?;
         // 7. output gate, wo, post-attention conv
+        b.seg_mark("pf: gate,wo,conv,mix,router", s);
         self.mm_rows(pf.gate_out, nq, &layer.gate_attn, m, s)?;
         b.gate_attn_sigmoid_mul(pf.attn_out, pf.attn_out, pf.gate_out, m * q_dim, s)?;
         self.mm_rows(pf.o_raw, pf.attn_out, &layer.wo, m, s)?;
@@ -490,7 +494,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         b.router_topk8_rows(pf.route, pf.router_logits, Some(layer.router_bias), cfg.route_scale, m, 16, s)?;
 
         // 10. expert-grouped MoE (host plan from the routed ids)
+        b.seg_mark("pf: moe (sync,plan,kernels)", s);
         let ids = self.prefill_moe(ip, m)?;
+        b.seg_mark("pf: moe post", s);
 
         let pf = self.pf.as_ref().unwrap();
         let st = &self.layer_states[il];

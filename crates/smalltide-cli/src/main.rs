@@ -749,6 +749,11 @@ fn run_generate(args: &[String]) {
     println!("[Prompt] {} tokens", prompt_ids.len());
 
     // Prefill
+    let pf_seg = std::env::var_os("SMALLTIDE_SEGTIME_PREFILL").is_some();
+    if pf_seg {
+        backend.set_segment_timing(true).expect("segment timing");
+        let _ = backend.take_segment_times();
+    }
     let t_pf = Instant::now();
     if prefill_mode == "token" {
         for (idx, &tid) in prompt_ids.iter().enumerate() {
@@ -762,6 +767,15 @@ fn run_generate(args: &[String]) {
     }
     backend.sync_stream(engine.tide.compute_stream).expect("sync prefill");
     let pf_secs = t_pf.elapsed().as_secs_f64();
+    if pf_seg {
+        let st = backend.take_segment_times();
+        let total: f64 = st.iter().map(|k| k.2).sum();
+        println!("[GPU segments, prefill] total {total:.1} ms (wall {:.1} ms)", pf_secs * 1000.0);
+        for (name, cnt, ms) in st {
+            println!("  {:<32} {:>6}x  {:>9.1} ms  ({:>7.1} us avg)", name, cnt, ms, ms * 1000.0 / cnt.max(1) as f64);
+        }
+        backend.set_segment_timing(false).expect("segment timing off");
+    }
 
     // Mode 2: Prefill -> Decode Boundary Rebalance
     let t_reb = Instant::now();

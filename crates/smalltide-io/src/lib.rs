@@ -6,4 +6,5 @@ pub mod quant;
 pub mod safetensors;
 pub mod stide_pack;
 pub mod tokenizer;
+pub mod unicode_cats;
 pub mod win_direct_io;

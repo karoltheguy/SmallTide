@@ -61,6 +61,14 @@
     expert choice incl. skipped-expert mask, isolating arithmetic from near-tie router flips).
     Setup: `python -m venv refenv; pip install torch --index-url https://download.pytorch.org/whl/cpu;
     pip install safetensors numpy "transformers @ https://github.com/huggingface/transformers/archive/430050f6f71195b76004b5d61bbb446ec0508fb3.zip"`.
+* **R2b — Tokenizer now matches HF `tokenizers` exactly: DONE** (found while porting the chat template)
+  - Old pre-tokenizer split only on spaces/newlines and ignored `ignore_merges`: digits, whitespace
+    runs and code tokenized non-canonically (Rust source: 28,457 vs 15,538 reference tokens).
+  - New: hand-implemented o200k `Split` regex (same alternation/backtracking semantics) over a
+    generated Unicode general-category table (`tools/gen_unicode_cats.py` -> `unicode_cats.rs`),
+    id-based BPE merges, `ignore_merges`, `Utf8Stream` incremental decoding for streaming.
+  - `tools/test_tokenizer.py` (HF tokenizers 0.23.3): 20/20 adversarial cases + 59 repo files
+    (268K tokens) identical.
 * **R2 — Server prompt prefix cache: DONE**
   - `Inkling2Engine::{snapshot_state, restore_state}`: rewindable state = 40 local KV rings + scales
     and all 48x4 short-conv histories (86 MiB), copied stream-ordered to pinned host RAM. Global KV

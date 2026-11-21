@@ -54,6 +54,17 @@ fn main() {
             .expect("pack .stide");
             println!("Packed all 3,072 experts in {:.2}s!", t0.elapsed().as_secs_f64());
         }
+        Some("tokenize") => {
+            // Dev tool: `tokenize <tokenizer.json> <in.txt>` -> JSON token ids of the whole file.
+            let (Some(tj), Some(input)) = (args.get(2), args.get(3)) else {
+                eprintln!("Usage: smalltide-cli tokenize <tokenizer.json> <in.txt>");
+                std::process::exit(1);
+            };
+            let tok = BpeTokenizer::from_file(Path::new(tj)).expect("load tokenizer.json");
+            let text = std::fs::read_to_string(input).expect("read input");
+            let ids = tok.encode(&text);
+            println!("{}", serde_json::to_string(&ids).unwrap());
+        }
         Some("inspect") => {
             let Some(path) = args.get(2) else {
                 eprintln!("Usage: smalltide-cli inspect <path-to.safetensors> [substring-filter]");

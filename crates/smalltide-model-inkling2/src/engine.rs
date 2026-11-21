@@ -170,6 +170,9 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     route_log_is_prefill: bool,
     /// Logical layers whose routing the scheduler already saw this token (partial layers).
     layer_planned: Vec<bool>,
+    /// Partial layers dispatched without a host readback (rescue disabled): their Tide
+    /// bookkeeping (hit/miss, heat, async promotion queue) runs from the routing log afterwards.
+    layer_deferred: Vec<bool>,
     pub(crate) dump: Option<DumpState>,
     pub(crate) dump_token: (u32, usize),
     rng_state: u64,
@@ -303,6 +306,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             tide_step_pending: false,
             route_log_is_prefill: false,
             layer_planned: vec![false; num_logical],
+            layer_deferred: vec![false; num_logical],
             dump,
             dump_token: (0, 0),
             rng_state: 0x9E37_79B9_7F4A_7C15,
@@ -533,6 +537,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 ids[k] = w[k] as u16;
                 ws[k] = f32::from_bits(w[8 + k]);
                 tot += ws[k];
+            }
+            if self.layer_deferred[il] {
+                // Same bookkeeping as the synchronous path (rescue is disabled, so no transfers).
+                let _ = self.tide.scheduler.plan_layer_dispatch(phys, &ids, &ws);
+                continue;
             }
             if self.route_log_is_prefill {
                 self.tide.scheduler.record_prefill_routing(phys, &ids, &ws);
@@ -978,7 +987,15 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let fully_resident = self.tide.scheduler.is_layer_fully_resident_vram(phys_id);
         let mut rescue_ms_local = 0.0f64;
         let need_dump_routes = self.dump.is_some();
-        if fully_resident && !need_dump_routes {
+        // Rescue disabled: nothing would be copied in, so a partial layer needs no host readback
+        // either - the kernels skip unpublished experts and the bookkeeping is deferred.
+        let defer = !fully_resident
+            && !is_prefill
+            && !need_dump_routes
+            && matches!(self.tide.scheduler.tide_cfg.rescue_policy, smalltide_core::RescuePolicy::Disabled);
+        if defer {
+            self.layer_deferred[il] = true;
+        } else if fully_resident && !need_dump_routes {
             self.tide
                 .scheduler
                 .record_full_layer_hit(phys_id, self.cfg.num_experts_per_tok as u64);
@@ -1164,6 +1181,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let published = self.tide.poll_pending()?;
         self.tide.scheduler.telemetry.stage1_async_published += published as u64;
         self.layer_planned.iter_mut().for_each(|p| *p = false);
+        self.layer_deferred.iter_mut().for_each(|p| *p = false);
         self.dump_token = (token_id, pos);
 
         self.backend.seg_mark("token_start(embed,tables)", s);

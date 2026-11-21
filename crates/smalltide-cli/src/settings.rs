@@ -80,6 +80,16 @@ pub enum Tri {
     Off,
 }
 
+/// How the auto-sized device expert pools are bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolBudget {
+    /// Free device memory as reported by HIP (on Windows this includes memory the driver
+    /// silently backs with system RAM).
+    Device,
+    /// The OS resident budget (DXGI): only memory that really stays on the card.
+    Resident,
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub model_dir: PathBuf,
@@ -88,6 +98,7 @@ pub struct Settings {
     pub nvfp4_slots: Option<usize>,
     pub mxfp8_slots: Option<usize>,
     pub mxfp8_host: Tri,
+    pub pool_budget: PoolBudget,
     pub ram_gb: f64,
     pub batched_prefill: bool,
     pub profile: bool,
@@ -110,6 +121,11 @@ impl Settings {
             "off" | "0" | "false" => Tri::Off,
             other => bad("SMALLTIDE_MXFP8_HOST", other, "auto | on | off"),
         };
+        let pool_budget = match var("SMALLTIDE_POOL_BUDGET").as_deref().unwrap_or("device") {
+            "device" => PoolBudget::Device,
+            "resident" => PoolBudget::Resident,
+            other => bad("SMALLTIDE_POOL_BUDGET", other, "device | resident"),
+        };
         let batched_prefill = match var("SMALLTIDE_PREFILL").as_deref().unwrap_or("batched") {
             "batched" => true,
             "token" => false,
@@ -122,6 +138,7 @@ impl Settings {
             nvfp4_slots: parse_auto("SMALLTIDE_NVFP4_SLOTS"),
             mxfp8_slots: parse_auto("SMALLTIDE_MXFP8_SLOTS"),
             mxfp8_host,
+            pool_budget,
             ram_gb: parse("SMALLTIDE_RAM_GB", 10.0, "GiB"),
             batched_prefill,
             profile: parse::<u8>("SMALLTIDE_PROFILE", 0, "0 or 1") != 0,
@@ -162,9 +179,22 @@ pub fn build_engine(s: &Settings) -> Loaded {
         + 64 * 1024 * 1024;
     let headroom_bytes = 900 * 1024 * 1024usize;
     let scratch_ring_bytes = 8 * (nvfp4_slab + mxfp8_slab);
-    let avail = info_after_dense
+    let mut avail = info_after_dense
         .free_vram_bytes
         .saturating_sub(est_kv_bytes + headroom_bytes + scratch_ring_bytes);
+    let resident_fit = s.pool_budget == PoolBudget::Resident;
+    if resident_fit {
+        match backend.resident_vram_info() {
+            Some((usage, resident)) => {
+                // Engine buffers (~KV + scratch + 256 MiB margin) still have to fit after this.
+                let margin = 256usize << 20;
+                let left = (resident as usize).saturating_sub(usage as usize + est_kv_bytes + scratch_ring_bytes + margin);
+                avail = avail.min(left);
+                println!("[pools] resident budget: {:.2} GiB left for expert pools", avail as f64 / (1u64 << 30) as f64);
+            }
+            None => eprintln!("[pools] SMALLTIDE_POOL_BUDGET=resident but no DXGI budget is available; using device free memory"),
+        }
+    }
     let total_nvfp4 = cfg.mxfp8_start_layer * cfg.n_routed_experts;
     let total_mxfp8 = (cfg.num_physical_layers - cfg.mxfp8_start_layer) * cfg.n_routed_experts;
     let (nvfp4_slots, mxfp8_slots) = match (s.nvfp4_slots, s.mxfp8_slots) {
@@ -176,6 +206,13 @@ pub fn build_engine(s: &Settings) -> Loaded {
         (None, Some(m8)) => {
             let m8 = m8.min(total_mxfp8);
             ((avail.saturating_sub(m8 * mxfp8_slab) / nvfp4_slab).min(total_nvfp4).max(1536), m8)
+        }
+        (None, None) if resident_fit => {
+            // Only what really stays on the card: NVFP4 first (loop core is placed first), then
+            // MXFP8 with what is left. No floors - missing experts are Tide misses.
+            let n4 = (avail / nvfp4_slab).min(total_nvfp4).max(1);
+            let m8 = (avail.saturating_sub(n4 * nvfp4_slab) / mxfp8_slab).min(total_mxfp8).max(1);
+            (n4, m8)
         }
         (None, None) => {
             // Loop core first (1536), then the rest of NVFP4, then MXFP8 with what is left.
@@ -189,7 +226,7 @@ pub fn build_engine(s: &Settings) -> Loaded {
     let mxfp8_host_mapped = match s.mxfp8_host {
         Tri::On => true,
         Tri::Off => false,
-        Tri::Auto => mxfp8_slots < total_mxfp8,
+        Tri::Auto => mxfp8_slots < total_mxfp8 && !resident_fit,
     };
     let mxfp8_slots = if mxfp8_host_mapped { total_mxfp8 } else { mxfp8_slots };
 

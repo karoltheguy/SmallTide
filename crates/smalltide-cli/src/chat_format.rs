@@ -249,8 +249,19 @@ fn dump_into(out: &mut String, v: &OJson, compact: bool, sort_keys: bool) {
 }
 
 pub fn parse_json(s: &str) -> Result<OJson, String> {
+    parse_json_with(s, false)
+}
+
+/// Lenient JSON parser used only as a fallback for model-emitted tool calls after strict
+/// `parse_json` fails. Tolerates non-standard string escapes (`\'`, `\s`, `\U`, non-hex `\u`),
+/// trailing commas, and unescaped inner quotes (e.g. HTML attributes inside large payloads).
+pub fn parse_json_lenient(s: &str) -> Result<OJson, String> {
+    parse_json_with(s, true)
+}
+
+fn parse_json_with(s: &str, lenient: bool) -> Result<OJson, String> {
     let b = s.as_bytes();
-    let mut p = Parser { b, i: 0 };
+    let mut p = Parser { b, i: 0, lenient };
     p.ws();
     let v = p.value(0)?;
     p.ws();
@@ -263,6 +274,7 @@ pub fn parse_json(s: &str) -> Result<OJson, String> {
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
+    lenient: bool,
 }
 
 impl Parser<'_> {
@@ -305,7 +317,16 @@ impl Parser<'_> {
                     v.push(self.value(depth + 1)?);
                     self.ws();
                     match self.b.get(self.i) {
-                        Some(b',') => self.i += 1,
+                        Some(b',') => {
+                            self.i += 1;
+                            if self.lenient {
+                                self.ws();
+                                if self.b.get(self.i) == Some(&b']') {
+                                    self.i += 1;
+                                    return Ok(OJson::Arr(v));
+                                }
+                            }
+                        }
                         Some(b']') => {
                             self.i += 1;
                             return Ok(OJson::Arr(v));
@@ -342,7 +363,16 @@ impl Parser<'_> {
                     }
                     self.ws();
                     match self.b.get(self.i) {
-                        Some(b',') => self.i += 1,
+                        Some(b',') => {
+                            self.i += 1;
+                            if self.lenient {
+                                self.ws();
+                                if self.b.get(self.i) == Some(&b'}') {
+                                    self.i += 1;
+                                    return Ok(OJson::Obj(kv));
+                                }
+                            }
+                        }
                         Some(b'}') => {
                             self.i += 1;
                             return Ok(OJson::Obj(kv));
@@ -401,6 +431,21 @@ impl Parser<'_> {
             match self.b.get(self.i) {
                 None => return self.err("unterminated string"),
                 Some(b'"') => {
+                    if self.lenient {
+                        let mut k = self.i + 1;
+                        while k < self.b.len() && matches!(self.b[k], b' ' | b'\t' | b'\n' | b'\r') {
+                            k += 1;
+                        }
+                        let looks_closing = matches!(
+                            self.b.get(k),
+                            None | Some(b',') | Some(b'}') | Some(b']') | Some(b':')
+                        );
+                        if !looks_closing {
+                            out.push('"');
+                            self.i += 1;
+                            continue;
+                        }
+                    }
                     self.i += 1;
                     return Ok(out);
                 }
@@ -417,22 +462,33 @@ impl Parser<'_> {
                         b'n' => out.push('\n'),
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
-                        b'u' => {
-                            let hi = self.hex4()?;
-                            let cp = if (0xD800..0xDC00).contains(&hi)
-                                && self.b[self.i..].starts_with(b"\\u")
-                            {
-                                self.i += 2;
-                                let lo = self.hex4()?;
-                                if (0xDC00..0xE000).contains(&lo) {
-                                    0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                        b'u' => match self.hex4() {
+                            Ok(hi) => {
+                                let cp = if (0xD800..0xDC00).contains(&hi)
+                                    && self.b[self.i..].starts_with(b"\\u")
+                                {
+                                    self.i += 2;
+                                    let lo = self.hex4()?;
+                                    if (0xDC00..0xE000).contains(&lo) {
+                                        0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                                    } else {
+                                        0xFFFD
+                                    }
                                 } else {
-                                    0xFFFD
-                                }
-                            } else {
-                                hi
-                            };
-                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                                    hi
+                                };
+                                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                            }
+                            Err(_) if self.lenient => {
+                                out.push('\\');
+                                out.push('u');
+                            }
+                            Err(err) => return Err(err),
+                        },
+                        b'\'' if self.lenient => out.push('\''),
+                        _ if self.lenient => {
+                            out.push('\\');
+                            self.i -= 1;
                         }
                         _ => return self.err("bad escape"),
                     }
@@ -781,19 +837,56 @@ impl AnswerParser {
         let raw = String::from_utf8_lossy(&self.tool_buf).into_owned();
         let header = String::from_utf8_lossy(&self.header).into_owned();
         self.tool_buf.clear();
-        match parse_json(&raw) {
-            Ok(v) => {
+        let parsed = match parse_json(&raw) {
+            Ok(v) => Ok(v),
+            Err(strict_err) => match parse_json_lenient(&raw) {
+                Ok(v) => {
+                    eprintln!(
+                        "[tool-parse] lenient JSON fallback recovered call (header={header:?}, strict error: {strict_err})"
+                    );
+                    Ok(v)
+                }
+                Err(lenient_err) => {
+                    let head: String = raw.chars().take(120).collect();
+                    let tail: String = raw
+                        .chars()
+                        .rev()
+                        .take(120)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    eprintln!(
+                        "[tool-parse] failed (header={header:?}, len={}): strict={strict_err}; lenient={lenient_err} | head={head:?} | tail={tail:?}",
+                        raw.len()
+                    );
+                    Err(())
+                }
+            },
+        };
+        match parsed {
+            Ok(v)
+                if matches!(&v, OJson::Obj(_))
+                    && (v.get("args").is_some()
+                        || v.get("arguments").is_some()
+                        || v.get("name").is_some()
+                        || !header.is_empty()) =>
+            {
                 let name = v
                     .get("name")
                     .and_then(OJson::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| header.clone());
-                let args = v.get("args").cloned().unwrap_or(OJson::Obj(Vec::new()));
+                let args = v
+                    .get("args")
+                    .or_else(|| v.get("arguments"))
+                    .cloned()
+                    .unwrap_or(OJson::Obj(Vec::new()));
                 self.tool_calls += 1;
                 out.push(AnswerEvent::ToolCall { name, arguments: py_dumps(&args, true, false) });
             }
             // Not a parsable call: surface the body as content instead of losing it.
-            Err(_) => out.push(AnswerEvent::Text(raw)),
+            _ => out.push(AnswerEvent::Text(raw)),
         }
     }
 
@@ -803,6 +896,9 @@ impl AnswerParser {
         if is_special {
             match id {
                 TOK_MESSAGE_MODEL => {
+                    if self.body == Body::ToolJson && !self.tool_buf.is_empty() {
+                        self.finish_tool(&mut out);
+                    }
                     self.flush_streams(&mut out);
                     self.body = Body::Header;
                     self.header.clear();
@@ -820,8 +916,18 @@ impl AnswerParser {
                     self.body = Body::Idle;
                 }
                 TOK_MESSAGE_USER | TOK_MESSAGE_SYSTEM | TOK_MESSAGE_TOOL => {
+                    if self.body == Body::ToolJson && !self.tool_buf.is_empty() {
+                        self.finish_tool(&mut out);
+                    }
                     self.flush_streams(&mut out);
                     out.push(AnswerEvent::EndOfAnswer);
+                }
+                // If a tool-name header was emitted before `<|content_text|>` (missing
+                // `<|content_invoke_tool_json|>`), buffer as a candidate tool call; non-JSON
+                // bodies still fall back cleanly to `AnswerEvent::Text`.
+                _ if id == TOK_CONTENT_TEXT && self.body == Body::Header && !self.header.is_empty() => {
+                    self.body = Body::ToolJson;
+                    self.tool_buf.clear();
                 }
                 // `<|content_text|>` and every other content kind: the body is content.
                 _ if id == TOK_CONTENT_TEXT || self.body == Body::Header => self.body = Body::Text,
@@ -957,6 +1063,64 @@ mod tests {
                 AnswerEvent::Thinking("plan".into()),
                 AnswerEvent::ToolCall { name: "get_weather".into(), arguments: r#"{"city":"Brasília"}"#.into() },
             ]
+        );
+    }
+
+    #[test]
+    fn parser_recovers_lenient_tool_call_json() {
+        // Strict parse_json still rejects bad escapes and trailing commas.
+        assert!(parse_json(r#"{"a":"it\'s"}"#).is_err());
+        assert!(parse_json(r#"{"a":"C:\Users\test"}"#).is_err());
+        assert!(parse_json(r#"{"a":1,}"#).is_err());
+
+        // Lenient tool-call recovery handles \' escapes, Windows paths (\U, \u non-hex),
+        // regex escapes (\s, \d), unescaped HTML attribute quotes, and trailing commas.
+        let mut p = AnswerParser::new();
+        let mut ev = Vec::new();
+        let payload = br#"{"name":"create_artifact","args":{"html":"<div class="hero">it\'s \s+\d+ C:\Users\proj\ufoo</div>","title":"Diagrams",}}"#;
+        let toks: Vec<(u32, &[u8], bool)> = vec![
+            (TOK_MESSAGE_MODEL, b"", true),
+            (1, b"create_artifact", false),
+            (TOK_INVOKE_TOOL_JSON, b"", true),
+            (2, payload, false),
+            (TOK_END_MESSAGE, b"", true),
+        ];
+        for (id, b, sp) in toks {
+            ev.extend(p.feed(id, b, sp));
+        }
+        ev.extend(p.finish());
+        assert_eq!(ev.len(), 1);
+        match &ev[0] {
+            AnswerEvent::ToolCall { name, arguments } => {
+                assert_eq!(name, "create_artifact");
+                let parsed = parse_json(arguments).expect("re-serialized arguments must be valid strict JSON");
+                assert_eq!(parsed.get("title").and_then(OJson::as_str), Some("Diagrams"));
+                assert_eq!(
+                    parsed.get("html").and_then(OJson::as_str),
+                    Some(r#"<div class="hero">it's \s+\d+ C:\Users\proj\ufoo</div>"#)
+                );
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+
+        // Also recovers when `<|content_text|>` follows a non-empty tool-name header.
+        let mut p2 = AnswerParser::new();
+        let mut ev2 = Vec::new();
+        for (id, b, sp) in [
+            (TOK_MESSAGE_MODEL, &b""[..], true),
+            (1, &b"run_cmd"[..], false),
+            (TOK_CONTENT_TEXT, &b""[..], true),
+            (2, &br#"{"name":"run_cmd","args":{"cmd":"echo \'hi\'"}}"#[..], false),
+            (TOK_END_MESSAGE, &b""[..], true),
+        ] {
+            ev2.extend(p2.feed(id, b, sp));
+        }
+        assert_eq!(
+            ev2,
+            vec![AnswerEvent::ToolCall {
+                name: "run_cmd".into(),
+                arguments: r#"{"cmd":"echo 'hi'"}"#.into(),
+            }]
         );
     }
 

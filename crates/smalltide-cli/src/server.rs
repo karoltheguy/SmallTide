@@ -69,9 +69,16 @@ enum StreamEvent {
         decode_secs: f64,
         vram_hit_rate: f64,
     },
+    /// Sent once the prompt passes validation (non-empty, fits in `max_ctx`) before prefill starts,
+    /// so streaming callers can return HTTP 400 on oversized prompts instead of 200 OK SSE.
+    Admitted,
     /// Periodic liveness probe sent while output is buffered (e.g. inside an unterminated tool call)
     /// so disconnected clients abort generation immediately instead of running to `max_tokens`.
     Heartbeat,
+    BadRequest {
+        code: &'static str,
+        message: String,
+    },
     Error(String),
 }
 
@@ -659,13 +666,20 @@ fn engine_worker_loop(
                 };
                 let prompt_ids = tok.encode(&prompt_text);
                 if prompt_ids.is_empty() {
-                    let _ = event_tx.send(StreamEvent::Error("empty prompt".into()));
+                    let _ = event_tx.send(StreamEvent::BadRequest {
+                        code: "invalid_prompt",
+                        message: "empty prompt".into(),
+                    });
                 } else if prompt_ids.len() >= max_lane_ctx {
-                    let _ = event_tx.send(StreamEvent::Error(format!(
-                        "prompt length {} exceeds max_ctx {}",
-                        prompt_ids.len(),
-                        max_lane_ctx
-                    )));
+                    eprintln!("[reject] prompt length {} exceeds max_ctx {}", prompt_ids.len(), max_lane_ctx);
+                    let _ = event_tx.send(StreamEvent::BadRequest {
+                        code: "context_length_exceeded",
+                        message: format!(
+                            "This model's maximum context length is {} tokens. However, your messages resulted in {} tokens.",
+                            max_lane_ctx,
+                            prompt_ids.len()
+                        ),
+                    });
                 } else {
                     let fits: Vec<usize> = free.iter().copied().filter(|&l| engine.lane_max_seq(l) > prompt_ids.len()).collect();
                     if fits.is_empty() {
@@ -708,6 +722,7 @@ fn engine_worker_loop(
                                 }),
                                 PrefixPlan::Restore { snap_idx, .. } => pc.snapshot(*snap_idx).drafter_valid,
                             };
+                        let _ = event_tx.send(StreamEvent::Admitted);
                         if let Some(req) = admit(
                             &mut engine, &tok, &mut pc, lane, plan, prompt_ids, is_chat, forced_tool,
                             single_tool_call, max_tokens, sampling, stop_strings, cache_prompt,
@@ -1360,26 +1375,53 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
             }
 
             if is_stream {
-                if write_sse_headers(&mut stream).is_err() {
-                    return;
-                }
-                let role_chunk = json!({
-                    "id": req_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": SERVED_MODEL_NAME,
-                    "choices": [{
-                        "index": 0,
-                        "delta": { "role": "assistant" },
-                        "finish_reason": Value::Null
-                    }]
-                });
-                let _ = write!(stream, "data: {}\n\n", role_chunk);
-                let _ = stream.flush();
+                let mut sse_started = false;
+                let start_sse = |stream: &mut TcpStream, started: &mut bool| -> bool {
+                    if *started {
+                        return true;
+                    }
+                    if write_sse_headers(stream).is_err() {
+                        return false;
+                    }
+                    let role_chunk = json!({
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": SERVED_MODEL_NAME,
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "role": "assistant" },
+                            "finish_reason": Value::Null
+                        }]
+                    });
+                    if write!(stream, "data: {}\n\n", role_chunk).is_err() || stream.flush().is_err() {
+                        return false;
+                    }
+                    *started = true;
+                    true
+                };
 
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
+                        StreamEvent::Admitted => {
+                            if !start_sse(&mut stream, &mut sse_started) {
+                                return;
+                            }
+                        }
+                        StreamEvent::BadRequest { code, message } => {
+                            let body = json!({"error": {"message": message, "type": "invalid_request_error", "code": code}});
+                            if !sse_started {
+                                write_json_response(&mut stream, "400 Bad Request", &body);
+                            } else {
+                                let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", body);
+                                let _ = stream.flush();
+                            }
+                            return;
+                        }
                         StreamEvent::Delta { channel, text } => {
+                            if !start_sse(&mut stream, &mut sse_started) {
+                                return;
+                            }
                             let delta = match channel {
                                 OutputChannel::Thinking => json!({ "reasoning_content": text }),
                                 OutputChannel::Text => json!({ "content": text }),
@@ -1400,6 +1442,9 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             }
                         }
                         StreamEvent::ToolCall { index, id, name, arguments } => {
+                            if !start_sse(&mut stream, &mut sse_started) {
+                                return;
+                            }
                             let chunk = json!({
                                 "id": req_id,
                                 "object": "chat.completion.chunk",
@@ -1427,6 +1472,9 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             cached_tokens,
                             ..
                         } => {
+                            if !start_sse(&mut stream, &mut sse_started) {
+                                return;
+                            }
                             let end_chunk = json!({
                                 "id": req_id,
                                 "object": "chat.completion.chunk",
@@ -1449,13 +1497,18 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             break;
                         }
                         StreamEvent::Heartbeat => {
-                            if write!(stream, ": keepalive\n\n").is_err() || stream.flush().is_err() {
+                            if sse_started && (write!(stream, ": keepalive\n\n").is_err() || stream.flush().is_err()) {
                                 return;
                             }
                         }
                         StreamEvent::Error(msg) => {
-                            let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", json!({"error": msg}));
-                            let _ = stream.flush();
+                            let body = json!({"error": {"message": msg, "type": "server_error"}});
+                            if !sse_started {
+                                write_json_response(&mut stream, "500 Internal Server Error", &body);
+                            } else {
+                                let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", body);
+                                let _ = stream.flush();
+                            }
                             break;
                         }
                     }
@@ -1469,6 +1522,15 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 let mut cached = 0usize;
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
+                        StreamEvent::Admitted => {}
+                        StreamEvent::BadRequest { code, message } => {
+                            write_json_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                &json!({"error": {"message": message, "type": "invalid_request_error", "code": code}}),
+                            );
+                            return;
+                        }
                         StreamEvent::Heartbeat => {
                             if peer_disconnected(&stream) {
                                 return;
@@ -1502,7 +1564,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             break;
                         }
                         StreamEvent::Error(msg) => {
-                            write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": msg}}));
+                            write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": msg, "type": "server_error"}}));
                             return;
                         }
                     }
@@ -1597,13 +1659,39 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
             }
 
             if is_stream {
-                if write_sse_headers(&mut stream).is_err() {
-                    return;
-                }
+                let mut sse_started = false;
+                let start_sse = |stream: &mut TcpStream, started: &mut bool| -> bool {
+                    if *started {
+                        return true;
+                    }
+                    if write_sse_headers(stream).is_err() {
+                        return false;
+                    }
+                    *started = true;
+                    true
+                };
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
+                        StreamEvent::Admitted => {
+                            if !start_sse(&mut stream, &mut sse_started) {
+                                return;
+                            }
+                        }
+                        StreamEvent::BadRequest { code, message } => {
+                            let body = json!({"error": {"message": message, "type": "invalid_request_error", "code": code}});
+                            if !sse_started {
+                                write_json_response(&mut stream, "400 Bad Request", &body);
+                            } else {
+                                let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", body);
+                                let _ = stream.flush();
+                            }
+                            return;
+                        }
                         StreamEvent::ToolCall { .. } => {}
                         StreamEvent::Delta { text, .. } => {
+                            if !start_sse(&mut stream, &mut sse_started) {
+                                return;
+                            }
                             let chunk = json!({
                                 "id": req_id,
                                 "object": "text_completion",
@@ -1626,6 +1714,9 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             cached_tokens,
                             ..
                         } => {
+                            if !start_sse(&mut stream, &mut sse_started) {
+                                return;
+                            }
                             let end_chunk = json!({
                                 "id": req_id,
                                 "object": "text_completion",
@@ -1648,13 +1739,18 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             break;
                         }
                         StreamEvent::Heartbeat => {
-                            if write!(stream, ": keepalive\n\n").is_err() || stream.flush().is_err() {
+                            if sse_started && (write!(stream, ": keepalive\n\n").is_err() || stream.flush().is_err()) {
                                 return;
                             }
                         }
                         StreamEvent::Error(msg) => {
-                            let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", json!({"error": msg}));
-                            let _ = stream.flush();
+                            let body = json!({"error": {"message": msg, "type": "server_error"}});
+                            if !sse_started {
+                                write_json_response(&mut stream, "500 Internal Server Error", &body);
+                            } else {
+                                let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", body);
+                                let _ = stream.flush();
+                            }
                             break;
                         }
                     }
@@ -1666,6 +1762,15 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 let mut cached = 0usize;
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
+                        StreamEvent::Admitted => {}
+                        StreamEvent::BadRequest { code, message } => {
+                            write_json_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                &json!({"error": {"message": message, "type": "invalid_request_error", "code": code}}),
+                            );
+                            return;
+                        }
                         StreamEvent::Heartbeat => {
                             if peer_disconnected(&stream) {
                                 return;
@@ -1692,7 +1797,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             break;
                         }
                         StreamEvent::Error(msg) => {
-                            write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": msg}}));
+                            write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": {"message": msg, "type": "server_error"}}));
                             return;
                         }
                     }

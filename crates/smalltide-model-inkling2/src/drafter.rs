@@ -370,8 +370,8 @@ impl<B: ComputeBackend> Drafter<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn draft_with_margins(&mut self, dense: &Inkling2DenseGpu<B>, anchor: u32, p: usize, taps: DeviceBuf, tap_stride: usize, tap_row: usize, n: usize, s: Stream) -> Result<Vec<(u32, f32)>> {
         let n = n.clamp(1, BLOCK - 1);
-        if p + BLOCK > self.max_seq {
-            return Err(SmallTideError::Backend { backend: "drafter", message: format!("draft at {p} past max_seq") });
+        if p + 1 + n > self.max_seq {
+            return Err(SmallTideError::Backend { backend: "drafter", message: format!("draft {n} at {p} past max_seq {}", self.max_seq) });
         }
         let b = self.backend.as_ref();
         let sc = &self.sc;

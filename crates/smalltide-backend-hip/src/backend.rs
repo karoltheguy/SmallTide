@@ -267,12 +267,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32,
-            moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32,
-            kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32,
-            value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32,
-            rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32,
-            vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, moe_w2_rows)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -1684,6 +1679,9 @@ impl ComputeBackend for HipBackend {
         let (mut a, mut b, mut c, mut d) = (self.dev_ptr(y)?, self.dev_ptr(x)?, self.dev_ptr(w_fp8)?, self.dev_ptr(row_scales)?);
         let (mut m, mut n, mut k) = (rows as u32, n_rows as u32, k_cols as u32);
         let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut m), p(&mut n), p(&mut k)];
+        if rows >= 16 && k_cols % 32 == 0 && std::env::var_os("SMALLTIDE_GEMM_SCALAR").is_none() {
+            return self.launch(self.kernels.gemm_fp8_rows_wmma, (n.div_ceil(64), m.div_ceil(128), 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma)");
+        }
         self.launch(self.kernels.gemm_fp8_e4m3_batched_f32, (n.div_ceil(4), m.div_ceil(8), 1), 128, &mut args, stream, "launch(gemm_fp8_rows)")
     }
 
@@ -1744,6 +1742,13 @@ impl ComputeBackend for HipBackend {
             self.opt_dev_ptr(rel_table)?, self.opt_dev_ptr(sinks)?);
         let (mut nq, mut nkv, mut ms, mut win, mut p0, mut re, mut isd) = (pp.n_q_heads as u32, pp.n_kv_heads as u32,
             pp.max_seq as u32, pp.window as u32, pp.pos0 as u32, pp.rel_extent as u32, pp.inv_sqrt_d);
+        if std::env::var_os("SMALLTIDE_ATTN_SCALAR").is_none() && pp.n_q_heads % pp.n_kv_heads == 0 {
+            let mut rows = pp.rows as u32;
+            let nqv = rows * (nq / nkv);
+            let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut g), p(&mut h),
+                p(&mut nq), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd), p(&mut rows)];
+            return self.launch(self.kernels.attn_prefill_wmma, (nkv, nqv.div_ceil(16), 1), 128, &mut args, stream, "launch(attn_prefill_wmma)");
+        }
         let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut g), p(&mut h),
             p(&mut nq), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd)];
         self.launch(self.kernels.attn_prefill_fp8, (nkv, pp.rows as u32, 1), 128, &mut args, stream, "launch(attn_prefill_fp8)")
@@ -1775,11 +1780,39 @@ impl ComputeBackend for HipBackend {
                 (self.dev_ptr(mid)?, self.dev_ptr(x)?, self.dev_ptr(pool)?, self.dev_ptr(work)?, self.dev_ptr(pairs)?);
             let (mut st, mut h, mut i, mut gc, mut uc) = (gp.expert_stride_bytes as u64, gp.hidden_size as u32, gp.intermediate_size as u32, 4.0f32, 25.0f32);
             let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut st), p(&mut h), p(&mut i), p(&mut gc), p(&mut uc)];
-            self.launch(self.kernels.moe_w13_grouped, (gp.n_work as u32, i.div_ceil(64), 1), 256, &mut args, stream, "launch(moe_w13_grouped)")?;
+            let wmma = std::env::var_os("SMALLTIDE_MOE_SCALAR").is_none();
+            let v1 = std::env::var_os("SMALLTIDE_MOE_WMMA1").is_some();
+            if wmma && !v1 {
+                // x -> f16 once into `out` (free until the final reduce), f16 `mid`.
+                let n = (gp.rows * gp.hidden_size) as u32;
+                let (mut xo, mut xi, mut nn) = (self.dev_ptr(out)?, self.dev_ptr(x)?, n);
+                let mut cargs = [p(&mut xo), p(&mut xi), p(&mut nn)];
+                self.launch(self.kernels.f32_to_f16, (n.div_ceil(1024), 1, 1), 256, &mut cargs, stream, "launch(f32_to_f16)")?;
+                let mut x16 = self.dev_ptr(out)?;
+                let mut args = [p(&mut a), p(&mut x16), p(&mut c), p(&mut d), p(&mut e), p(&mut st), p(&mut h), p(&mut i), p(&mut gc), p(&mut uc)];
+                self.launch(self.kernels.moe_w13_grouped_wmma2, (gp.n_work as u32, (2 * i).div_ceil(128), 1), 256, &mut args, stream, "launch(moe_w13_grouped_wmma2)")?;
+                let (mut a2, mut bm, mut c2, mut d2, mut e2, mut f2) = (self.dev_ptr(tmp)?, self.dev_ptr(mid)?, self.dev_ptr(pool)?,
+                    self.dev_ptr(work)?, self.dev_ptr(pairs)?, self.dev_ptr(route)?);
+                let mut args = [p(&mut a2), p(&mut bm), p(&mut c2), p(&mut d2), p(&mut e2), p(&mut f2), p(&mut st), p(&mut h), p(&mut i)];
+                self.launch(self.kernels.moe_w2_grouped_wmma2, (gp.n_work as u32, h.div_ceil(128), 1), 256, &mut args, stream, "launch(moe_w2_grouped_wmma2)")?;
+                if reduce {
+                    self.moe_reduce_rows(out, tmp, gp.hidden_size, gp.rows, stream)?;
+                }
+                return Ok(());
+            }
+            if wmma {
+                self.launch(self.kernels.moe_w13_grouped_wmma, (gp.n_work as u32, (2 * i).div_ceil(128), 1), 256, &mut args, stream, "launch(moe_w13_grouped_wmma)")?;
+            } else {
+                self.launch(self.kernels.moe_w13_grouped, (gp.n_work as u32, i.div_ceil(64), 1), 256, &mut args, stream, "launch(moe_w13_grouped)")?;
+            }
             let (mut a, mut b, mut c, mut d, mut e, mut f) = (self.dev_ptr(tmp)?, self.dev_ptr(mid)?, self.dev_ptr(pool)?,
                 self.dev_ptr(work)?, self.dev_ptr(pairs)?, self.dev_ptr(route)?);
             let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut st), p(&mut h), p(&mut i)];
-            self.launch(self.kernels.moe_w2_grouped, (gp.n_work as u32, h.div_ceil(64), 1), 256, &mut args, stream, "launch(moe_w2_grouped)")?;
+            if wmma {
+                self.launch(self.kernels.moe_w2_grouped_wmma, (gp.n_work as u32, h.div_ceil(128), 1), 256, &mut args, stream, "launch(moe_w2_grouped_wmma)")?;
+            } else {
+                self.launch(self.kernels.moe_w2_grouped, (gp.n_work as u32, h.div_ceil(64), 1), 256, &mut args, stream, "launch(moe_w2_grouped)")?;
+            }
         }
         if reduce {
             self.moe_reduce_rows(out, tmp, gp.hidden_size, gp.rows, stream)?;

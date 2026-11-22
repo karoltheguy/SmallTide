@@ -753,6 +753,11 @@ fn run_generate(args: &[String]) {
     println!("[Prompt] {} tokens", prompt_ids.len());
 
     // Prefill
+    let pf_kt = std::env::var_os("SMALLTIDE_KTIMING_PREFILL").is_some();
+    if pf_kt {
+        backend.set_kernel_timing(true).expect("kernel timing");
+        let _ = backend.take_kernel_times();
+    }
     let pf_seg = std::env::var_os("SMALLTIDE_SEGTIME_PREFILL").is_some();
     if pf_seg {
         backend.set_segment_timing(true).expect("segment timing");
@@ -771,6 +776,16 @@ fn run_generate(args: &[String]) {
     }
     backend.sync_stream(engine.tide.compute_stream).expect("sync prefill");
     let pf_secs = t_pf.elapsed().as_secs_f64();
+    if pf_kt {
+        let mut kt = backend.take_kernel_times();
+        kt.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let total: f64 = kt.iter().map(|k| k.2).sum();
+        println!("[GPU kernels, prefill] total {total:.1} ms (wall {:.1} ms)", pf_secs * 1000.0);
+        for (name, cnt, ms) in kt.iter().take(14) {
+            println!("  {:<32} {:>6}x  {:>9.1} ms  ({:>7.1} us avg)", name, cnt, ms, ms * 1000.0 / *cnt as f64);
+        }
+        backend.set_kernel_timing(false).expect("kernel timing off");
+    }
     if pf_seg {
         let st = backend.take_segment_times();
         let total: f64 = st.iter().map(|k| k.2).sum();

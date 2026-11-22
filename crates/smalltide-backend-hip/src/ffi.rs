@@ -174,6 +174,13 @@ pub struct CoreKernels {
     pub attn_prep_decode: HipFunction,
     pub fused_mix_decode: HipFunction,
     pub moe_w13_rows: HipFunction,
+    pub moe_w13_grouped_wmma: HipFunction,
+    pub moe_w2_grouped_wmma: HipFunction,
+    pub moe_w13_grouped_wmma2: HipFunction,
+    pub moe_w2_grouped_wmma2: HipFunction,
+    pub f32_to_f16: HipFunction,
+    pub attn_prefill_wmma: HipFunction,
+    pub gemm_fp8_rows_wmma: HipFunction,
     pub moe_w2_rows: HipFunction,
 }
 
@@ -381,6 +388,13 @@ impl HipRuntime {
             attn_prep_decode: get_fn("smalltide_attn_prep_decode")?,
             fused_mix_decode: get_fn("smalltide_fused_mix_decode")?,
             moe_w13_rows: get_fn("smalltide_moe_w13_rows")?,
+            moe_w13_grouped_wmma: get_fn("smalltide_moe_w13_grouped_wmma")?,
+            moe_w2_grouped_wmma: get_fn("smalltide_moe_w2_grouped_wmma")?,
+            moe_w13_grouped_wmma2: get_fn("smalltide_moe_w13_grouped_wmma2")?,
+            moe_w2_grouped_wmma2: get_fn("smalltide_moe_w2_grouped_wmma2")?,
+            f32_to_f16: get_fn("smalltide_f32_to_f16")?,
+            attn_prefill_wmma: get_fn("smalltide_attn_prefill_wmma")?,
+            gemm_fp8_rows_wmma: get_fn("smalltide_gemm_fp8_rows_wmma")?,
             moe_w2_rows: get_fn("smalltide_moe_w2_rows")?,
         })
     }

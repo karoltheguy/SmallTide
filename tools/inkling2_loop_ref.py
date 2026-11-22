@@ -227,6 +227,7 @@ def main():
     ap.add_argument("--emulate-fp8-kv", action="store_true")
     ap.add_argument("--force-engine-routes", action="store_true")
     ap.add_argument("--threads", type=int, default=os.cpu_count())
+    ap.add_argument("--worst", type=int, default=0, help="list the N positions with the largest error in the worst layer")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
 
@@ -307,15 +308,24 @@ def main():
     print("\nlayer  rel_err(mean)  rel_err(max)  cos(min)   route_overlap")
     ref_routes = [rl[1] for rl in route_log]  # in call order = logical order, each [T, 8]
     worst = 0.0
+    worst_il, worst_d = 0, None
     for il in range(nl):
         d = (eng[:, il] - ref[:, il]).norm(dim=-1) / ref[:, il].norm(dim=-1).clamp_min(1e-12)
         cos = F.cosine_similarity(eng[:, il], ref[:, il], dim=-1)
         er = np.stack([r[3][il] for r in rows]) & 0x7FFFFFFF
         rr = ref_routes[il].numpy()
         ov = np.mean([len(set(er[t]) & set(rr[t])) / 8.0 for t in range(T)])
+        if worst_d is None or d.max().item() > worst:
+            worst_il, worst_d = il, d
         worst = max(worst, d.max().item())
         print(f"{il:5d}  {d.mean().item():12.3e}  {d.max().item():12.3e}  {cos.min().item():8.6f}   {ov:6.3f}")
 
+    if args.worst and worst_d is not None:
+        idx = torch.argsort(worst_d, descending=True)[: args.worst].tolist()
+        print(f"\nworst positions in layer {worst_il}: " + ", ".join(
+            f"pos {t} (tok {tokens[t]}, rel {worst_d[t].item():.3f}, |ref| {ref[t, worst_il].norm().item():.1f})" for t in idx))
+        med = worst_d.median().item()
+        print(f"median rel_err in that layer: {med:.3e}")
     print("\nlogits (positions the engine computed):")
     agree = 0
     n = 0

@@ -540,3 +540,552 @@ extern "C" __global__ void smalltide_moe_reduce_rows(
     for (uint32_t k = 0u; k < 8u; ++k) s += t[static_cast<size_t>(k) * hidden];
     out[static_cast<size_t>(m) * hidden + h] = s;
 }
+
+// ---------------------------------------------------------------------------
+// WMMA (matrix core) expert-grouped MoE for prefill, gfx12 v_wmma_f32_16x16x16_f16.
+// Same work / pairs layout as the scalar grouped kernels: one work item = one expert with up to
+// 16 (row, k) pairs = the M = 16 rows of a WMMA tile. Each warp computes one 16-column tile of
+// output weight rows over the full K. Weights are dequantized to f16 per fragment (NVFP4 values
+// times their FP8 block scale are exact in f16); activations are rounded to f16; f32 accumulate.
+// Fragment layout (verified): A lane l = row l%16, k (l/16)*8..+8; B lane l = col l%16, same k;
+// C lane l = col l%16, rows (l/16)*8..+8.
+// ---------------------------------------------------------------------------
+typedef _Float16 st_half8 __attribute__((ext_vector_type(8)));
+typedef float st_float8 __attribute__((ext_vector_type(8)));
+
+// 8 consecutive f32 activations -> f16 fragment (zeros for padding rows).
+__device__ __forceinline__ st_half8 wmma_load_x8(const float* __restrict__ p, bool valid) {
+    st_half8 a;
+    if (valid) {
+        float4 u = reinterpret_cast<const float4*>(p)[0], v = reinterpret_cast<const float4*>(p)[1];
+        a[0] = (_Float16)u.x; a[1] = (_Float16)u.y; a[2] = (_Float16)u.z; a[3] = (_Float16)u.w;
+        a[4] = (_Float16)v.x; a[5] = (_Float16)v.y; a[6] = (_Float16)v.z; a[7] = (_Float16)v.w;
+    } else {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) a[i] = (_Float16)0.0f;
+    }
+    return a;
+}
+
+// 8 consecutive weights (k0..k0+7, k0 % 8 == 0) of one row -> f16 fragment.
+__device__ __forceinline__ st_half8 wmma_load_w8(uint32_t tag, const uint8_t* __restrict__ w_row,
+                                                  const uint8_t* __restrict__ s_row, uint32_t k0) {
+    st_half8 b;
+    if (tag == 0u) {
+        uint32_t w = *reinterpret_cast<const uint32_t*>(w_row + (k0 >> 1));
+        float s = decode_fp8_e4m3fn(s_row[k0 >> 4]);
+        float4 ev, od;
+        e2m1x8(w, ev, od);
+        b[0] = (_Float16)(ev.x * s); b[1] = (_Float16)(od.x * s); b[2] = (_Float16)(ev.y * s); b[3] = (_Float16)(od.y * s);
+        b[4] = (_Float16)(ev.z * s); b[5] = (_Float16)(od.z * s); b[6] = (_Float16)(ev.w * s); b[7] = (_Float16)(od.w * s);
+    } else {
+        uint2 w = *reinterpret_cast<const uint2*>(w_row + k0);
+        float s = decode_ue8m0(s_row[k0 >> 5]);
+        float4 a = decode_fp8x4(w.x), c = decode_fp8x4(w.y);
+        b[0] = (_Float16)(a.x * s); b[1] = (_Float16)(a.y * s); b[2] = (_Float16)(a.z * s); b[3] = (_Float16)(a.w * s);
+        b[4] = (_Float16)(c.x * s); b[5] = (_Float16)(c.y * s); b[6] = (_Float16)(c.z * s); b[7] = (_Float16)(c.w * s);
+    }
+    return b;
+}
+
+// Pass 1: mid[pair][r] = SiTU(gate_r . x[row], up_r . x[row]); w13 rows interleaved (2r gate, 2r+1 up).
+//   Grid: (n_work, ceil(2I / 128)), Block: 256 (8 warps x 16 w13 rows)
+extern "C" __global__ void smalltide_moe_w13_grouped_wmma(
+    float* __restrict__ mid, const float* __restrict__ x, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ work, const uint32_t* __restrict__ pairs, uint64_t slab_stride,
+    uint32_t hidden, uint32_t inter, float gate_cap, float up_cap
+) {
+    uint32_t wi = blockIdx.x;
+    uint32_t slot = work[wi * 4u], p0 = work[wi * 4u + 1u], np = work[wi * 4u + 2u];
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    __shared__ uint32_t s_pairs[ST_MOE_PAIRS];
+    if (threadIdx.x < np) s_pairs[threadIdx.x] = pairs[p0 + threadIdx.x];
+    __syncthreads();
+    uint32_t n0 = (blockIdx.y * 8u + warp) * 16u; // first w13 row of this warp's tile
+    if (n0 >= 2u * inter) return;
+    const uint8_t* slab = pool + static_cast<size_t>(slot) * slab_stride;
+    const ExpertSlabHeaderGpu* hdr = reinterpret_cast<const ExpertSlabHeaderGpu*>(slab);
+    uint32_t tag = hdr->dtype_tag;
+    size_t wrow = (tag == 0u) ? (hidden >> 1) : hidden;
+    size_t srow = (tag == 0u) ? (hidden >> 4) : (hidden >> 5);
+    const uint8_t* w = slab + hdr->w13_weight_offset + (n0 + (l & 15u)) * wrow;
+    const uint8_t* sc = slab + hdr->w13_scale_offset + (n0 + (l & 15u)) * srow;
+    uint32_t m = l & 15u;
+    bool valid = m < np;
+    const float* xr = x + static_cast<size_t>(valid ? (s_pairs[m] >> 3) : 0u) * hidden;
+    uint32_t kh = (l >> 4) * 8u;
+    st_float8 c = {};
+    for (uint32_t k = 0u; k < hidden; k += 16u) {
+        st_half8 a = wmma_load_x8(xr + k + kh, valid);
+        st_half8 b = wmma_load_w8(tag, w, sc, k + kh);
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+    }
+    float osc = (tag == 0u) ? hdr->w13_outer_scale : 1.0f;
+    uint32_t r = (n0 + (l & 15u)) >> 1;
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        float g = c[i] * osc;
+        float u = __shfl_xor(c[i], 1, 32) * osc; // odd column = up of the same r
+        uint32_t mm = (l >> 4) * 8u + i;
+        if ((l & 1u) == 0u && mm < np) {
+            mid[static_cast<size_t>(s_pairs[mm]) * inter + r] = situ_f32(g, u, gate_cap, up_cap);
+        }
+    }
+}
+
+// Pass 2: tmp[pair][h] = weight(pair) * (w2_h . mid[pair]).
+//   Grid: (n_work, ceil(H / 128)), Block: 256 (8 warps x 16 hidden rows)
+extern "C" __global__ void smalltide_moe_w2_grouped_wmma(
+    float* __restrict__ tmp, const float* __restrict__ mid, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ work, const uint32_t* __restrict__ pairs, const uint32_t* __restrict__ route,
+    uint64_t slab_stride, uint32_t hidden, uint32_t inter
+) {
+    uint32_t wi = blockIdx.x;
+    uint32_t slot = work[wi * 4u], p0 = work[wi * 4u + 1u], np = work[wi * 4u + 2u];
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    __shared__ uint32_t s_pairs[ST_MOE_PAIRS];
+    __shared__ float s_w[ST_MOE_PAIRS];
+    if (threadIdx.x < np) {
+        uint32_t pr = pairs[p0 + threadIdx.x];
+        s_pairs[threadIdx.x] = pr;
+        s_w[threadIdx.x] = __uint_as_float(route[(pr >> 3) * 16u + 8u + (pr & 7u)]);
+    }
+    __syncthreads();
+    uint32_t n0 = (blockIdx.y * 8u + warp) * 16u;
+    if (n0 >= hidden) return;
+    const uint8_t* slab = pool + static_cast<size_t>(slot) * slab_stride;
+    const ExpertSlabHeaderGpu* hdr = reinterpret_cast<const ExpertSlabHeaderGpu*>(slab);
+    uint32_t tag = hdr->dtype_tag;
+    size_t wrow = (tag == 0u) ? (inter >> 1) : inter;
+    size_t srow = (tag == 0u) ? (inter >> 4) : (inter >> 5);
+    const uint8_t* w = slab + hdr->w2_weight_offset + (n0 + (l & 15u)) * wrow;
+    const uint8_t* sc = slab + hdr->w2_scale_offset + (n0 + (l & 15u)) * srow;
+    uint32_t m = l & 15u;
+    bool valid = m < np;
+    const float* ar = mid + static_cast<size_t>(valid ? s_pairs[m] : 0u) * inter;
+    uint32_t kh = (l >> 4) * 8u;
+    st_float8 c = {};
+    for (uint32_t k = 0u; k < inter; k += 16u) {
+        st_half8 a = wmma_load_x8(ar + k + kh, valid);
+        st_half8 b = wmma_load_w8(tag, w, sc, k + kh);
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+    }
+    float osc = (tag == 0u) ? hdr->w2_outer_scale : 1.0f;
+    uint32_t hh = n0 + (l & 15u);
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        uint32_t mm = (l >> 4) * 8u + i;
+        if (mm < np) tmp[static_cast<size_t>(s_pairs[mm]) * hidden + hh] = c[i] * osc * s_w[mm];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WMMA grouped MoE v2: f16 activations (converted once per layer), f16 `mid`, K loop unrolled by
+// 4 with every load of the 4 steps issued before the 4 WMMAs (latency hiding), dtype branch
+// hoisted out of the loop.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_f32_to_f16(_Float16* __restrict__ out, const float* __restrict__ in, uint32_t n) {
+    uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) * 4u;
+    if (i + 3u < n) {
+        float4 v = reinterpret_cast<const float4*>(in)[i >> 2];
+        out[i] = (_Float16)v.x; out[i + 1u] = (_Float16)v.y; out[i + 2u] = (_Float16)v.z; out[i + 3u] = (_Float16)v.w;
+    } else {
+        for (; i < n; ++i) out[i] = (_Float16)in[i];
+    }
+}
+
+__device__ __forceinline__ st_half8 wmma_nvfp4_frag(uint32_t w, float s) {
+    float4 ev, od;
+    e2m1x8(w, ev, od);
+    st_half8 b;
+    b[0] = (_Float16)(ev.x * s); b[1] = (_Float16)(od.x * s); b[2] = (_Float16)(ev.y * s); b[3] = (_Float16)(od.y * s);
+    b[4] = (_Float16)(ev.z * s); b[5] = (_Float16)(od.z * s); b[6] = (_Float16)(ev.w * s); b[7] = (_Float16)(od.w * s);
+    return b;
+}
+
+__device__ __forceinline__ st_half8 wmma_mxfp8_frag(uint2 w, float s) {
+    float4 a = decode_fp8x4(w.x), c = decode_fp8x4(w.y);
+    st_half8 b;
+    b[0] = (_Float16)(a.x * s); b[1] = (_Float16)(a.y * s); b[2] = (_Float16)(a.z * s); b[3] = (_Float16)(a.w * s);
+    b[4] = (_Float16)(c.x * s); b[5] = (_Float16)(c.y * s); b[6] = (_Float16)(c.z * s); b[7] = (_Float16)(c.w * s);
+    return b;
+}
+
+__device__ __forceinline__ st_half8 as_half8(uint4 v) {
+    return __builtin_bit_cast(st_half8, v);
+}
+
+// c += A[16 x K] (f16 rows `ar`, this lane's row) x B[K x 16] (weight rows, this lane's column).
+// K % 64 == 0. `kh` = this lane's k offset within a 16-step (0 or 8).
+__device__ __forceinline__ st_float8 wmma_dot_k(uint32_t tag, const _Float16* __restrict__ ar, bool valid,
+                                                const uint8_t* __restrict__ w, const uint8_t* __restrict__ sc,
+                                                uint32_t K, uint32_t kh, st_float8 c) {
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    if (tag == 0u) {
+        for (uint32_t k = 0u; k < K; k += 64u) {
+            uint4 av[4]; uint32_t wv[4]; float sv[4];
+            #pragma unroll
+            for (uint32_t j = 0u; j < 4u; ++j) {
+                uint32_t kk = k + 16u * j + kh;
+                av[j] = valid ? *reinterpret_cast<const uint4*>(ar + kk) : zero;
+                wv[j] = *reinterpret_cast<const uint32_t*>(w + (kk >> 1));
+                sv[j] = decode_fp8_e4m3fn(sc[kk >> 4]);
+            }
+            #pragma unroll
+            for (uint32_t j = 0u; j < 4u; ++j) {
+                c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av[j]), wmma_nvfp4_frag(wv[j], sv[j]), c);
+            }
+        }
+    } else {
+        for (uint32_t k = 0u; k < K; k += 64u) {
+            uint4 av[4]; uint2 wv[4]; float sv[4];
+            #pragma unroll
+            for (uint32_t j = 0u; j < 4u; ++j) {
+                uint32_t kk = k + 16u * j + kh;
+                av[j] = valid ? *reinterpret_cast<const uint4*>(ar + kk) : zero;
+                wv[j] = *reinterpret_cast<const uint2*>(w + kk);
+                sv[j] = decode_ue8m0(sc[kk >> 5]);
+            }
+            #pragma unroll
+            for (uint32_t j = 0u; j < 4u; ++j) {
+                c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av[j]), wmma_mxfp8_frag(wv[j], sv[j]), c);
+            }
+        }
+    }
+    return c;
+}
+
+// Pass 1: mid16[pair][r] = SiTU(gate_r . x16[row], up_r . x16[row]).  Grid: (n_work, ceil(2I / 128)), Block: 256
+extern "C" __global__ void smalltide_moe_w13_grouped_wmma2(
+    _Float16* __restrict__ mid16, const _Float16* __restrict__ x16, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ work, const uint32_t* __restrict__ pairs, uint64_t slab_stride,
+    uint32_t hidden, uint32_t inter, float gate_cap, float up_cap
+) {
+    uint32_t wi = blockIdx.x;
+    uint32_t slot = work[wi * 4u], p0 = work[wi * 4u + 1u], np = work[wi * 4u + 2u];
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    __shared__ uint32_t s_pairs[ST_MOE_PAIRS];
+    if (threadIdx.x < np) s_pairs[threadIdx.x] = pairs[p0 + threadIdx.x];
+    __syncthreads();
+    uint32_t n0 = (blockIdx.y * 8u + warp) * 16u;
+    if (n0 >= 2u * inter) return;
+    const uint8_t* slab = pool + static_cast<size_t>(slot) * slab_stride;
+    const ExpertSlabHeaderGpu* hdr = reinterpret_cast<const ExpertSlabHeaderGpu*>(slab);
+    uint32_t tag = hdr->dtype_tag;
+    size_t wrow = (tag == 0u) ? (hidden >> 1) : hidden;
+    size_t srow = (tag == 0u) ? (hidden >> 4) : (hidden >> 5);
+    const uint8_t* w = slab + hdr->w13_weight_offset + (n0 + (l & 15u)) * wrow;
+    const uint8_t* sc = slab + hdr->w13_scale_offset + (n0 + (l & 15u)) * srow;
+    uint32_t m = l & 15u;
+    bool valid = m < np;
+    const _Float16* xr = x16 + static_cast<size_t>(valid ? (s_pairs[m] >> 3) : 0u) * hidden;
+    st_float8 c = {};
+    c = wmma_dot_k(tag, xr, valid, w, sc, hidden, (l >> 4) * 8u, c);
+    float osc = (tag == 0u) ? hdr->w13_outer_scale : 1.0f;
+    uint32_t r = (n0 + (l & 15u)) >> 1;
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        float g = c[i] * osc;
+        float u = __shfl_xor(c[i], 1, 32) * osc;
+        uint32_t mm = (l >> 4) * 8u + i;
+        if ((l & 1u) == 0u && mm < np) {
+            mid16[static_cast<size_t>(s_pairs[mm]) * inter + r] = (_Float16)situ_f32(g, u, gate_cap, up_cap);
+        }
+    }
+}
+
+// Pass 2: tmp[pair][h] = weight(pair) * (w2_h . mid16[pair]).  Grid: (n_work, ceil(H / 128)), Block: 256
+extern "C" __global__ void smalltide_moe_w2_grouped_wmma2(
+    float* __restrict__ tmp, const _Float16* __restrict__ mid16, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ work, const uint32_t* __restrict__ pairs, const uint32_t* __restrict__ route,
+    uint64_t slab_stride, uint32_t hidden, uint32_t inter
+) {
+    uint32_t wi = blockIdx.x;
+    uint32_t slot = work[wi * 4u], p0 = work[wi * 4u + 1u], np = work[wi * 4u + 2u];
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    __shared__ uint32_t s_pairs[ST_MOE_PAIRS];
+    __shared__ float s_w[ST_MOE_PAIRS];
+    if (threadIdx.x < np) {
+        uint32_t pr = pairs[p0 + threadIdx.x];
+        s_pairs[threadIdx.x] = pr;
+        s_w[threadIdx.x] = __uint_as_float(route[(pr >> 3) * 16u + 8u + (pr & 7u)]);
+    }
+    __syncthreads();
+    uint32_t n0 = (blockIdx.y * 8u + warp) * 16u;
+    if (n0 >= hidden) return;
+    const uint8_t* slab = pool + static_cast<size_t>(slot) * slab_stride;
+    const ExpertSlabHeaderGpu* hdr = reinterpret_cast<const ExpertSlabHeaderGpu*>(slab);
+    uint32_t tag = hdr->dtype_tag;
+    size_t wrow = (tag == 0u) ? (inter >> 1) : inter;
+    size_t srow = (tag == 0u) ? (inter >> 4) : (inter >> 5);
+    const uint8_t* w = slab + hdr->w2_weight_offset + (n0 + (l & 15u)) * wrow;
+    const uint8_t* sc = slab + hdr->w2_scale_offset + (n0 + (l & 15u)) * srow;
+    uint32_t m = l & 15u;
+    bool valid = m < np;
+    const _Float16* ar = mid16 + static_cast<size_t>(valid ? s_pairs[m] : 0u) * inter;
+    st_float8 c = {};
+    c = wmma_dot_k(tag, ar, valid, w, sc, inter, (l >> 4) * 8u, c);
+    float osc = (tag == 0u) ? hdr->w2_outer_scale : 1.0f;
+    uint32_t hh = n0 + (l & 15u);
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        uint32_t mm = (l >> 4) * 8u + i;
+        if (mm < np) tmp[static_cast<size_t>(s_pairs[mm]) * hidden + hh] = c[i] * osc * s_w[mm];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WMMA flash attention for prefill (same semantics as smalltide_attn_prefill_fp8).
+// Block = 4 warps on one KV head and 16 query vectors (query vector qi = row t * g + head i of
+// the GQA group). Warps split the key range in 16-key tiles (tile j -> warp j % 4) and merge.
+// Per tile: S = Q K^T (8 WMMA over head_dim 128; FP8 K -> f16 exact, K scale applied to S),
+// masks + relative bias + online softmax, O += P V (8 WMMA; V scale folded into P, V staged
+// in LDS as f16). Sinks add to the normalizer only.
+//   Grid: (n_kv_heads, ceil(rows * g / 16)), Block: 128
+// ---------------------------------------------------------------------------
+#define AW_WARPS 4u
+
+extern "C" __global__ void smalltide_attn_prefill_wmma(
+    float* __restrict__ out, const float* __restrict__ q, const uint8_t* __restrict__ k_cache,
+    const float* __restrict__ k_scales, const uint8_t* __restrict__ v_cache, const float* __restrict__ v_scales,
+    const float* __restrict__ rel_table, const float* __restrict__ sinks, uint32_t n_q_heads, uint32_t n_kv_heads,
+    uint32_t max_seq, uint32_t window, uint32_t pos0, uint32_t rel_extent, float inv_sqrt_d, uint32_t rows
+) {
+    const float LOG2E = 1.4426950408889634f;
+    uint32_t kvh = blockIdx.x;
+    uint32_t g = n_q_heads / n_kv_heads;
+    uint32_t qh0 = kvh * g;
+    uint32_t nq = rows * g;
+    uint32_t q_base = blockIdx.y * 16u;
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t nl = l & 15u, half_ = l >> 4;
+
+    __shared__ _Float16 s_p[AW_WARPS][16][16];
+    __shared__ _Float16 s_v[AW_WARPS][16][128];
+    __shared__ float s_m[AW_WARPS][16], s_l[AW_WARPS][16];
+    __shared__ float s_o[AW_WARPS][16][128 + 4];
+
+    // Query vectors of this block: positions, rows and their key ranges.
+    auto qinfo = [&](uint32_t m, uint32_t& t, uint32_t& qh, uint32_t& p, uint32_t& lo) {
+        uint32_t qi = min(q_base + m, nq - 1u);
+        t = qi / g;
+        qh = qh0 + qi % g;
+        p = pos0 + t;
+        lo = (window != 0u && p + 1u > window) ? (p + 1u - window) : 0u;
+    };
+    uint32_t t_first, qh_x, p_first, lo_first, t_last, p_last, lo_last;
+    qinfo(0u, t_first, qh_x, p_first, lo_first);
+    qinfo(15u, t_last, qh_x, p_last, lo_last);
+    uint32_t key_lo = lo_first;            // smallest window start (positions grow with m)
+    uint32_t key_hi = p_last;              // inclusive
+    uint32_t n_tiles = (key_hi - key_lo) / 16u + 1u;
+
+    // A fragment of Q (row m = l % 16, dims half*8 + 16c .. +8), pre-scaled to the log2 domain.
+    uint32_t tA, qhA, pA, loA;
+    qinfo(nl, tA, qhA, pA, loA);
+    bool validA = q_base + nl < nq;
+    const float* qrow = q + (static_cast<size_t>(tA) * n_q_heads + qhA) * 128u;
+    float qs = inv_sqrt_d * LOG2E;
+    st_half8 qa[8];
+    #pragma unroll
+    for (uint32_t c = 0u; c < 8u; ++c) {
+        const float4* src = reinterpret_cast<const float4*>(qrow + c * 16u + half_ * 8u);
+        float4 u = validA ? src[0] : make_float4(0, 0, 0, 0), v = validA ? src[1] : make_float4(0, 0, 0, 0);
+        qa[c][0] = (_Float16)(u.x * qs); qa[c][1] = (_Float16)(u.y * qs); qa[c][2] = (_Float16)(u.z * qs); qa[c][3] = (_Float16)(u.w * qs);
+        qa[c][4] = (_Float16)(v.x * qs); qa[c][5] = (_Float16)(v.y * qs); qa[c][6] = (_Float16)(v.z * qs); qa[c][7] = (_Float16)(v.w * qs);
+    }
+    // Rows this lane holds in the C layout: m = half * 8 + i.
+    uint32_t tC[8], qhC[8], pC[8], loC[8];
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) qinfo(half_ * 8u + i, tC[i], qhC[i], pC[i], loC[i]);
+
+    const uint8_t* kb = k_cache + static_cast<size_t>(kvh) * max_seq * 128u;
+    const uint8_t* vb = v_cache + static_cast<size_t>(kvh) * max_seq * 128u;
+    const float* ksb = k_scales + static_cast<size_t>(kvh) * max_seq;
+    const float* vsb = v_scales + static_cast<size_t>(kvh) * max_seq;
+
+    float m_run[8], l_run[8];
+    st_float8 o[8];
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) { m_run[i] = -1e30f; l_run[i] = 0.0f; }
+    #pragma unroll
+    for (uint32_t c = 0u; c < 8u; ++c) o[c] = (st_float8){};
+
+    for (uint32_t tile = warp; tile < n_tiles; tile += AW_WARPS) {
+        uint32_t k0 = key_lo + tile * 16u;
+        // This lane's key (column n = l % 16) for S and its cache slot.
+        uint32_t kp = k0 + nl;
+        bool kin = kp <= key_hi;
+        uint32_t slot = (window != 0u) ? (kp % max_seq) : kp;
+        // S = Q K^T over 8 dim chunks.
+        st_float8 sacc = {};
+        #pragma unroll
+        for (uint32_t c = 0u; c < 8u; ++c) {
+            uint2 kw = kin ? *reinterpret_cast<const uint2*>(kb + static_cast<size_t>(slot) * 128u + c * 16u + half_ * 8u) : make_uint2(0u, 0u);
+            float4 a = decode_fp8x4(kw.x), b = decode_fp8x4(kw.y);
+            st_half8 kf;
+            kf[0] = (_Float16)a.x; kf[1] = (_Float16)a.y; kf[2] = (_Float16)a.z; kf[3] = (_Float16)a.w;
+            kf[4] = (_Float16)b.x; kf[5] = (_Float16)b.y; kf[6] = (_Float16)b.z; kf[7] = (_Float16)b.w;
+            sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qa[c], kf, sacc);
+        }
+        float kscale = kin ? ksb[slot] : 0.0f;
+        float vscale = kin ? vsb[slot] : 0.0f;
+        // Logits, masks, relative bias; online softmax (row max over the 16 key lanes).
+        float pr[8];
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            bool ok = kin && kp <= pC[i] && kp >= loC[i] && (q_base + half_ * 8u + i) < nq;
+            float sc = -1e30f;
+            if (ok) {
+                uint32_t dist = pC[i] - kp;
+                float rb = (rel_table != nullptr && dist < rel_extent)
+                    ? rel_table[(static_cast<size_t>(tC[i]) * n_q_heads + qhC[i]) * rel_extent + dist] * LOG2E : 0.0f;
+                sc = sacc[i] * kscale + rb;
+            }
+            float mx = sc;
+            mx = fmaxf(mx, __shfl_xor(mx, 8, 32));
+            mx = fmaxf(mx, __shfl_xor(mx, 4, 32));
+            mx = fmaxf(mx, __shfl_xor(mx, 2, 32));
+            mx = fmaxf(mx, __shfl_xor(mx, 1, 32));
+            float mn = fmaxf(m_run[i], mx);
+            float al = exp2f(m_run[i] - mn);
+            float pv = ok ? exp2f(sc - mn) : 0.0f;
+            l_run[i] = l_run[i] * al + pv; // per-lane partial (reduced at the end)
+            m_run[i] = mn;
+            #pragma unroll
+            for (uint32_t c = 0u; c < 8u; ++c) o[c][i] *= al;
+            pr[i] = pv * vscale;
+        }
+        // P (C layout: lane = key column) -> LDS -> A layout (lane = query row).
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) s_p[warp][half_ * 8u + i][nl] = (_Float16)pr[i];
+        // V tile [16 keys][128] FP8 -> f16 (raw; the V scale is in P).
+        #pragma unroll
+        for (uint32_t r = 0u; r < 16u; ++r) {
+            uint32_t kr = k0 + r;
+            uint32_t vslot = (window != 0u) ? (kr % max_seq) : kr;
+            uint32_t vw = (kr <= key_hi) ? reinterpret_cast<const uint32_t*>(vb + static_cast<size_t>(vslot) * 128u)[l] : 0u;
+            float4 vv = decode_fp8x4(vw);
+            s_v[warp][r][l * 4u + 0u] = (_Float16)vv.x; s_v[warp][r][l * 4u + 1u] = (_Float16)vv.y;
+            s_v[warp][r][l * 4u + 2u] = (_Float16)vv.z; s_v[warp][r][l * 4u + 3u] = (_Float16)vv.w;
+        }
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+        st_half8 pa;
+        #pragma unroll
+        for (uint32_t j = 0u; j < 8u; ++j) pa[j] = s_p[warp][nl][half_ * 8u + j];
+        #pragma unroll
+        for (uint32_t c = 0u; c < 8u; ++c) {
+            st_half8 vf;
+            #pragma unroll
+            for (uint32_t j = 0u; j < 8u; ++j) vf[j] = s_v[warp][half_ * 8u + j][c * 16u + nl];
+            o[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pa, vf, o[c]);
+        }
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+    }
+
+    // Row sums over the 16 key lanes; publish (m, l, O) per warp.
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        float s = l_run[i];
+        s += __shfl_xor(s, 8, 32); s += __shfl_xor(s, 4, 32); s += __shfl_xor(s, 2, 32); s += __shfl_xor(s, 1, 32);
+        if (nl == 0u) { s_m[warp][half_ * 8u + i] = m_run[i]; s_l[warp][half_ * 8u + i] = s; }
+        #pragma unroll
+        for (uint32_t c = 0u; c < 8u; ++c) s_o[warp][half_ * 8u + i][c * 16u + nl] = o[c][i];
+    }
+    __syncthreads();
+    // Merge the warps + the sink; 128 threads = 16 rows x 8 threads x 16 dims.
+    uint32_t mrow = threadIdx.x >> 3, dpart = (threadIdx.x & 7u) * 16u;
+    if (q_base + mrow < nq) {
+        uint32_t t, qh, p, lo;
+        qinfo(mrow, t, qh, p, lo);
+        float sink = (sinks != nullptr) ? sinks[static_cast<size_t>(t) * n_q_heads + qh] * LOG2E : -1e30f;
+        float mb = sink;
+        for (uint32_t w = 0u; w < AW_WARPS; ++w) if (s_l[w][mrow] > 0.0f) mb = fmaxf(mb, s_m[w][mrow]);
+        float lb = (sinks != nullptr) ? exp2f(sink - mb) : 0.0f;
+        float f[AW_WARPS];
+        for (uint32_t w = 0u; w < AW_WARPS; ++w) {
+            f[w] = (s_l[w][mrow] > 0.0f) ? exp2f(s_m[w][mrow] - mb) : 0.0f;
+            lb += s_l[w][mrow] * f[w];
+        }
+        float inv = (lb > 1e-30f) ? 1.0f / lb : 0.0f;
+        float* dst = out + (static_cast<size_t>(t) * n_q_heads + qh) * 128u + dpart;
+        for (uint32_t d = 0u; d < 16u; ++d) {
+            float acc = 0.0f;
+            for (uint32_t w = 0u; w < AW_WARPS; ++w) acc = fmaf(s_o[w][mrow][dpart + d], f[w], acc);
+            dst[d] = acc * inv;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WMMA FP8 GEMM for prefill rows: Y[m][n] = row_scale[n] * sum_k X[m][k] * W_fp8[n][k].
+// Block 256 = 8 warps; block tile 128 rows x 64 cols; warp w = rows w*16..+16 x 4 N tiles (one A
+// fragment feeds 4 WMMAs). FP8 -> f16 is exact; X rounded to f16; f32 accumulate; 2-step
+// prefetch. K % 32 == 0.   Grid: (ceil(N / 64), ceil(M / 128)), Block: 256
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ st_half8 fp8x8_to_half8(uint2 w) {
+    float4 a = decode_fp8x4(w.x), b = decode_fp8x4(w.y);
+    st_half8 h;
+    h[0] = (_Float16)a.x; h[1] = (_Float16)a.y; h[2] = (_Float16)a.z; h[3] = (_Float16)a.w;
+    h[4] = (_Float16)b.x; h[5] = (_Float16)b.y; h[6] = (_Float16)b.z; h[7] = (_Float16)b.w;
+    return h;
+}
+
+extern "C" __global__ void smalltide_gemm_fp8_rows_wmma(
+    float* __restrict__ y, const float* __restrict__ x, const uint8_t* __restrict__ w_fp8,
+    const float* __restrict__ row_scale, uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) {
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t m0 = blockIdx.y * 128u + warp * 16u;
+    if (m0 >= m_rows) return;
+    uint32_t n0 = blockIdx.x * 64u;
+    uint32_t am = m0 + (l & 15u);
+    bool a_ok = am < m_rows;
+    const float* xr = x + static_cast<size_t>(a_ok ? am : 0u) * k_cols;
+    uint32_t kh = (l >> 4) * 8u;
+    const uint8_t* wr[4];
+    bool b_ok[4];
+    #pragma unroll
+    for (uint32_t j = 0u; j < 4u; ++j) {
+        uint32_t n = n0 + 16u * j + (l & 15u);
+        b_ok[j] = n < n_rows;
+        wr[j] = w_fp8 + static_cast<size_t>(b_ok[j] ? n : 0u) * k_cols;
+    }
+    st_float8 c[4] = {};
+    for (uint32_t k = 0u; k < k_cols; k += 32u) {
+        float4 xa[2][2];
+        uint2 wv[2][4];
+        #pragma unroll
+        for (uint32_t s = 0u; s < 2u; ++s) {
+            uint32_t kk = k + 16u * s + kh;
+            const float4* xp = reinterpret_cast<const float4*>(xr + kk);
+            xa[s][0] = a_ok ? xp[0] : make_float4(0, 0, 0, 0);
+            xa[s][1] = a_ok ? xp[1] : make_float4(0, 0, 0, 0);
+            #pragma unroll
+            for (uint32_t j = 0u; j < 4u; ++j) wv[s][j] = b_ok[j] ? *reinterpret_cast<const uint2*>(wr[j] + kk) : make_uint2(0u, 0u);
+        }
+        #pragma unroll
+        for (uint32_t s = 0u; s < 2u; ++s) {
+            st_half8 a;
+            a[0] = (_Float16)xa[s][0].x; a[1] = (_Float16)xa[s][0].y; a[2] = (_Float16)xa[s][0].z; a[3] = (_Float16)xa[s][0].w;
+            a[4] = (_Float16)xa[s][1].x; a[5] = (_Float16)xa[s][1].y; a[6] = (_Float16)xa[s][1].z; a[7] = (_Float16)xa[s][1].w;
+            #pragma unroll
+            for (uint32_t j = 0u; j < 4u; ++j) {
+                c[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, fp8x8_to_half8(wv[s][j]), c[j]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint32_t j = 0u; j < 4u; ++j) {
+        uint32_t n = n0 + 16u * j + (l & 15u);
+        if (n >= n_rows) continue;
+        float sc = (row_scale != nullptr) ? row_scale[n] : 1.0f;
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            uint32_t mm = m0 + (l >> 4) * 8u + i;
+            if (mm < m_rows) y[static_cast<size_t>(mm) * n_rows + n] = c[j][i] * sc;
+        }
+    }
+}

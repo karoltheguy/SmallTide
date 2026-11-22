@@ -615,7 +615,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         b.router_topk8_rows(pf.route, pf.router_logits, Some(layer.router_bias), cfg.route_scale, m, 16, s)?;
 
         // 10. expert-grouped MoE (host plan from the routed ids)
-        b.seg_mark("pf: moe (sync,plan,kernels)", s);
+        b.seg_mark("pf: moe route sync + host plan", s);
         if let Some(rows) = lanes {
             // Batched decode MoE: device-side routing, experts deduplicated across rows, no host
             // sync; per-row renormalized sum + MLP short conv + residual.
@@ -794,6 +794,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         // Wave 0: resident experts plus the first `ring` missing ones (staged into scratch);
         // further waves stage the next `ring` missing experts each.
+        self.backend.seg_mark("pf: moe kernels (+staging)", s);
         let mut next_missing = 0usize;
         let mut first = true;
         while first || next_missing < missing.len() {

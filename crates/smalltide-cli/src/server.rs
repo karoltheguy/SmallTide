@@ -720,6 +720,17 @@ fn admit(
         }
     };
     pc.rewound_to(lane, &plan, reuse_len);
+    pc.touch_prefixes(&prompt_ids);
+    eprintln!(
+        "[prefix] lane {lane}: {} - reused {reuse_len} of {} prompt tokens",
+        match &plan {
+            PrefixPlan::Extend { .. } => "same conversation",
+            PrefixPlan::Restore { global: true, .. } => "restored a snapshot from another conversation",
+            PrefixPlan::Restore { .. } => "restored a snapshot",
+            PrefixPlan::Reset => "no cached prefix",
+        },
+        prompt_ids.len()
+    );
 
     // Snapshot points: the first user-message boundary (shared system/tool prefix) and one
     // token before the prompt end (the last token is always re-processed, so this serves exact
@@ -727,7 +738,8 @@ fn admit(
     // exactly on its point.
     let end = prompt_ids.len();
     let mut points: Vec<usize> = Vec::new();
-    if let Some(bd) = prompt_ids.iter().position(|&t| t == TOK_MESSAGE_USER) {
+    let shared_point = prompt_ids.iter().position(|&t| t == TOK_MESSAGE_USER);
+    if let Some(bd) = shared_point {
         if bd > reuse_len && bd >= 16 {
             points.push(bd);
         }
@@ -748,7 +760,7 @@ fn admit(
         if cache_prompt && points.contains(&a) && !pc.has_snapshot_of(&prompt_ids[..a]) {
             let mut slot = pc.take_payload(a);
             match engine.snapshot_state(a, &mut slot) {
-                Ok(()) => pc.insert(lane, a, slot.unwrap()),
+                Ok(()) => pc.insert_kind(lane, a, slot.unwrap(), Some(a) == shared_point),
                 Err(e) => eprintln!("[prefix-cache] snapshot at {a} failed: {e}"),
             }
         }

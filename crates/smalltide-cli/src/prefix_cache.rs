@@ -45,6 +45,9 @@ pub struct PrefixStats {
 struct Snap<S> {
     tokens: Vec<u32>,
     tick: u64,
+    /// Taken at a shared-prefix point (system / tool prompt before the first user message):
+    /// evicted last.
+    shared: bool,
     payload: S,
     /// Routing demand of the request that produced this snapshot (prompt + answer): expected
     /// routing of the conversation's next turn (prompt-aware expert loading).
@@ -153,6 +156,37 @@ impl<S> PrefixCache<S> {
         }
     }
 
+    /// Marks every snapshot that `prompt` starts with as used now: a shared system prompt stays
+    /// fresh while conversations keep extending it in their lanes (no restore needed there).
+    pub fn touch_prefixes(&mut self, prompt: &[u32]) {
+        self.tick += 1;
+        let t = self.tick;
+        for sn in self.snaps.iter_mut() {
+            if !sn.tokens.is_empty() && prompt.starts_with(&sn.tokens) {
+                sn.tick = t;
+            }
+        }
+    }
+
+    /// Eviction order: per-turn snapshots that a longer snapshot already extends (superseded by
+    /// the same conversation's later turn), then other per-turn snapshots, then shared prefixes;
+    /// least recently used first within a class.
+    fn eviction_victim(&self) -> usize {
+        let class = |i: usize| -> u8 {
+            let sn = &self.snaps[i];
+            if sn.shared {
+                return 2;
+            }
+            let superseded = self
+                .snaps
+                .iter()
+                .enumerate()
+                .any(|(j, o)| j != i && o.tokens.len() > sn.tokens.len() && o.tokens.starts_with(&sn.tokens));
+            if superseded { 0 } else { 1 }
+        };
+        (0..self.snaps.len()).min_by_key(|&i| (class(i), self.snaps[i].tick)).unwrap()
+    }
+
     /// Records the outcome of `plan` once the engine state was rewound to `pos` (0 for Reset).
     /// Snapshots of other sequences are kept: they carry their own global KV.
     pub fn rewound_to(&mut self, lane: usize, plan: &PrefixPlan, pos: usize) {
@@ -182,7 +216,7 @@ impl<S> PrefixCache<S> {
         while !self.snaps.is_empty()
             && (self.snaps.len() >= self.max_snaps || self.snapshot_tokens() + pos > self.max_tokens)
         {
-            let (i, _) = self.snaps.iter().enumerate().min_by_key(|(_, s)| s.tick).unwrap();
+            let i = self.eviction_victim();
             let s = self.snaps.remove(i);
             self.stats.evictions += 1;
             self.pool.push(s.payload);
@@ -191,17 +225,24 @@ impl<S> PrefixCache<S> {
     }
 
     /// Stores a filled snapshot describing `lane`'s state after `live[lane][..pos]`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert(&mut self, lane: usize, pos: usize, payload: S) {
+        self.insert_kind(lane, pos, payload, false)
+    }
+
+    /// `insert`; `shared`: a shared-prefix point (evicted last).
+    pub fn insert_kind(&mut self, lane: usize, pos: usize, payload: S, shared: bool) {
         debug_assert!(pos <= self.live[lane].len());
         self.tick += 1;
         self.stats.snapshots_taken += 1;
         let tokens = self.live[lane][..pos].to_vec();
         if let Some(i) = self.snaps.iter().position(|s| s.tokens == tokens) {
-            let old = std::mem::replace(&mut self.snaps[i], Snap { tokens, tick: self.tick, payload, demand: None });
+            let shared = shared || self.snaps[i].shared;
+            let old = std::mem::replace(&mut self.snaps[i], Snap { tokens, tick: self.tick, shared, payload, demand: None });
             self.pool.push(old.payload);
             return;
         }
-        self.snaps.push(Snap { tokens, tick: self.tick, payload, demand: None });
+        self.snaps.push(Snap { tokens, tick: self.tick, shared, payload, demand: None });
     }
 
     /// Attaches `demand` to the snapshot of exactly `prefix` (if any).
@@ -286,6 +327,32 @@ mod tests {
         assert_eq!(plan, PrefixPlan::Restore { snap_idx: 0, pos: 3, global: true });
         assert_eq!(pc.live[0], vec![1, 2, 3, 4, 60, 61]);
         assert_eq!(pc.stats.cross_restores, 1);
+    }
+
+    #[test]
+    fn shared_prefix_survives_long_conversation() {
+        // Budget of 3 snapshots: a system prefix (10 tokens) and a conversation whose every turn
+        // adds a per-turn snapshot. The shared prefix must survive and serve a new session.
+        let mut pc: PrefixCache<u32> = PrefixCache::new(2, 3, 1_000_000);
+        let sys: Vec<u32> = (0..10).collect();
+        let mut conv = sys.clone();
+        conv.extend(100..105);
+        pc.live[0] = conv.clone();
+        pc.insert_kind(0, 10, 0, true);
+        for turn in 0..6u32 {
+            conv.extend((200 + turn * 10)..(205 + turn * 10));
+            pc.touch_prefixes(&conv);
+            pc.live[0] = conv.clone();
+            let n = conv.len() - 1;
+            let p = pc.take_payload(n).unwrap_or(turn + 1);
+            pc.insert(0, n, p);
+        }
+        let mut other = sys.clone();
+        other.extend(900..905);
+        match pc.plan(1, &other) {
+            PrefixPlan::Restore { pos, .. } => assert_eq!(pos, 10),
+            p => panic!("expected a restore of the shared prefix, got {p:?}"),
+        }
     }
 
     #[test]

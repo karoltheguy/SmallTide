@@ -72,6 +72,19 @@ enum StreamEvent {
     Error(String),
 }
 
+/// Logs an engine error for a request; a lost GPU context (HIP launch failure / illegal address:
+/// sticky, every later launch fails too) ends the process with a clear message instead of a server
+/// that answers every request with an error.
+fn engine_error(what: &str, msg: &str) -> String {
+    let line = format!("{what}: {msg}");
+    eprintln!("[error] {line}");
+    if ["hipError_t=719", "hipError_t=700", "hipError_t=999"].iter().any(|c| msg.contains(c)) {
+        eprintln!("[fatal] the GPU context is lost ({msg}); the server must be restarted - exiting");
+        std::process::exit(2);
+    }
+    line
+}
+
 /// `max_tokens` when a request gives none: `SMALLTIDE_MAX_TOKENS` (default 48K); the lane's
 /// context still bounds it.
 fn default_max_tokens() -> usize {
@@ -679,9 +692,20 @@ fn engine_worker_loop(
         // ends its request (finish_reason "length").
         for l in 0..n_lanes {
             let Some(req) = active[l].as_ref() else { continue };
-            if !engine.kv_reserve(l, req.pos + 1).unwrap_or(false) {
-                let req = active[l].take().unwrap();
-                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+            match engine.kv_reserve(l, req.pos + 1) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!("[kv] lane {l}: the KV pool cannot hold position {} - request ends (length)", req.pos + 1);
+                    let req = active[l].take().unwrap();
+                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                }
+                Err(e) => {
+                    let msg = engine_error("kv reserve", &e.to_string());
+                    let req = active[l].take().unwrap();
+                    let _ = req.event_tx.send(StreamEvent::Error(msg));
+                    pc.invalidate(l);
+                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                }
             }
         }
         for l in engine.take_lost_lanes() {
@@ -717,7 +741,7 @@ fn engine_worker_loop(
                         !req.accept(&tok, engine.lane_max_seq(l))
                     }
                     Err(msg) => {
-                        let _ = req.event_tx.send(StreamEvent::Error(msg));
+                        let _ = req.event_tx.send(StreamEvent::Error(engine_error("decode", &msg)));
                         pc.invalidate(l);
                         true
                     }
@@ -734,7 +758,7 @@ fn engine_worker_loop(
             engine.select_lane(l);
             let mut done = false;
             if let Err(e) = engine.forward_token(req.next_tok, req.pos, false, true) {
-                let _ = req.event_tx.send(StreamEvent::Error(format!("decode error: {e}")));
+                let _ = req.event_tx.send(StreamEvent::Error(engine_error("decode error", &e.to_string())));
                 pc.invalidate(l);
                 done = true;
             } else {
@@ -749,7 +773,7 @@ fn engine_worker_loop(
                         }
                     }
                     Err(e) => {
-                        let _ = req.event_tx.send(StreamEvent::Error(format!("sample error: {e}")));
+                        let _ = req.event_tx.send(StreamEvent::Error(engine_error("sample error", &e.to_string())));
                         done = true;
                     }
                 }
@@ -808,7 +832,7 @@ fn admit(
         Ok(p) => p,
         Err(e) => {
             pc.invalidate(lane);
-            let _ = event_tx.send(StreamEvent::Error(format!("prefix restore: {e}")));
+            let _ = event_tx.send(StreamEvent::Error(engine_error("prefix restore", &e.to_string())));
             return None;
         }
     };
@@ -859,7 +883,7 @@ fn admit(
         }
         if let Err(e) = engine.prefill(&prompt_ids[a..b], a, b == end) {
             pc.invalidate(lane);
-            let _ = event_tx.send(StreamEvent::Error(format!("prefill error at pos {a}..{b}: {e}")));
+            let _ = event_tx.send(StreamEvent::Error(engine_error(&format!("prefill error at pos {a}..{b}"), &e.to_string())));
             return None;
         }
         pc.live[lane].extend_from_slice(&prompt_ids[a..b]);
@@ -875,7 +899,7 @@ fn admit(
     let next_tok = match engine.sample_next_token(&sampling, &[]) {
         Ok(t) => t,
         Err(e) => {
-            let _ = event_tx.send(StreamEvent::Error(format!("sample error: {e}")));
+            let _ = event_tx.send(StreamEvent::Error(engine_error("sample error", &e.to_string())));
             return None;
         }
     };

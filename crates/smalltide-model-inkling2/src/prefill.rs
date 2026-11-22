@@ -186,6 +186,19 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         while off < tokens.len() {
             let m = (tokens.len() - off).min(PREFILL_CHUNK);
             let last = off + m == tokens.len();
+            if off > 0 {
+                // Prompt-aware loading: swaps queued after the previous chunk that have landed
+                // are published now (non-blocking), the next ones are planned from this prompt's
+                // routing so far and overlap the next chunk.
+                let published = self.tide.poll_pending()?;
+                self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+                if self.prefill_chunk_swaps > 0 {
+                    let ops = self.tide.scheduler.plan_prefill_progress_swaps(self.prefill_chunk_swaps);
+                    if !ops.is_empty() {
+                        self.tide.execute_transfers(&ops, false, true)?;
+                    }
+                }
+            }
             self.rows_forward(&tokens[off..off + m], RowsMode::Prefill { pos0: pos0 + off }, need_logits && last)?;
             off += m;
         }

@@ -40,6 +40,10 @@ pub struct TideTelemetry {
     pub prefill_weight_total: f64,
     #[serde(default)]
     pub prefill_weight_skipped: f64,
+    /// Prompt-aware async swaps (anticipated from conversation memory, between prefill chunks,
+    /// at the prefill -> decode boundary).
+    #[serde(default)]
+    pub prompt_aware_swaps: u64,
     /// RAM -> VRAM promotions made during decode by the per-token async planner.
     #[serde(default)]
     pub decode_async_promotions: u64,

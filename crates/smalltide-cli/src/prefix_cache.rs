@@ -46,6 +46,9 @@ struct Snap<S> {
     tokens: Vec<u32>,
     tick: u64,
     payload: S,
+    /// Routing demand of the request that produced this snapshot (prompt + answer): expected
+    /// routing of the conversation's next turn (prompt-aware expert loading).
+    demand: Option<Vec<f32>>,
 }
 
 pub struct PrefixCache<S> {
@@ -194,11 +197,23 @@ impl<S> PrefixCache<S> {
         self.stats.snapshots_taken += 1;
         let tokens = self.live[lane][..pos].to_vec();
         if let Some(i) = self.snaps.iter().position(|s| s.tokens == tokens) {
-            let old = std::mem::replace(&mut self.snaps[i], Snap { tokens, tick: self.tick, payload });
+            let old = std::mem::replace(&mut self.snaps[i], Snap { tokens, tick: self.tick, payload, demand: None });
             self.pool.push(old.payload);
             return;
         }
-        self.snaps.push(Snap { tokens, tick: self.tick, payload });
+        self.snaps.push(Snap { tokens, tick: self.tick, payload, demand: None });
+    }
+
+    /// Attaches `demand` to the snapshot of exactly `prefix` (if any).
+    pub fn set_demand(&mut self, prefix: &[u32], demand: &[f32]) {
+        if let Some(sn) = self.snaps.iter_mut().find(|s| s.tokens == prefix) {
+            sn.demand = Some(demand.to_vec());
+        }
+    }
+
+    /// Demand attached to snapshot `idx`.
+    pub fn snapshot_demand(&self, idx: usize) -> Option<&[f32]> {
+        self.snaps[idx].demand.as_deref()
     }
 
     /// Drops `lane`'s live sequence (e.g. after an engine error). Snapshots carry their own global

@@ -315,6 +315,9 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
         });
     }
     engine.prefill_min_share = parse("SMALLTIDE_PREFILL_MIN_SHARE", 1.0f32, "tokens of routing share");
+    engine.prefill_chunk_swaps = parse("SMALLTIDE_PREFILL_CHUNK_SWAPS", 96usize, "a swap count");
+    engine.anticipate_swaps = parse("SMALLTIDE_ANTICIPATE_SWAPS", 256usize, "a swap count");
+    engine.anticipate_wait = parse::<u8>("SMALLTIDE_ANTICIPATE_WAIT", 0, "0 or 1") != 0;
     engine.tide.scheduler.async_hysteresis = parse("SMALLTIDE_ASYNC_HYSTERESIS", 1.25f64, "a factor >= 1");
     let preload_ops = engine.tide.scheduler.plan_pre_prefill(None);
     engine.tide.execute_transfers(&preload_ops, true, false).expect("Mode 1 pre-prefill");

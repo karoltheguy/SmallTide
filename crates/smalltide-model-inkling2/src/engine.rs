@@ -203,6 +203,13 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     batch_pending_rows: usize,
     /// The rows forward in progress is a batched decode round (GEMV-style kernels for <= 8 rows).
     pub(crate) rows_decode: bool,
+    /// Lanes of the rows of the last batched round (Tide demand bookkeeping per lane).
+    batch_lanes: Vec<usize>,
+    /// Prompt-aware loading: max async swaps between prefill chunks / before a request.
+    pub prefill_chunk_swaps: usize,
+    pub anticipate_swaps: usize,
+    /// Wait for the anticipated swaps before prefill (the prompt itself then hits them).
+    pub anticipate_wait: bool,
 }
 
 /// Most rows (concurrent sequences) one batched decode round can carry.
@@ -369,6 +376,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             batch_route_log: None,
             batch_pending_rows: 0,
             rows_decode: false,
+            batch_lanes: Vec::new(),
+            prefill_chunk_swaps: 96,
+            anticipate_swaps: 256,
+            anticipate_wait: true,
             profile: StepProfile::default(),
         })
     }
@@ -573,10 +584,29 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
     /// Mode 2: Prefill -> Decode Boundary Tide Rebalance.
     pub fn rebalance_after_prefill(&mut self, max_swaps: usize) -> Result<usize> {
+        // Async: the copies overlap the first decode tokens and are published once they land
+        // (the copy stream waits for every kernel that could still read the evicted slots).
         let ops = self.tide.scheduler.plan_prefill_decode_rebalance(max_swaps);
         let n = ops.len();
         if n > 0 {
-            self.tide.execute_transfers(&ops, true, false)?;
+            self.tide.execute_transfers(&ops, false, true)?;
+        }
+        Ok(n)
+    }
+
+    /// Prompt-aware loading before a request's prefill: async swaps toward `demand` (expected
+    /// routing shares, e.g. the conversation's previous turn). Returns the number of transfers.
+    pub fn anticipate(&mut self, demand: &[f32]) -> Result<usize> {
+        if self.anticipate_swaps == 0 {
+            return Ok(0);
+        }
+        let ops = self.tide.scheduler.plan_anticipated_swaps(demand, self.anticipate_swaps);
+        let n = ops.len();
+        if n > 0 {
+            self.tide.execute_transfers(&ops, false, true)?;
+        }
+        if n > 0 && self.anticipate_wait {
+            self.tide.wait_and_publish_all_pending()?;
         }
         Ok(n)
     }
@@ -713,6 +743,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.rng_state = next.rng_state;
         self.global_max_seq = self.lane_max_seq[i];
         self.active_lane = i;
+        self.tide.scheduler.cache.set_current_lane(i);
     }
 
     /// The single-row logits buffer (`[unpadded_vocab]` f32).
@@ -763,6 +794,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let lp: Vec<(usize, usize)> = rows.iter().map(|r| (r.0, r.2)).collect();
         self.rows_forward(&tokens, crate::prefill::RowsMode::Decode { rows: &lp }, true)?;
         self.batch_pending_rows = m;
+        self.batch_lanes = rows.iter().map(|r| r.0).collect();
         Ok(())
     }
 
@@ -790,6 +822,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         for il in 0..n_log {
             let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
             for r in 0..m {
+                let lane = self.batch_lanes.get(r).copied().unwrap_or(self.active_lane);
+                self.tide.scheduler.cache.set_current_lane(lane);
                 let base = (il * MAX_BATCH_ROWS + r) * 16;
                 let mut ids = [0u16; 8];
                 let mut ws = [0f32; 8];
@@ -800,6 +834,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 self.tide.scheduler.record_batch_dispatch(phys, &ids, &ws);
             }
         }
+        self.tide.scheduler.cache.set_current_lane(self.active_lane);
         self.tokens_decoded += m as u64;
         self.tide_step_pending = true;
         Ok(())

@@ -251,6 +251,9 @@ pub fn run_serve(args: &[String]) {
 
 /// One generation in flight on an engine lane.
 struct ActiveReq {
+    lane: usize,
+    /// `prompt[..len - 1]`: key of this prompt's end snapshot (conversation memory).
+    prompt_key: Vec<u32>,
     is_chat: bool,
     single_tool_call: bool,
     max_tokens: usize,
@@ -379,6 +382,29 @@ impl ActiveReq {
     }
 }
 
+/// Finishes `req` and remembers its routing demand (prompt + answer) as its conversation's
+/// expected routing: on its lane (next turn extends it) and on its prompt's end snapshot (next
+/// turn restores it, possibly on another lane).
+fn finish_req(
+    engine: &mut Inkling2Engine<HipBackend>,
+    pc: &mut PrefixCache<SeqSnapshot>,
+    lane_demand: &mut [Option<Vec<f32>>],
+    req: ActiveReq,
+) -> f64 {
+    let lane = req.lane;
+    let demand = engine.tide.scheduler.cache.take_lane_demand(lane);
+    if demand.iter().any(|&d| d > 0.0) {
+        pc.set_demand(&req.prompt_key, &demand);
+        lane_demand[lane] = Some(demand);
+    }
+    let hit = engine.telemetry().total_vram_hit_rate();
+    let tps = req.finish(hit);
+    if let Some(line) = engine.tide.scheduler.finish_request() {
+        println!("{line}");
+    }
+    tps
+}
+
 /// Engine worker: owns the engine and serves up to `engine.num_lanes()` requests at once.
 ///
 /// Each round: drain commands (blocking only when idle), admit at most one queued request into
@@ -398,6 +424,7 @@ fn engine_worker_loop(
         env_usize("SMALLTIDE_PREFIX_TOKENS", 65_536),
     );
     let mut active: Vec<Option<ActiveReq>> = (0..n_lanes).map(|_| None).collect();
+    let mut lane_demand: Vec<Option<Vec<f32>>> = vec![None; n_lanes];
     let mut queue: std::collections::VecDeque<EngineCommand> = std::collections::VecDeque::new();
     let mut last_decode_tok_s: f64 = 0.0;
     let mut last_prefill_tok_s: f64 = 0.0;
@@ -453,6 +480,7 @@ fn engine_worker_loop(
                         "prefill_weight_total": tel.prefill_weight_total,
                         "prefill_weight_skipped": tel.prefill_weight_skipped,
                         "decode_async_promotions": tel.decode_async_promotions,
+                        "prompt_aware_swaps": tel.prompt_aware_swaps,
                         "experts_vram_resident": { "prelude": pre, "loop_core": core, "coda": coda },
                         "experts_ram_warm": ram,
                         "prefix_cache": {
@@ -536,6 +564,18 @@ fn engine_worker_loop(
                         } else {
                             (fits[0], PrefixPlan::Reset)
                         };
+                        // Prompt-aware loading: the conversation's remembered routing (the
+                        // snapshot it restores, or this lane's live conversation it extends).
+                        let memory: Option<Vec<f32>> = match &plan {
+                            PrefixPlan::Restore { snap_idx, .. } => pc.snapshot_demand(*snap_idx).map(|d| d.to_vec()),
+                            PrefixPlan::Extend { .. } => lane_demand[lane].clone(),
+                            PrefixPlan::Reset => None,
+                        };
+                        engine.select_lane(lane);
+                        let _ = engine.tide.scheduler.cache.take_lane_demand(lane);
+                        if let Some(d) = &memory {
+                            let _ = engine.anticipate(d);
+                        }
                         if let Some(req) = admit(
                             &mut engine, &tok, &mut pc, lane, plan, prompt_ids, is_chat, forced_tool,
                             single_tool_call, max_tokens, sampling, stop_strings, cache_prompt, event_tx,
@@ -545,11 +585,7 @@ fn engine_worker_loop(
                             if req.accept(&tok, engine.lane_max_seq(lane)) {
                                 active[lane] = Some(req);
                             } else {
-                                let hit = engine.telemetry().total_vram_hit_rate();
-                                last_decode_tok_s = req.finish(hit);
-                                if let Some(line) = engine.tide.scheduler.finish_request() {
-                                    println!("{line}");
-                                }
+                                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
                             }
                         }
                     }
@@ -595,11 +631,7 @@ fn engine_worker_loop(
                 };
                 if done {
                     let req = active[l].take().unwrap();
-                    let hit = engine.telemetry().total_vram_hit_rate();
-                    last_decode_tok_s = req.finish(hit);
-                    if let Some(line) = engine.tide.scheduler.finish_request() {
-                        println!("{line}");
-                    }
+                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
                 }
             }
             continue;
@@ -631,11 +663,7 @@ fn engine_worker_loop(
             }
             if done {
                 let req = active[l].take().unwrap();
-                let hit = engine.telemetry().total_vram_hit_rate();
-                last_decode_tok_s = req.finish(hit);
-                if let Some(line) = engine.tide.scheduler.finish_request() {
-                    println!("{line}");
-                }
+                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
             }
         }
     }
@@ -747,6 +775,8 @@ fn admit(
         }
     };
     Some(ActiveReq {
+        lane,
+        prompt_key: prompt_ids[..end.saturating_sub(1)].to_vec(),
         is_chat,
         single_tool_call,
         max_tokens,

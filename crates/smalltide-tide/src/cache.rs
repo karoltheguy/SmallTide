@@ -140,6 +140,10 @@ pub struct TideCache {
     prior_rate: Vec<f32>,
     /// Weight of the prior in an expert's value, in steady-state heat units (see `value`).
     prior_heat_equiv: f32,
+    /// Per-lane demand of the request in flight on that lane (conversation memory for
+    /// prompt-aware loading); `current_lane` receives the touches.
+    lane_demand: Vec<Vec<f32>>,
+    current_lane: usize,
 }
 
 /// Per-token heat decay (half-life ~46 tokens).
@@ -190,7 +194,33 @@ impl TideCache {
             demand: vec![0.0; total],
             prior_rate: vec![0.0; total],
             prior_heat_equiv: 0.0,
+            lane_demand: vec![vec![0.0; total]],
+            current_lane: 0,
         }
+    }
+
+    /// Routing observations go to `lane`'s demand from now on.
+    pub fn set_current_lane(&mut self, lane: usize) {
+        let total = self.entries.len();
+        while self.lane_demand.len() <= lane {
+            self.lane_demand.push(vec![0.0; total]);
+        }
+        self.current_lane = lane;
+    }
+
+    /// `lane`'s demand since the last call (and resets it).
+    pub fn take_lane_demand(&mut self, lane: usize) -> Vec<f32> {
+        let total = self.entries.len();
+        if lane >= self.lane_demand.len() {
+            return vec![0.0; total];
+        }
+        std::mem::replace(&mut self.lane_demand[lane], vec![0.0; total])
+    }
+
+    /// Adds anticipated heat (expected routing shares of an upcoming request).
+    pub fn add_heat(&mut self, id: ExpertId, h: f32) {
+        let idx = self.flat_index(id);
+        self.entries[idx].heat += h;
     }
 
     /// Installs prior per-token routing rates (`TidePriors::rates`). `prior_weight` is how many
@@ -503,6 +533,7 @@ impl TideCache {
     pub fn touch_expert(&mut self, id: ExpertId, router_share: f32) {
         let idx = self.flat_index(id);
         self.demand[idx] += router_share;
+        self.lane_demand[self.current_lane][idx] += router_share;
         let e = &mut self.entries[idx];
         e.heat += router_share;
         e.last_touch_step = self.step;

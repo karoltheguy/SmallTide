@@ -251,20 +251,28 @@ impl TideScheduler {
             self.prefill_scores.fill(0.0);
             return Vec::new();
         }
-        // Candidates: experts the prompt routed to that are not resident, best value first.
-        let mut ranked: Vec<(ExpertId, f64)> = self
-            .prefill_scores
-            .iter()
-            .enumerate()
-            .filter(|(_, &s)| s > 0.0)
-            .map(|(idx, _)| self.cache.expert_from_flat(idx))
-            .filter(|&id| self.cache.entry(id).vram_slot.is_missing())
+        let ops = self.plan_prefill_progress_swaps(max_swaps);
+        self.prefill_scores.fill(0.0);
+        ops
+    }
+
+    /// Async swaps toward `cands` (missing experts): best value first, each must beat the eviction
+    /// floor of its pool by `cache::SWAP_HYSTERESIS`. RAM-ready experts are promoted (RAM -> VRAM,
+    /// copy stream); the others get an async disk -> RAM read and are picked up by later passes.
+    /// Never reads disk synchronously.
+    pub fn plan_async_swaps(&mut self, cands: Vec<ExpertId>, max_swaps: usize) -> Vec<TransferOp> {
+        let mut ranked: Vec<(ExpertId, f64)> = cands
+            .into_iter()
+            .filter(|&id| {
+                let e = self.cache.entry(id);
+                (e.vram_slot.is_missing() || e.is_scratch_slot) && !self.cache.is_vram_pending(id)
+            })
             .map(|id| (id, self.cache.value(id)))
             .collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-
         let mut ops = Vec::new();
         let mut swaps = 0usize;
+        let mut ram_reads = 0usize;
         let mut floors: [Option<Option<f64>>; 2] = [None, None];
         for (id, val) in ranked {
             if swaps >= max_swaps {
@@ -279,17 +287,57 @@ impl TideScheduler {
                     continue;
                 }
             }
-            floors[ci] = None;
+            if !self.cache.is_ram_ready(id) {
+                if ram_reads < max_swaps {
+                    if let Some(op) = self.cache.promote_to_ram_with_flag(id, true) {
+                        self.record_transfer_telemetry(&op, false);
+                        ops.push(op);
+                        ram_reads += 1;
+                    }
+                }
+                *self.pending_async_vram.entry(id).or_insert(0.0) += 1.0;
+                continue;
+            }
             let pin = !self.cache.has_priors() && self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
-            if let Some(op) = self.cache.promote_to_vram(id, pin, true) {
+            if let Some(op) = self.cache.promote_to_vram(id, pin, false) {
                 self.record_transfer_telemetry(&op, false);
+                self.telemetry.prompt_aware_swaps += 1;
                 ops.push(op);
                 swaps += 1;
+                floors[ci] = None;
             }
         }
-
-        self.prefill_scores.fill(0.0);
         ops
+    }
+
+    /// Between prefill chunks: async swaps for the missing experts this prompt has routed to so
+    /// far (its heat already holds the prompt's demand).
+    pub fn plan_prefill_progress_swaps(&mut self, max_swaps: usize) -> Vec<TransferOp> {
+        let cands: Vec<ExpertId> = self
+            .prefill_scores
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v > 0.0)
+            .map(|(i, _)| self.cache.expert_from_flat(i))
+            .collect();
+        self.plan_async_swaps(cands, max_swaps)
+    }
+
+    /// Before a request's prefill: anticipate its routing from `demand` (e.g. the conversation's
+    /// previous turn, sum of routing shares per expert): adds it as heat, then plans async swaps for
+    /// the missing experts it covers.
+    pub fn plan_anticipated_swaps(&mut self, demand: &[f32], max_swaps: usize) -> Vec<TransferOp> {
+        let mut cands = Vec::new();
+        for (i, &d) in demand.iter().enumerate() {
+            if d > 0.0 {
+                let id = self.cache.expert_from_flat(i);
+                self.cache.add_heat(id, d);
+                if self.cache.entry(id).vram_slot.is_missing() {
+                    cands.push(id);
+                }
+            }
+        }
+        self.plan_async_swaps(cands, max_swaps)
     }
 
     /// Returns true if all `n_routed_experts` for `layer` are currently resident in VRAM.
@@ -736,8 +784,19 @@ mod tests {
             sched.record_prefill_routing(PhysicalLayerId(22), &hot_ids, &weights);
         }
         let rebal = sched.plan_prefill_decode_rebalance(32);
-        sched.cache.publish_all_pending();
         assert!(!rebal.is_empty());
+        // Async: experts not in RAM get a disk -> RAM read first (never a sync disk read);
+        // once those land, the paced async steps promote them.
+        for op in &rebal {
+            if let TransferOp::DiskToRam { expert, .. } = op {
+                sched.cache.mark_ram_ready(*expert);
+            }
+        }
+        sched.tide_cfg.max_async_vram_promotions_per_token = 8;
+        for _ in 0..4 {
+            let _ = sched.plan_async_step();
+        }
+        sched.cache.publish_all_pending();
         for &e in &hot_ids {
             assert!(
                 !sched.cache.entry(ExpertId { layer: PhysicalLayerId(22), expert: e }).vram_slot.is_missing(),

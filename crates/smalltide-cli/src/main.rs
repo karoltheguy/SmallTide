@@ -722,6 +722,14 @@ fn run_generate(args: &[String]) {
         std::env::var("SMALLTIDE_BATCH_BENCH").ok().and_then(|v| v.parse::<usize>().ok()).map_or(1, |m| m + 1)
     });
 
+    // `run` is for dev / benchmarks: it does not teach the routing priors (repeated test prompts
+    // would skew them) unless SMALLTIDE_PRIORS_UPDATE is set explicitly. `serve` learns from traffic.
+    if std::env::var_os("SMALLTIDE_PRIORS_UPDATE").is_none() {
+        if let Some(st) = engine.tide.scheduler.priors_store.as_mut() {
+            st.update = false;
+        }
+    }
+
     if std::env::var_os("SMALLTIDE_BENCH_MOE").is_some() {
         let n4 = nvfp4_slots as u32;
         let m8 = mxfp8_slots as u32;

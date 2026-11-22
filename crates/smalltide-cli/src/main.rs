@@ -30,6 +30,7 @@ fn main() {
     }
     match args.get(1).map(String::as_str) {
         Some("probe") => run_probe(),
+        Some("vision-check") => run_vision_check(&args[2..]),
         Some("vram-probe") => run_vram_probe(),
         Some("bench-gpu") => run_bench_gpu(),
         Some("stress-rescue") => {
@@ -1751,4 +1752,57 @@ fn run_stress_rescue(mode: &str, tokens: usize) {
         total_rescue_us / total_rescues.max(1) as f64,
         (slab_bytes as f64 / 1e9) / (total_rescue_us / total_rescues.max(1) as f64 / 1e6),
     );
+}
+
+/// Dev: `vision-check --rows R --cols C [--model DIR] [--patches IN.bin] [--patches-out P.bin] --out O.bin`
+/// runs the vision tower alone on one image's patches (bf16 `[R * C * 4][1200]`; pseudo-random when
+/// no file is given) and writes the feature rows (f32 `[R * C][hidden]`) for tools/inkling2_vision_ref.py.
+/// SMALLTIDE_VISION_DUMP=PREFIX also writes the intermediates.
+fn run_vision_check(args: &[String]) {
+    use smalltide_model_inkling2::vision::{VisionTower, PATCH_K, PER_TOKEN};
+    let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let rows: usize = arg("--rows").and_then(|v| v.parse().ok()).unwrap_or(3);
+    let cols: usize = arg("--cols").and_then(|v| v.parse().ok()).unwrap_or(5);
+    let model = std::path::PathBuf::from(arg("--model").unwrap_or_else(|| "models/Inkling-2-Mini".into()));
+    let hidden: usize = serde_json::from_slice::<serde_json::Value>(&std::fs::read(model.join("config.json")).expect("config.json"))
+        .ok()
+        .and_then(|v| v["vision_config"]["text_hidden_size"].as_u64())
+        .expect("vision_config.text_hidden_size") as usize;
+    let n = rows * cols * PER_TOKEN * PATCH_K;
+    let patches: Vec<u16> = match arg("--patches") {
+        Some(p) => std::fs::read(p).expect("patches").chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
+        None => {
+            // values in [-1, 1) as bf16, a fixed sequence
+            let mut x = 0x2545_F491_4F6C_DD1Du64;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let f = ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0;
+                    (f.to_bits() >> 16) as u16
+                })
+                .collect()
+        }
+    };
+    assert_eq!(patches.len(), n, "patches: {} values, {rows} x {cols} tokens need {n}", patches.len());
+    if let Some(p) = arg("--patches-out") {
+        std::fs::write(p, patches.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).expect("patches-out");
+    }
+    let backend = HipBackend::new_auto().expect("init HipBackend");
+    let s = backend.create_stream(smalltide_core::QueueKind::Compute).expect("stream");
+    let tower = VisionTower::open(&model.join("model-00001-of-00001.safetensors"), hidden).expect("vision tower");
+    let reps: usize = arg("--reps").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let mut out = Vec::new();
+    for _ in 0..reps {
+        let (o, st) = tower.encode(&backend, s, &patches, rows, cols).expect("encode");
+        println!("vision: {rows} x {cols} = {} tokens in {:.1} ms, {:.1} MB on the device", st.tokens, st.ms, st.device_bytes as f64 / 1e6);
+        out = o;
+    }
+    let finite = out.iter().all(|v| v.is_finite());
+    let rms = (out.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / out.len() as f64).sqrt();
+    println!("rows: {} x {hidden}, finite {finite}, rms {rms:.4}", rows * cols);
+    if let Some(p) = arg("--out") {
+        std::fs::write(p, out.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).expect("out");
+    }
 }

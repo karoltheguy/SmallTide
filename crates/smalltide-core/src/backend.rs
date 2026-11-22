@@ -740,6 +740,36 @@ pub trait ComputeBackend: Send + Sync {
     /// `out` (f16) = `x` (f32) over `n` elements.
     fn f32_to_f16(&self, out: DeviceBuf, x: DeviceBuf, n: usize, stream: Stream) -> Result<()>;
 
+    // ---- Vision tower (f32 activations, BF16 weights) ----
+    /// `y[m][n]` (f32) = `x[m][k]` (f32, rounded to bf16) . `w[n][k]`^T (bf16); `k` a multiple of 32.
+    #[allow(clippy::too_many_arguments)]
+    fn vit_gemm_bf16(&self, _y: DeviceBuf, _x: DeviceBuf, _w: DeviceBuf, _m: usize, _n: usize, _k: usize,
+        _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("vision".into()))
+    }
+    /// A Linear's epilogue over `[m][n]`: `+ bias`, GELU when `gelu`, `* gamma`, `+ residual`
+    /// (each optional; bias / gamma bf16 `[n]`). `out` may be `y` or `residual`.
+    #[allow(clippy::too_many_arguments)]
+    fn vit_epilogue(&self, _out: DeviceBuf, _y: DeviceBuf, _bias: Option<DeviceBuf>, _gamma: Option<DeviceBuf>,
+        _residual: Option<DeviceBuf>, _m: usize, _n: usize, _gelu: bool, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("vision".into()))
+    }
+    /// LayerNorm over `rows` rows of `n` (weight / bias bf16 `[n]`). `out` may be `x`.
+    #[allow(clippy::too_many_arguments)]
+    fn vit_ln(&self, _out: DeviceBuf, _x: DeviceBuf, _w: DeviceBuf, _b: DeviceBuf, _rows: usize, _n: usize, _eps: f32,
+        _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("vision".into()))
+    }
+    /// Axial 2D RoPE on q and k of `qkv [rows][3][heads][64]` in place; `cs` / `sn` f32 `[rows][32]`.
+    fn vit_rope(&self, _qkv: DeviceBuf, _rows: usize, _heads: usize, _cs: DeviceBuf, _sn: DeviceBuf,
+        _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("vision".into()))
+    }
+    /// Full attention over `rows`: `qkv [rows][3][heads][64]` -> `out [rows][heads][64]`.
+    fn vit_attn(&self, _out: DeviceBuf, _qkv: DeviceBuf, _rows: usize, _heads: usize, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("vision".into()))
+    }
+
     // ---- DSpark drafter ----
     /// `out[r] = RMSNorm(sum_t alpha[t] * taps[t][r]) * w` over `rows`; taps `[4][tap_stride][d]`.
     #[allow(clippy::too_many_arguments)]

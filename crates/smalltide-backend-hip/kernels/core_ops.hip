@@ -363,6 +363,7 @@ __device__ __forceinline__ uint32_t kv_phys(const uint32_t* __restrict__ page_ta
 #include "inkling2_ops.hip"
 #include "batched_ops.hip"
 #include "prefill_ops.hip"
+#include "vision_ops.hip"
 
 // ---------------------------------------------------------------------------
 // Multi-segment GEMV: up to 8 independent y_s = W_s . x_s in one launch (FP8 E4M3 row-scaled or

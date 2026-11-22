@@ -371,7 +371,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, rescue_write_route, rescue_apply_patch, rescue_wait_and_patch, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, gemv_multi_wmma, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, dspark_argmax_final_margin, argmax_rows_part, argmax_rows_reduce, attn_prefill_wmma_split, attn_prefill_wmma_reduce, dspark_quant_fold_fp8, dspark_logits_argmax_fp8, dspark_rnn_step, dspark_ctx_store_fp8, dspark_attn_fp8_split, dspark_attn_reduce, dspark_embed_prep, add_rmsnorm_rows, dspark_qk_norm_rope, moe_w2_rows)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, rescue_write_route, rescue_apply_patch, rescue_wait_and_patch, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, gemv_multi_wmma, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, dspark_argmax_final_margin, argmax_rows_part, argmax_rows_reduce, attn_prefill_wmma_split, attn_prefill_wmma_reduce, dspark_quant_fold_fp8, dspark_logits_argmax_fp8, dspark_rnn_step, dspark_ctx_store_fp8, dspark_attn_fp8_split, dspark_attn_reduce, dspark_embed_prep, add_rmsnorm_rows, dspark_qk_norm_rope, moe_w2_rows, vit_gemm_bf16, vit_epilogue, vit_ln, vit_rope, vit_attn)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -2200,6 +2200,46 @@ impl ComputeBackend for HipBackend {
         }
         let mut args = [p(&mut a)];
         self.launch(self.kernels.ctrl_apply_norm_multi, (rows as u32, items.len() as u32, 1), 1024, &mut args, stream, "launch(ctrl_apply_norm_multi)")
+    }
+
+    fn vit_gemm_bf16(&self, y: DeviceBuf, x: DeviceBuf, w: DeviceBuf, m: usize, n: usize, k: usize,
+        stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c) = (self.dev_ptr(y)?, self.dev_ptr(x)?, self.dev_ptr(w)?);
+        let (mut mm, mut nn, mut kk) = (m as u32, n as u32, k as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut mm), p(&mut nn), p(&mut kk)];
+        self.launch(self.kernels.vit_gemm_bf16, (nn.div_ceil(64), mm.div_ceil(128), 1), 256, &mut args, stream, "launch(vit_gemm_bf16)")
+    }
+
+    fn vit_epilogue(&self, out: DeviceBuf, y: DeviceBuf, bias: Option<DeviceBuf>, gamma: Option<DeviceBuf>,
+        residual: Option<DeviceBuf>, m: usize, n: usize, gelu: bool, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c, mut d, mut e) = (self.dev_ptr(out)?, self.dev_ptr(y)?, self.opt_dev_ptr(bias)?,
+            self.opt_dev_ptr(gamma)?, self.opt_dev_ptr(residual)?);
+        let (mut mm, mut nn, mut g) = (m as u32, n as u32, gelu as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut mm), p(&mut nn), p(&mut g)];
+        self.launch(self.kernels.vit_epilogue, (nn.div_ceil(256), mm, 1), 256, &mut args, stream, "launch(vit_epilogue)")
+    }
+
+    fn vit_ln(&self, out: DeviceBuf, x: DeviceBuf, w: DeviceBuf, b: DeviceBuf, rows: usize, n: usize, eps: f32,
+        stream: Stream) -> Result<()> {
+        let (mut a, mut bb, mut c, mut d) = (self.dev_ptr(out)?, self.dev_ptr(x)?, self.dev_ptr(w)?, self.dev_ptr(b)?);
+        let (mut r, mut nn, mut e) = (rows as u32, n as u32, eps);
+        let mut args = [p(&mut a), p(&mut bb), p(&mut c), p(&mut d), p(&mut r), p(&mut nn), p(&mut e)];
+        self.launch(self.kernels.vit_ln, (r, 1, 1), 256, &mut args, stream, "launch(vit_ln)")
+    }
+
+    fn vit_rope(&self, qkv: DeviceBuf, rows: usize, heads: usize, cs: DeviceBuf, sn: DeviceBuf,
+        stream: Stream) -> Result<()> {
+        let (mut a, mut c, mut d) = (self.dev_ptr(qkv)?, self.dev_ptr(cs)?, self.dev_ptr(sn)?);
+        let (mut r, mut h) = (rows as u32, heads as u32);
+        let mut args = [p(&mut a), p(&mut r), p(&mut h), p(&mut c), p(&mut d)];
+        self.launch(self.kernels.vit_rope, (r, 1, 1), 256, &mut args, stream, "launch(vit_rope)")
+    }
+
+    fn vit_attn(&self, out: DeviceBuf, qkv: DeviceBuf, rows: usize, heads: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b) = (self.dev_ptr(out)?, self.dev_ptr(qkv)?);
+        let (mut r, mut h) = (rows as u32, heads as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut r), p(&mut h)];
+        self.launch(self.kernels.vit_attn, (r.div_ceil(64), h, 1), 64, &mut args, stream, "launch(vit_attn)")
     }
 
     fn f32_to_f16(&self, out: DeviceBuf, x: DeviceBuf, n: usize, stream: Stream) -> Result<()> {

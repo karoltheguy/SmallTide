@@ -11,6 +11,7 @@ pub mod drafter;
 pub mod engine;
 pub mod kv_pager;
 pub mod prefill;
+pub mod vision;
 pub mod weights;
 
 use smalltide_core::{Inkling2Config, LogicalLayerId, PhysicalLayerId};

@@ -261,6 +261,37 @@ pub trait ComputeBackend: Send + Sync {
         Err(crate::SmallTideError::Unsupported("stream wait value".into()))
     }
 
+    /// Allocates coherent host-mapped memory suitable for CPU<->GPU signals and wait flags.
+    fn alloc_host_signal(&self, size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {
+        self.alloc_host_mapped(size_bytes)
+    }
+
+    /// Copies `n_words` u32 values from `src` to coherent host-mapped `dst[0..n_words]`, flushes
+    /// system-scope stores, and publishes `ticket` to `dst[n_words]`.
+    fn rescue_write_route(
+        &self,
+        _dst: DeviceBuf,
+        _src: DeviceBuf,
+        _n_words: usize,
+        _ticket: u32,
+        _stream: Stream,
+    ) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("rescue_write_route".into()))
+    }
+
+    /// Post-wait compute-stream rescue barrier: if `patch_hdr[0] != 0`, invalidates GPU L2
+    /// (system-scope acquire) and applies slot-table updates on `stream`.
+    fn rescue_apply_patch(
+        &self,
+        _slot_table: DeviceBuf,
+        _patch_hdr: DeviceBuf,
+        _full_table: DeviceBuf,
+        _total_entries: usize,
+        _stream: Stream,
+    ) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("rescue_apply_patch".into()))
+    }
+
     fn alloc_host_mapped(&self, _size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {
         Err(crate::SmallTideError::Unsupported("host-mapped memory".into()))
     }

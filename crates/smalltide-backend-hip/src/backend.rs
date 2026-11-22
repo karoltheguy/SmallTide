@@ -702,6 +702,71 @@ impl ComputeBackend for HipBackend {
         unsafe { check_hip(f(s, ptr, value, HIP_STREAM_WAIT_VALUE_GTE, 0xFFFF_FFFF), "hipStreamWaitValue32") }
     }
 
+    fn alloc_host_signal(&self, size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {
+        self.bind();
+        const HIP_HOST_MALLOC_PORTABLE: u32 = 0x1;
+        const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
+        const HIP_HOST_MALLOC_COHERENT: u32 = 0x4000_0000;
+        let mut hptr: *mut c_void = ptr::null_mut();
+        let r = unsafe {
+            (self.rt.hip_host_malloc)(
+                &mut hptr,
+                size_bytes,
+                HIP_HOST_MALLOC_PORTABLE | HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_COHERENT,
+            )
+        };
+        if r != 0 || hptr.is_null() {
+            return self.alloc_host_mapped(size_bytes);
+        }
+        let mut dptr: *mut c_void = ptr::null_mut();
+        let r2 = unsafe { (self.rt.hip_host_get_device_pointer)(&mut dptr, hptr, 0) };
+        if r2 != 0 || dptr.is_null() {
+            unsafe { let _ = (self.rt.hip_host_free)(hptr); }
+            check_hip(r2, "hipHostGetDevicePointer(signal)")?;
+            return Err(SmallTideError::Backend { backend: "hip", message: "null device pointer for coherent signal memory".into() });
+        }
+        let pid = self.next_handle();
+        self.pinned_bufs.lock().unwrap().insert(pid, PinnedAlloc { ptr: hptr, size_bytes });
+        let did = self.next_handle();
+        self.dev_bufs
+            .lock()
+            .unwrap()
+            .insert(did, DeviceAlloc { ptr: dptr, size_bytes, borrowed: true });
+        Ok((DeviceBuf { id: did, offset_bytes: 0, size_bytes }, PinnedBuf { id: pid, size_bytes }))
+    }
+
+    fn rescue_write_route(
+        &self,
+        dst: DeviceBuf,
+        src: DeviceBuf,
+        n_words: usize,
+        ticket: u32,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_dst = self.dev_ptr(dst)?;
+        let mut d_src = self.dev_ptr(src)?;
+        let mut n_arg = n_words as u32;
+        let mut t_arg = ticket;
+        let mut args = [p(&mut d_dst), p(&mut d_src), p(&mut n_arg), p(&mut t_arg)];
+        self.launch(self.kernels.rescue_write_route, (1, 1, 1), 32, &mut args, stream, "launch(rescue_write_route)")
+    }
+
+    fn rescue_apply_patch(
+        &self,
+        slot_table: DeviceBuf,
+        patch_hdr: DeviceBuf,
+        full_table: DeviceBuf,
+        total_entries: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_tbl = self.dev_ptr(slot_table)?;
+        let mut d_pat = self.dev_ptr(patch_hdr)?;
+        let mut d_full = self.dev_ptr(full_table)?;
+        let mut tot = total_entries as u32;
+        let mut args = [p(&mut d_tbl), p(&mut d_pat), p(&mut d_full), p(&mut tot)];
+        self.launch(self.kernels.rescue_apply_patch, (1, 1, 1), 256, &mut args, stream, "launch(rescue_apply_patch)")
+    }
+
     fn alloc_host_mapped(&self, size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {
         self.bind();
         const HIP_HOST_MALLOC_PORTABLE: u32 = 0x1;

@@ -437,3 +437,58 @@ extern "C" __global__ void smalltide_argmax_partial_f32(
         out_idx[blockIdx.x] = s_idx[0];
     }
 }
+
+// ---------------------------------------------------------------------------
+// 12. GPU-side rescue check handoff kernels (coherent host-mapped control buffers)
+// ---------------------------------------------------------------------------
+
+// Copies `n` u32 routing words (n <= 32) from `src` to coherent host-mapped `dst[0..n]`, flushes
+// system-scope stores, then publishes `ticket` to `dst[n]`.
+// Grid: (1, 1, 1), Block: (32, 1, 1) (single wave32)
+extern "C" __global__ void smalltide_rescue_write_route(
+    uint32_t* __restrict__ dst,
+    const uint32_t* __restrict__ src,
+    uint32_t n,
+    uint32_t ticket
+) {
+    uint32_t i = threadIdx.x;
+    if (i < n) {
+        __scoped_atomic_store_n(dst + i, src[i], __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+    __builtin_amdgcn_wave_barrier();
+    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+    if (i == 0u) {
+        __scoped_atomic_store_n(dst + n, ticket, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+// Runs on compute_stream right after hipStreamWaitValue32 before MoE kernels:
+//   patch_hdr[0] == 0          : no rescue on this layer (immediate exit, no GL2 flush)
+//   patch_hdr[0] == 0xFFFFFFFE : invalidate GL2 only (0 table patches)
+//   patch_hdr[0] == 0xFFFFFFFF : invalidate GL2 + copy all `total_entries` from `full_table`
+//   otherwise (`n`)            : invalidate GL2 + apply `n` (idx, slot) pairs from `patch_hdr[1..]`
+// Grid: (1, 1, 1), Block: (256, 1, 1)
+extern "C" __global__ void smalltide_rescue_apply_patch(
+    uint32_t* __restrict__ slot_table,
+    const uint32_t* __restrict__ patch_hdr,
+    const uint32_t* __restrict__ full_table,
+    uint32_t total_entries
+) {
+    uint32_t n = __scoped_atomic_load_n(patch_hdr, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    if (n == 0u) return;
+    // System-scope acquire invalidates GPU GL0/GL1/GL2 so freshly SDMA'd slabs in vram_pool
+    // and host-written patch entries are visible to this kernel and subsequent MoE kernels.
+    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
+    if (n == 0xFFFFFFFEu) return;
+    if (n == 0xFFFFFFFFu) {
+        for (uint32_t i = threadIdx.x; i < total_entries; i += blockDim.x) {
+            slot_table[i] = __scoped_atomic_load_n(full_table + i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        }
+    } else {
+        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+            uint32_t idx = __scoped_atomic_load_n(patch_hdr + 1u + 2u * i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+            uint32_t val = __scoped_atomic_load_n(patch_hdr + 2u + 2u * i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+            if (idx < total_entries) slot_table[idx] = val;
+        }
+    }
+}

@@ -401,19 +401,36 @@ impl TideCache {
     }
 
     /// Stages a cold 1-off sync miss into the transient Scratch Rescue Ring without evicting
-    /// any resident VRAM expert.
+    /// any resident VRAM expert (skipping any ring slot occupied by a `protected` expert).
     pub fn stage_scratch_rescue(&mut self, id: ExpertId) -> TransferOp {
         let cls = self.expert_class(id);
+        let ring_size = self.scratch_ring_size as usize;
         let (base, prev_occupant, ring_idx) = match cls {
             ExpertClass::Nvfp4 => {
-                let r = (self.scratch_cursor_nvfp4 % self.scratch_ring_size) as usize;
-                self.scratch_cursor_nvfp4 = self.scratch_cursor_nvfp4.wrapping_add(1);
+                let mut r = (self.scratch_cursor_nvfp4 as usize) % ring_size;
+                for _ in 0..ring_size {
+                    let is_prot = self.scratch_occupants_nvfp4[r]
+                        .is_some_and(|occ| self.protected.contains(&self.flat_index(occ)));
+                    if !is_prot {
+                        break;
+                    }
+                    r = (r + 1) % ring_size;
+                }
+                self.scratch_cursor_nvfp4 = ((r + 1) % ring_size) as u32;
                 let prev = self.scratch_occupants_nvfp4[r].replace(id);
                 (self.scratch_base_nvfp4, prev, r)
             }
             ExpertClass::Mxfp8 => {
-                let r = (self.scratch_cursor_mxfp8 % self.scratch_ring_size) as usize;
-                self.scratch_cursor_mxfp8 = self.scratch_cursor_mxfp8.wrapping_add(1);
+                let mut r = (self.scratch_cursor_mxfp8 as usize) % ring_size;
+                for _ in 0..ring_size {
+                    let is_prot = self.scratch_occupants_mxfp8[r]
+                        .is_some_and(|occ| self.protected.contains(&self.flat_index(occ)));
+                    if !is_prot {
+                        break;
+                    }
+                    r = (r + 1) % ring_size;
+                }
+                self.scratch_cursor_mxfp8 = ((r + 1) % ring_size) as u32;
                 let prev = self.scratch_occupants_mxfp8[r].replace(id);
                 (self.scratch_base_mxfp8, prev, r)
             }

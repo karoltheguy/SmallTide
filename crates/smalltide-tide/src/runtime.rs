@@ -546,16 +546,17 @@ impl<B: ComputeBackend> TideExecutor<B> {
     }
 
     /// Synchronous rescue while the compute stream is parked at a GPU-side wait right before the
-    /// layer that needs it (every earlier kernel finished, no later one started): the slab copies
-    /// and the table upload go on the copy stream and the host waits for them, so no compute-side
-    /// fence is needed (it would deadlock behind the parked stream). With no ops: publishes what
-    /// is pending (an in-flight async promotion of a picked expert).
-    pub fn execute_rescue_now(&mut self, ops: &[TransferOp]) -> Result<()> {
+    /// layer that needs it (every earlier kernel finished, no later one started): copies the slab(s)
+    /// on the copy stream, waits for the copy stream, publishes pending entries in the host table
+    /// mirror, and returns the dirty `(flat_idx, new_slot)` updates so the caller can apply them
+    /// on the **compute stream** (preserving Invariant 1 and issuing a system-scope GL2 invalidate
+    /// before the MoE kernels read the newly DMA'd slabs).
+    pub fn execute_rescue_now(&mut self, ops: &[TransferOp]) -> Result<Vec<(usize, u32)>> {
         self.allocate_pools()?;
         let t0 = std::time::Instant::now();
         let _ = self.issue_ops(ops, false)?;
         let t1 = std::time::Instant::now();
-        // The copy stream is in order: once it is idle, every earlier async batch landed too.
+        // The copy stream is in order: once it is idle, every slab DMA has landed in VRAM.
         self.backend.sync_stream(self.copy_stream)?;
         self.rescue_stats.0 += 1;
         self.rescue_stats.1 += (t1 - t0).as_secs_f64() * 1000.0;
@@ -564,8 +565,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             self.free_events.push(ev);
         }
         self.scheduler.cache.publish_all_pending();
-        self.upload_table_on(self.copy_stream)?;
-        self.backend.sync_stream(self.copy_stream)
+        Ok(self.scheduler.cache.take_dirty_gpu_updates())
     }
 
     /// Frees the Scratch Rescue Ring for direct use (unmaps occupants on the compute stream).

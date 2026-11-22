@@ -165,6 +165,13 @@ pub(crate) struct ActivationScratch {
 }
 
 const ROUTE_WORDS: usize = 16;
+/// Coherent host-mapped routing mirror stride: 16 route words + 1 ticket sentinel, padded to 128 B.
+const ROUTE_MIRROR_STRIDE_WORDS: usize = 32;
+/// Cache-line stride (64 B = 16 u32s) per layer for `hipStreamWaitValue32` flags.
+const WAIT_FLAG_STRIDE_WORDS: usize = 16;
+/// Per-layer rescue table patch buffer stride: 1 count header + up to 255 `(idx, slot)` pairs (2 KiB).
+const PATCH_MAX_PAIRS: usize = 255;
+const PATCH_STRIDE_WORDS: usize = 512;
 
 /// Optional per-token hidden-state dump for reference verification (`SMALLTIDE_DUMP_DIR`).
 pub(crate) struct DumpState {
@@ -191,8 +198,12 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// used. The token's whole pass is queued with a wait before each checked layer's experts;
     /// the host services the checks afterwards and releases each wait by writing its flag.
     rescue_wait: Option<bool>,
-    /// Mapped `[logical]` u32 release flags (device view, host) and this token's ticket.
+    /// Mapped `[logical]` cache-line-spaced u32 release flags (device view, host) and this token's ticket.
     wait_flags: Option<(DeviceBuf, PinnedBuf)>,
+    /// Mapped `[logical][PATCH_STRIDE_WORDS]` slot-table patch buffers applied on `compute_stream`
+    /// right after each GPU-side rescue wait, plus a `[total_experts]` fallback full-table mirror.
+    rescue_patches: Option<(DeviceBuf, PinnedBuf)>,
+    rescue_full_table: Option<(DeviceBuf, PinnedBuf)>,
     wait_ticket: u32,
     pending_checks: Vec<usize>,
     /// Expert map: the decoded tokens' routing (host copies of what the engine already read back),
@@ -479,6 +490,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             route_pinned: None,
             rescue_wait: None,
             wait_flags: None,
+            rescue_patches: None,
+            rescue_full_table: None,
             wait_ticket: 0,
             pending_checks: Vec::new(),
             routes: smalltide_tide::expert_map::RouteLog::default(),
@@ -983,20 +996,33 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let mut ok = std::env::var("SMALLTIDE_RESCUE_WAIT").map_or(true, |v| v.trim() != "0");
         if ok {
             let n_log = self.layer_planned.len();
-            match self.backend.alloc_host_mapped(n_log * 4) {
+            let total_experts = self.cfg.num_physical_layers * self.cfg.n_routed_experts;
+            match self.backend.alloc_host_signal(n_log * WAIT_FLAG_STRIDE_WORDS * 4) {
                 Ok((view, host)) => {
                     unsafe {
                         let p = self.backend.pinned_as_mut_slice(host)?.as_mut_ptr() as *mut u32;
-                        for i in 0..n_log {
+                        for i in 0..n_log * WAIT_FLAG_STRIDE_WORDS {
                             std::ptr::write_volatile(p.add(i), 0);
                         }
                     }
                     // Probe: a wait that is already satisfied (flag 0 >= 0).
                     let s = self.tide.compute_stream;
                     if self.backend.stream_wait_value_ge(s, view.slice(0, 4), 0).is_err() {
+                        let _ = self.backend.free_device(view);
+                        let _ = self.backend.free_pinned(host);
                         ok = false;
                     } else {
+                        let (pview, phost) = self.backend.alloc_host_signal(n_log * PATCH_STRIDE_WORDS * 4)?;
+                        let (ftview, fthost) = self.backend.alloc_host_signal(total_experts * 4)?;
+                        unsafe {
+                            let pp = self.backend.pinned_as_mut_slice(phost)?.as_mut_ptr() as *mut u32;
+                            for i in 0..n_log * PATCH_STRIDE_WORDS {
+                                std::ptr::write_volatile(pp.add(i), 0);
+                            }
+                        }
                         self.wait_flags = Some((view, host));
+                        self.rescue_patches = Some((pview, phost));
+                        self.rescue_full_table = Some((ftview, fthost));
                     }
                 }
                 Err(_) => ok = false,
@@ -1008,13 +1034,16 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     }
 
     /// After the token's pass is queued: services the rescue checks in layer order. Each check
-    /// reads its routing row from mapped memory (written right before the layer's GPU-side
-    /// wait, so every earlier kernel is done and no later one has started), plans, rescues through
-    /// the copy stream if needed, then releases the wait.
+    /// spins on its coherent routing mirror's ticket sentinel (written with system-scope release
+    /// right before the layer's GPU-side wait), plans, copies rescued slabs on `copy_stream`,
+    /// writes any slot-table patches to the coherent patch buffer (applied on `compute_stream`
+    /// with a system-scope GL2 invalidate right after the wait), then releases the wait.
     fn service_rescue_checks(&mut self) -> Result<()> {
         let s = self.tide.compute_stream;
         let (_, host, ev) = self.route_pinned.expect("route mirror");
         let (_, fhost) = self.wait_flags.expect("wait flags");
+        let (_, phost) = self.rescue_patches.expect("rescue patches");
+        let (_, fthost) = self.rescue_full_table.expect("rescue full table");
         let ticket = self.wait_ticket;
         // Make the driver submit the queued pass; the host then only reads mapped memory.
         self.backend.record_event(ev, s)?;
@@ -1024,30 +1053,68 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if trace {
             eprintln!("[rescue-trace] token ticket {ticket}: {} checks {:?}", checks.len(), checks);
         }
-        for il in checks {
+        let release_flag = |backend: &B, il: usize| {
+            if let Ok(slice) = unsafe { backend.pinned_as_mut_slice(fhost) } {
+                let f = slice.as_mut_ptr() as *mut u32;
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                unsafe { std::ptr::write_volatile(f.add(il * WAIT_FLAG_STRIDE_WORDS), ticket); }
+            }
+        };
+        let mut res: Result<()> = Ok(());
+        for (pos_idx, &il) in checks.iter().enumerate() {
+            // Once the rescue budget is spent, release all remaining layers immediately without
+            // stalling on them one by one; their bookkeeping runs from the routing log afterwards.
+            if self.tide.scheduler.rescue_budget_spent() {
+                for &rem_il in &checks[pos_idx..] {
+                    self.layer_deferred[rem_il] = true;
+                    release_flag(&*self.backend, rem_il);
+                }
+                break;
+            }
             let tw = Instant::now();
             if trace {
                 eprintln!("[rescue-trace]   layer {il}: waiting for routing row");
             }
-            let row = unsafe { self.backend.pinned_as_mut_slice(host)?[il * ROUTE_WORDS * 4..].as_ptr() as *const u32 };
+            let row = match unsafe { self.backend.pinned_as_mut_slice(host) } {
+                Ok(sl) => sl[il * ROUTE_MIRROR_STRIDE_WORDS * 4..].as_ptr() as *const u32,
+                Err(e) => {
+                    res = Err(e);
+                    for &rem_il in &checks[pos_idx..] {
+                        release_flag(&*self.backend, rem_il);
+                    }
+                    break;
+                }
+            };
             let mut spins = 0u64;
+            let mut wait_err: Option<smalltide_core::SmallTideError> = None;
             loop {
-                if (0..ROUTE_WORDS).all(|k| unsafe { std::ptr::read_volatile(row.add(k)) } != u32::MAX) {
+                if unsafe { std::ptr::read_volatile(row.add(ROUTE_WORDS)) } == ticket {
                     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
                     break;
                 }
                 spins += 1;
                 if spins % 8192 == 0 {
                     // Keeps the driver submitting (cheap when nothing is left to submit).
-                    let _ = self.backend.query_event(ev)?;
+                    if let Err(e) = self.backend.query_event(ev) {
+                        wait_err = Some(e);
+                        break;
+                    }
                     if tw.elapsed().as_secs() > 10 {
-                        return Err(smalltide_core::SmallTideError::Backend {
+                        wait_err = Some(smalltide_core::SmallTideError::Backend {
                             backend: "engine",
                             message: format!("rescue check: routing row of layer {il} never arrived"),
                         });
+                        break;
                     }
                 }
                 std::hint::spin_loop();
+            }
+            if let Some(e) = wait_err {
+                res = Err(e);
+                for &rem_il in &checks[pos_idx..] {
+                    release_flag(&*self.backend, rem_il);
+                }
+                break;
             }
             self.profile.rescue_wait_ms += tw.elapsed().as_secs_f64() * 1000.0;
             let tp = Instant::now();
@@ -1058,31 +1125,65 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 ws[k] = f32::from_bits(unsafe { std::ptr::read_volatile(row.add(8 + k)) });
             }
             let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
-            if self.tide.scheduler.rescue_budget_spent() {
-                // Budget used up: bookkeeping from the routing log at the next token boundary.
-                self.layer_deferred[il] = true;
-            } else {
-                self.layer_planned[il] = true;
-                let plan = self.tide.scheduler.plan_layer_dispatch(phys, &ids, &ws);
-                if !plan.sync_transfers.is_empty() || plan.wait_pending {
-                    if trace {
-                        eprintln!("[rescue-trace]   layer {il}: rescue {} op(s), wait_pending {}", plan.sync_transfers.len(), plan.wait_pending);
+            self.layer_planned[il] = true;
+            let plan = self.tide.scheduler.plan_layer_dispatch(phys, &ids, &ws);
+            if !plan.sync_transfers.is_empty() || plan.wait_pending {
+                if trace {
+                    eprintln!("[rescue-trace]   layer {il}: rescue {} op(s), wait_pending {}", plan.sync_transfers.len(), plan.wait_pending);
+                }
+                match self.tide.execute_rescue_now(&plan.sync_transfers) {
+                    Ok(dirty) => {
+                        let patch_res: Result<()> = (|| {
+                            unsafe {
+                                let p = self.backend.pinned_as_mut_slice(phost)?.as_mut_ptr() as *mut u32;
+                                let dst = p.add(il * PATCH_STRIDE_WORDS);
+                                if dirty.is_empty() {
+                                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                                    std::ptr::write_volatile(dst, 0xFFFF_FFFEu32);
+                                } else if dirty.len() <= PATCH_MAX_PAIRS {
+                                    for (k, &(idx, val)) in dirty.iter().enumerate() {
+                                        std::ptr::write_volatile(dst.add(1 + 2 * k), idx as u32);
+                                        std::ptr::write_volatile(dst.add(2 + 2 * k), val);
+                                    }
+                                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                                    std::ptr::write_volatile(dst, dirty.len() as u32);
+                                } else {
+                                    let tbl = self.tide.scheduler.cache.gpu_slot_table();
+                                    let ft = self.backend.pinned_as_mut_slice(fthost)?.as_mut_ptr() as *mut u32;
+                                    for (k, &v) in tbl.iter().enumerate() {
+                                        std::ptr::write_volatile(ft.add(k), v);
+                                    }
+                                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                                    std::ptr::write_volatile(dst, 0xFFFF_FFFFu32);
+                                }
+                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = patch_res {
+                            res = Err(e);
+                            for &rem_il in &checks[pos_idx..] {
+                                release_flag(&*self.backend, rem_il);
+                            }
+                            break;
+                        }
+                        if trace {
+                            eprintln!("[rescue-trace]   layer {il}: rescue done ({} patch(es))", dirty.len());
+                        }
                     }
-                    self.tide.execute_rescue_now(&plan.sync_transfers)?;
-                    if trace {
-                        eprintln!("[rescue-trace]   layer {il}: rescue done");
+                    Err(e) => {
+                        res = Err(e);
+                        for &rem_il in &checks[pos_idx..] {
+                            release_flag(&*self.backend, rem_il);
+                        }
+                        break;
                     }
                 }
             }
             self.profile.rescue_plan_ms += tp.elapsed().as_secs_f64() * 1000.0;
             self.profile.rescue_checks += 1;
-            unsafe {
-                let f = self.backend.pinned_as_mut_slice(fhost)?.as_mut_ptr() as *mut u32;
-                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                std::ptr::write_volatile(f.add(il), ticket);
-            }
+            release_flag(&*self.backend, il);
         }
-        Ok(())
+        res
     }
 
     /// One token's picks over the logical layers from routing-log words (`off` its first word in
@@ -1829,26 +1930,43 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if overlap {
             if self.route_pinned.is_none() {
                 let n_log = self.layer_planned.len();
-                let (view, host) = self.backend.alloc_host_mapped(n_log * ROUTE_WORDS * 4)?;
-                self.route_pinned = Some((view, host, self.backend.create_event()?));
-            }
-            let (view, host, ev) = self.route_pinned.unwrap();
-            if use_wait {
-                // Marker words the copy kernel overwrites (ids < 128, finite weights never match).
+                let (view, host) = self.backend.alloc_host_signal(n_log * ROUTE_MIRROR_STRIDE_WORDS * 4)?;
                 unsafe {
-                    let p = self.backend.pinned_as_mut_slice(host)?[il * ROUTE_WORDS * 4..].as_mut_ptr() as *mut u32;
-                    for k in 0..ROUTE_WORDS {
-                        std::ptr::write_volatile(p.add(k), u32::MAX);
+                    let p = self.backend.pinned_as_mut_slice(host)?.as_mut_ptr() as *mut u32;
+                    for i in 0..n_log * ROUTE_MIRROR_STRIDE_WORDS {
+                        std::ptr::write_volatile(p.add(i), 0);
                     }
                 }
+                self.route_pinned = Some((view, host, self.backend.create_event()?));
             }
-            // A kernel store into mapped host memory (no copy-engine round trip in the stream).
-            self.backend.vec_copy(view.slice(il * ROUTE_WORDS * 4, ROUTE_WORDS * 4), route_row, ROUTE_WORDS, s)?;
+            let (view, _, ev) = self.route_pinned.unwrap();
+            let row_off = il * ROUTE_MIRROR_STRIDE_WORDS * 4;
             if use_wait {
+                // Coherent route mirror + release-fenced ticket sentinel, then GPU-side wait,
+                // then compute-stream table patch + system-scope GL2 invalidate before MoE.
+                self.backend.rescue_write_route(
+                    view.slice(row_off, ROUTE_MIRROR_STRIDE_WORDS * 4),
+                    route_row,
+                    ROUTE_WORDS,
+                    self.wait_ticket,
+                    s,
+                )?;
                 let (fview, _) = self.wait_flags.unwrap();
-                self.backend.stream_wait_value_ge(s, fview.slice(il * 4, 4), self.wait_ticket)?;
+                self.backend.stream_wait_value_ge(s, fview.slice(il * WAIT_FLAG_STRIDE_WORDS * 4, 4), self.wait_ticket)?;
+                let (pview, _) = self.rescue_patches.unwrap();
+                let (ftview, _) = self.rescue_full_table.unwrap();
+                let total_experts = self.cfg.num_physical_layers * self.cfg.n_routed_experts;
+                self.backend.rescue_apply_patch(
+                    self.tide.gpu_slot_table,
+                    pview.slice(il * PATCH_STRIDE_WORDS * 4, PATCH_STRIDE_WORDS * 4),
+                    ftview,
+                    total_experts,
+                    s,
+                )?;
                 self.pending_checks.push(il);
             } else {
+                // A kernel store into mapped host memory (no copy-engine round trip in the stream).
+                self.backend.vec_copy(view.slice(row_off, ROUTE_WORDS * 4), route_row, ROUTE_WORDS, s)?;
                 self.backend.record_event(ev, s)?;
             }
         } else if defer {
@@ -1974,7 +2092,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let mut topk_ids_u16 = [0u16; 8];
             let mut topk_w_f32 = [0.0f32; 8];
             unsafe {
-                let rb = &self.backend.pinned_as_mut_slice(host)?[il * ROUTE_WORDS * 4..(il + 1) * ROUTE_WORDS * 4];
+                let off = il * ROUTE_MIRROR_STRIDE_WORDS * 4;
+                let rb = &self.backend.pinned_as_mut_slice(host)?[off..off + ROUTE_WORDS * 4];
                 for k in 0..8 {
                     topk_ids_u16[k] = u32::from_le_bytes(rb[k * 4..(k + 1) * 4].try_into().unwrap()) as u16;
                     topk_w_f32[k] = f32::from_le_bytes(rb[32 + k * 4..32 + (k + 1) * 4].try_into().unwrap());
@@ -2094,8 +2213,31 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.consume_route_log()?;
         let published = self.tide.poll_pending()?;
         self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+        // When GPU-side rescue waits are active and an async/rebalance batch is still in flight on
+        // copy_stream (e.g. Token 0 after rebalance_after_prefill or Token 65 after periodic
+        // rebalance), drain & publish it via hipStreamWaitEvent on compute_stream BEFORE queueing
+        // any WAIT_REG_MEM so compute_stream never stalls in WAIT_REG_MEM behind a large rebalance
+        // batch and all newly loaded experts become immediate hits on this token.
+        let use_wait_this_token = !is_prefill
+            && self.dump.is_none()
+            && matches!(self.tide.scheduler.tide_cfg.rescue_policy, smalltide_core::RescuePolicy::Threshold(_))
+            && std::env::var_os("SMALLTIDE_RESCUE_SERIAL").is_none()
+            && self.rescue_wait_enabled()?;
+        if use_wait_this_token && self.tide.pending_batch_count() > 0 {
+            let pub2 = self.tide.wait_and_publish_all_pending()?;
+            self.tide.scheduler.telemetry.stage1_async_published += pub2 as u64;
+        }
         self.tide.scheduler.begin_token();
         self.wait_ticket = self.wait_ticket.wrapping_add(1).max(1);
+        if let Some((_, phost)) = self.rescue_patches {
+            let n_log = self.layer_planned.len();
+            unsafe {
+                let p = self.backend.pinned_as_mut_slice(phost)?.as_mut_ptr() as *mut u32;
+                for il in 0..n_log {
+                    std::ptr::write_volatile(p.add(il * PATCH_STRIDE_WORDS), 0);
+                }
+            }
+        }
         self.pending_checks.clear();
         self.layer_planned.iter_mut().for_each(|p| *p = false);
         self.layer_deferred.iter_mut().for_each(|p| *p = false);
@@ -2424,6 +2566,17 @@ impl<B: ComputeBackend> Drop for Inkling2Engine<B> {
             pf.free(&*self.backend);
         }
         let _ = self.backend.free_pinned(self.embed_pinned);
+        if let Some((v, h, ev)) = self.route_pinned.take() {
+            let _ = self.backend.destroy_event(ev);
+            let _ = self.backend.free_device(v);
+            let _ = self.backend.free_pinned(h);
+        }
+        for pair in [self.wait_flags.take(), self.rescue_patches.take(), self.rescue_full_table.take()] {
+            if let Some((v, h)) = pair {
+                let _ = self.backend.free_device(v);
+                let _ = self.backend.free_pinned(h);
+            }
+        }
         for st in &self.layer_states {
             let _ = self.backend.free_device(st.k_cache);
             let _ = self.backend.free_device(st.k_scales);

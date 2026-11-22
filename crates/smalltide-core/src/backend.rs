@@ -593,6 +593,19 @@ pub trait ComputeBackend: Send + Sync {
     /// dim, 0); every state becomes the history rows `keep..keep+3`.
     fn sconv_rewind(&self, entries: DeviceBuf, n: usize, max_dim: usize, keep: usize, stream: Stream) -> Result<()>;
 
+    /// Grouped (WMMA) MoE for <= 8 decode / verify rows with the expert grouping built on the GPU:
+    /// `desc` receives the plan (work at 0, pairs at 1024 bytes); `tmp` gets unweighted outputs
+    /// (`moe_post_rows` / `moe_decode_post` apply weights + renorm). `xscratch` (>= rows * H f32) is
+    /// clobbered (f16 activations).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_rows_grouped(&self, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, xscratch: DeviceBuf, route: DeviceBuf,
+        slot_table: DeviceBuf, pool: DeviceBuf, desc: DeviceBuf, rows: usize, params: MoeDispatchParams,
+        stream: Stream) -> Result<()>;
+
+    /// `out[r] = sum_k w_rk * renorm_r * tmp[r*8+k]` for `rows` rows (no conv / residual).
+    fn moe_post_rows(&self, out: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, route: DeviceBuf,
+        rows: usize, hidden: usize, stream: Stream) -> Result<()>;
+
     /// Device address of `buf` (for pointer tables consumed by kernels).
     fn device_address(&self, buf: DeviceBuf) -> Result<u64>;
 

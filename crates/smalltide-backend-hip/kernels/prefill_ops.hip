@@ -767,6 +767,7 @@ extern "C" __global__ void smalltide_moe_w13_grouped_wmma2(
 ) {
     uint32_t wi = blockIdx.x;
     uint32_t slot = work[wi * 4u], p0 = work[wi * 4u + 1u], np = work[wi * 4u + 2u];
+    if (np == 0u) return; // unused work item (GPU-built plans have a fixed upper bound)
     uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
     __shared__ uint32_t s_pairs[ST_MOE_PAIRS];
     if (threadIdx.x < np) s_pairs[threadIdx.x] = pairs[p0 + threadIdx.x];
@@ -806,13 +807,15 @@ extern "C" __global__ void smalltide_moe_w2_grouped_wmma2(
 ) {
     uint32_t wi = blockIdx.x;
     uint32_t slot = work[wi * 4u], p0 = work[wi * 4u + 1u], np = work[wi * 4u + 2u];
+    if (np == 0u) return;
     uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
     __shared__ uint32_t s_pairs[ST_MOE_PAIRS];
     __shared__ float s_w[ST_MOE_PAIRS];
     if (threadIdx.x < np) {
         uint32_t pr = pairs[p0 + threadIdx.x];
         s_pairs[threadIdx.x] = pr;
-        s_w[threadIdx.x] = __uint_as_float(route[(pr >> 3) * 16u + 8u + (pr & 7u)]);
+        // route == nullptr: unweighted (the caller's post kernel applies weights + renorm).
+        s_w[threadIdx.x] = (route != nullptr) ? __uint_as_float(route[(pr >> 3) * 16u + 8u + (pr & 7u)]) : 1.0f;
     }
     __syncthreads();
     uint32_t n0 = (blockIdx.y * 8u + warp) * 16u;
@@ -1231,4 +1234,150 @@ extern "C" __global__ void smalltide_argmax_rows(uint32_t* __restrict__ out, con
         }
         if (l == 0u) out[blockIdx.x] = bi;
     }
+}
+
+// ---------------------------------------------------------------------------
+// GPU-built expert grouping for <= 8 decode / verify rows (no host sync): one work item per
+// distinct published expert of the rows' top-8, its (row, k) pairs listed; 64 work items always
+// (unused: n_pairs = 0, skipped by the WMMA kernels).  Grid: 1, Block: 32
+//   work: [64][4] u32 (slot, pair_start, n_pairs, 0), pairs: [64] u32
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_moe_group_rows(
+    uint32_t* __restrict__ work, uint32_t* __restrict__ pairs, const uint32_t* __restrict__ route,
+    const uint32_t* __restrict__ slot_table, uint32_t rows
+) {
+    if (threadIdx.x != 0u) return;
+    uint32_t np_total = rows * 8u;
+    uint32_t used = 0u, nw = 0u;
+    uint64_t done = 0ull;
+    for (uint32_t p = 0u; p < np_total; ++p) {
+        if (done & (1ull << p)) continue;
+        uint32_t e = route[(p >> 3) * 16u + (p & 7u)];
+        uint32_t slot = slot_table[e];
+        uint32_t start = used;
+        for (uint32_t q = p; q < np_total; ++q) {
+            if (!(done & (1ull << q)) && route[(q >> 3) * 16u + (q & 7u)] == e) {
+                done |= (1ull << q);
+                if (slot != 0xFFFFFFFFu) pairs[used++] = q;
+            }
+        }
+        if (slot != 0xFFFFFFFFu) {
+            work[nw * 4u] = slot; work[nw * 4u + 1u] = start; work[nw * 4u + 2u] = used - start; work[nw * 4u + 3u] = 0u;
+            ++nw;
+        }
+    }
+    for (; nw < 64u; ++nw) { work[nw * 4u] = 0u; work[nw * 4u + 1u] = 0u; work[nw * 4u + 2u] = 0u; work[nw * 4u + 3u] = 0u; }
+}
+
+// out[r][h] = sum_k w_rk * renorm_r * tmp[r*8+k][h] over published experts (no conv / residual).
+//   Grid: (ceil(H / 256), rows), Block: 256
+extern "C" __global__ void smalltide_moe_post_rows(
+    float* __restrict__ out, const float* __restrict__ tmp, const uint32_t* __restrict__ slot_table,
+    const uint32_t* __restrict__ route, uint32_t hidden
+) {
+    uint32_t h = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (h >= hidden) return;
+    const uint32_t* ids = route + r * 16u;
+    const float* wts = reinterpret_cast<const float*>(route + r * 16u + 8u);
+    float tot = 0.0f, ex = 0.0f;
+    for (uint32_t k = 0u; k < 8u; ++k) {
+        tot += wts[k];
+        if (slot_table[ids[k]] != 0xFFFFFFFFu) ex += wts[k];
+    }
+    float renorm = (ex > 1e-8f) ? (tot / ex) : 0.0f;
+    float acc = 0.0f;
+    for (uint32_t k = 0u; k < 8u; ++k) {
+        if (slot_table[ids[k]] != 0xFFFFFFFFu) acc = fmaf(wts[k] * renorm, tmp[(static_cast<size_t>(r) * 8u + k) * hidden + h], acc);
+    }
+    out[static_cast<size_t>(r) * hidden + h] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-row FP8 GEMV v2 (<= 8 rows): the activations of a 512-wide K tile are staged in LDS
+// once per block; 16 warps (one output row each) stream 16-byte weight chunks against it.
+//   Grid: (ceil(N / 16)), Block: 512
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_gemv_fp8_rows2(
+    float* __restrict__ y, const float* __restrict__ x, const uint8_t* __restrict__ w_fp8,
+    const float* __restrict__ row_scale, uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) {
+    __shared__ float4 xs[8][128]; // 8 rows x 512 floats
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t row = blockIdx.x * 16u + warp;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const uint8_t* wr = w_fp8 + static_cast<size_t>(row < n_rows ? row : 0u) * k_cols;
+    for (uint32_t k0 = 0u; k0 < k_cols; k0 += 512u) {
+        uint32_t tw = min(512u, k_cols - k0) >> 2; // float4s per row in this tile
+        for (uint32_t i = threadIdx.x; i < m_rows * 128u; i += blockDim.x) {
+            uint32_t r = i >> 7, c = i & 127u;
+            xs[r][c] = (c < tw) ? reinterpret_cast<const float4*>(x + static_cast<size_t>(r) * k_cols + k0)[c] : make_float4(0, 0, 0, 0);
+        }
+        __syncthreads();
+        uint32_t kk = k0 + lane * 16u;
+        if (row < n_rows && kk < k_cols) {
+            uint4 w16 = *reinterpret_cast<const uint4*>(wr + kk);
+            float4 d0 = decode_fp8x4(w16.x), d1 = decode_fp8x4(w16.y), d2 = decode_fp8x4(w16.z), d3 = decode_fp8x4(w16.w);
+            #pragma unroll
+            for (uint32_t m = 0u; m < 8u; ++m) {
+                if (m < m_rows) {
+                    float4 x0 = xs[m][lane * 4u], x1 = xs[m][lane * 4u + 1u], x2 = xs[m][lane * 4u + 2u], x3 = xs[m][lane * 4u + 3u];
+                    float a = acc[m];
+                    a = fmaf(d0.x, x0.x, a); a = fmaf(d0.y, x0.y, a); a = fmaf(d0.z, x0.z, a); a = fmaf(d0.w, x0.w, a);
+                    a = fmaf(d1.x, x1.x, a); a = fmaf(d1.y, x1.y, a); a = fmaf(d1.z, x1.z, a); a = fmaf(d1.w, x1.w, a);
+                    a = fmaf(d2.x, x2.x, a); a = fmaf(d2.y, x2.y, a); a = fmaf(d2.z, x2.z, a); a = fmaf(d2.w, x2.w, a);
+                    a = fmaf(d3.x, x3.x, a); a = fmaf(d3.y, x3.y, a); a = fmaf(d3.z, x3.z, a); a = fmaf(d3.w, x3.w, a);
+                    acc[m] = a;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row >= n_rows) return;
+    float sc = (row_scale != nullptr) ? row_scale[row] : 1.0f;
+    #pragma unroll
+    for (uint32_t m = 0u; m < 8u; ++m) {
+        if (m < m_rows) {
+            float sum = wave32_sum(acc[m]);
+            if (lane == 0u) y[static_cast<size_t>(m) * n_rows + row] = sum * sc;
+        }
+    }
+}
+
+// Parallel expert grouping (replaces the single-thread plan): Grid 1, Block 64.
+extern "C" __global__ void smalltide_moe_group_rows2(
+    uint32_t* __restrict__ work, uint32_t* __restrict__ pairs, const uint32_t* __restrict__ route,
+    const uint32_t* __restrict__ slot_table, uint32_t rows
+) {
+    __shared__ uint32_t s_e[64], s_cnt[64], s_wi[64], s_off[64];
+    __shared__ uint32_t s_nw;
+    uint32_t p = threadIdx.x, np_total = rows * 8u;
+    bool valid = p < np_total;
+    uint32_t e = valid ? route[(p >> 3) * 16u + (p & 7u)] : 0xFFFFFFFFu;
+    s_e[p] = e;
+    __syncthreads();
+    uint32_t slot = valid ? slot_table[e] : 0xFFFFFFFFu;
+    bool first = valid && slot != 0xFFFFFFFFu;
+    for (uint32_t q = 0u; q < p && first; ++q) if (s_e[q] == e) first = false;
+    uint32_t cnt = 0u;
+    if (first) for (uint32_t q = p; q < np_total; ++q) cnt += (s_e[q] == e) ? 1u : 0u;
+    s_cnt[p] = first ? cnt : 0u;
+    s_wi[p] = first ? 1u : 0u;
+    __syncthreads();
+    if (p == 0u) {
+        uint32_t wsum = 0u, osum = 0u;
+        for (uint32_t q = 0u; q < 64u; ++q) {
+            uint32_t f = s_wi[q], c = s_cnt[q];
+            s_wi[q] = wsum; s_off[q] = osum;
+            wsum += f; osum += c;
+        }
+        s_nw = wsum;
+    }
+    __syncthreads();
+    if (first) {
+        uint32_t wi = s_wi[p], off = s_off[p];
+        work[wi * 4u] = slot; work[wi * 4u + 1u] = off; work[wi * 4u + 2u] = cnt; work[wi * 4u + 3u] = 0u;
+        uint32_t j = 0u;
+        for (uint32_t q = p; q < np_total; ++q) if (s_e[q] == e) pairs[off + j++] = q;
+    }
+    if (p >= s_nw) { work[p * 4u] = 0u; work[p * 4u + 1u] = 0u; work[p * 4u + 2u] = 0u; work[p * 4u + 3u] = 0u; }
 }

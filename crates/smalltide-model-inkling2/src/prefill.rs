@@ -219,6 +219,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         };
         let verify = matches!(mode, RowsMode::Verify { .. });
         let decode = matches!(mode, RowsMode::Decode { .. }) || verify;
+        // Verify and batched decode (<= 8 rows) use the GEMV-style kernels (faster than WMMA at
+        // this size, and f32 activations like the single-row path).
         self.rows_decode = decode;
         let capture = self.capture_taps && !matches!(mode, RowsMode::Decode { .. });
         let s = self.tide.compute_stream;
@@ -690,7 +692,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 weight_dtype: dtype,
                 expert_stride_bytes: stride,
             };
-            b.moe_decode_rows(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pool, slot_table, pf.route, m, params, s)?;
+            if std::env::var_os("SMALLTIDE_BATCH_MOE_DEDUP").is_some() {
+                b.moe_decode_rows(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pool, slot_table, pf.route, m, params, s)?;
+            } else {
+                b.moe_rows_grouped(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pf.moe_out, pf.route, slot_table, pool, pf.desc, m, params, s)?;
+            }
             let log = self.batch_route_log.expect("batch route log");
             b.vec_copy(log.slice(il * crate::engine::MAX_BATCH_ROWS * 64, m * 64), pf.route.slice(0, m * 64), m * 16, s)?;
             let layer = &self.dense.layers[ip];
@@ -730,22 +736,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 weight_dtype: dtype,
                 expert_stride_bytes: stride,
             };
-            b.moe_decode_rows(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pool, slot_table, pf.route, m, params, s)?;
+            b.moe_rows_grouped(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pf.moe_out, pf.route, slot_table, pool, pf.desc, m, params, s)?;
             let log = self.batch_route_log.expect("batch route log");
             b.vec_copy(log.slice(il * crate::engine::MAX_BATCH_ROWS * 64, m * 64), pf.route.slice(0, m * 64), m * 16, s)?;
-            for r in 0..m {
-                b.moe_decode_post(
-                    row(pf.moe_out, r, h),
-                    pf.moe_tmp.slice(r * 8 * h * 4, 8 * h * 4),
-                    slot_table,
-                    pf.route.slice(r * 64, 32),
-                    pf.route.slice(r * 64 + 32, 32),
-                    cfg.num_experts_per_tok,
-                    None,
-                    h,
-                    s,
-                )?;
-            }
+            b.moe_post_rows(pf.moe_out, pf.moe_tmp, slot_table, pf.route, m, h, s)?;
             Vec::new()
         } else {
             self.prefill_moe(ip, m)?

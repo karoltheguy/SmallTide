@@ -847,27 +847,41 @@ fn run_generate(args: &[String]) {
         let mut snap = None;
         engine.snapshot_state(p0, &mut snap).expect("snapshot");
         let mut refs = vec![next_tok];
+        let t_ref = Instant::now();
         for i in 0..n {
             engine.forward_token(refs[i], p0 + i, false, true).expect("decode");
             engine.post_decode_tide_step().expect("post");
             refs.push(engine.sample_next_token(&sampling, &[]).expect("sample"));
         }
+        let ref_ms = t_ref.elapsed().as_secs_f64() * 1000.0 / n as f64;
         engine.restore_state(snap.as_ref().unwrap(), false).expect("restore");
+        let vkt = std::env::var_os("SMALLTIDE_KTIMING").is_some();
+        if vkt {
+            backend.set_kernel_timing(true).expect("kt");
+            let _ = backend.take_kernel_times();
+        }
+        let vseg = std::env::var_os("SMALLTIDE_SEGTIME").is_some();
+        if vseg {
+            backend.set_segment_timing(true).expect("seg");
+            let _ = backend.take_segment_times();
+        }
+        let t_ver = Instant::now();
         let (mut i, mut steps, mut agree_until) = (0usize, 0usize, None::<usize>);
         let mut out = vec![refs[0]];
-        while i + 8 < refs.len() {
-            let mut block: Vec<u32> = refs[i..i + 8].to_vec();
+        let width = std::env::var("SMALLTIDE_VERIFY_WIDTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(2, 8);
+        while i + width < refs.len() {
+            let mut block: Vec<u32> = refs[i..i + width].to_vec();
             block[0] = *out.last().unwrap();
-            let corrupt = 1 + (steps % 6);
+            let corrupt = 1 + (steps % (width - 1).max(1)).min(width - 2);
             block[corrupt] = (block[corrupt] + 7) % 100_000;
             engine.verify(&block, p0 + i).expect("verify");
-            let am = engine.rows_argmax(8).expect("argmax");
+            let am = engine.rows_argmax(width).expect("argmax");
             engine.post_batch_tide_step().expect("post batch");
             let mut c = 0usize;
-            while c < 7 && block[c + 1] == am[c] {
+            while c < width - 1 && block[c + 1] == am[c] {
                 c += 1;
             }
-            engine.verify_rewind(8, c + 1).expect("rewind");
+            engine.verify_rewind(width, c + 1).expect("rewind");
             out.extend_from_slice(&block[1..=c]);
             out.push(am[c]);
             i += c + 1;
@@ -878,6 +892,23 @@ fn run_generate(args: &[String]) {
                 }
             }
         }
+        let ver_ms = t_ver.elapsed().as_secs_f64() * 1000.0 / steps.max(1) as f64;
+        if vkt {
+            let mut kt = backend.take_kernel_times();
+            kt.sort_by(|a, b| b.2.total_cmp(&a.2));
+            for (name, cnt, ms) in kt.iter().take(12) {
+                println!("    {:<32} {:>6.1}x {:>8.3} ms/step ({:.1} us avg)", name, *cnt as f64 / steps.max(1) as f64, ms / steps.max(1) as f64, ms * 1000.0 / *cnt as f64);
+            }
+            backend.set_kernel_timing(false).expect("kt off");
+        }
+        if vseg {
+            let st = backend.take_segment_times();
+            for (name, cnt, ms) in st.iter().take(10) {
+                println!("    {:<32} {:>6.1}x {:>8.3} ms/step", name, *cnt as f64 / steps.max(1) as f64, ms / steps.max(1) as f64);
+            }
+            backend.set_segment_timing(false).expect("seg off");
+        }
+        println!("[verify-selftest] plain decode {ref_ms:.2} ms/token | 8-row verify {ver_ms:.2} ms/step ({:.2}x a decode step)", ver_ms / ref_ms);
         let cmp = out.len().min(refs.len());
         let same = (0..cmp).filter(|&k| out[k] == refs[k]).count();
         println!("[verify-selftest] {steps} verify steps, {} tokens; identical to plain decode: {same}/{cmp}; first divergence at {:?}", out.len(), agree_until);

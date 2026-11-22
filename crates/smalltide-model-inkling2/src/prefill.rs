@@ -426,6 +426,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     fn control_rows_multi(
         &self,
         items: &[(DeviceBuf, DeviceBuf, DeviceBuf, &LoopControllerGpu)],
+        norms: Option<&[(DeviceBuf, DeviceBuf)]>,
         m: usize,
         s: Stream,
     ) -> Result<()> {
@@ -434,8 +435,14 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let r = self.cfg.loop_gate_rank;
         const R8: usize = 8;
         let sl = |buf: DeviceBuf, j: usize, n: usize| buf.slice(j * R8 * n * 4, m * n * 4);
-        for (j, (_, cur, msg, _)) in items.iter().enumerate() {
-            self.backend.loop_control_prep_rows(sl(pf.ctrl_prep, j, 2 * h), *cur, *msg, h, self.cfg.rms_norm_eps, m, s)?;
+        let fused = norms.is_some();
+        if fused {
+            let prep: Vec<_> = items.iter().enumerate().map(|(j, it)| (sl(pf.ctrl_prep, j, 2 * h), it.1, it.2)).collect();
+            self.backend.ctrl_prep_multi(&prep, h, self.cfg.rms_norm_eps, m, s)?;
+        } else {
+            for (j, (_, cur, msg, _)) in items.iter().enumerate() {
+                self.backend.loop_control_prep_rows(sl(pf.ctrl_prep, j, 2 * h), *cur, *msg, h, self.cfg.rms_norm_eps, m, s)?;
+            }
         }
         let seg = |mm: &crate::weights::Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment {
             w: mm.data, row_scales: Some(mm.row_scales), x, y, n_rows: mm.n_rows, k_cols: mm.k_cols,
@@ -448,6 +455,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             gf.push(seg(&it.3.forget, sl(pf.ctrl_gate, j, r), sl(pf.ctrl_forget, j, h)));
         }
         self.backend.gemv_multi_rows(&gf, m, s)?;
+        if let Some(nw) = norms {
+            let ap: Vec<_> = items.iter().enumerate().map(|(j, it)| (it.0, it.1, it.2, sl(pf.ctrl_gain, j, h), sl(pf.ctrl_forget, j, h), nw.get(j).copied())).collect();
+            return self.backend.ctrl_apply_norm_multi(&ap, h, self.cfg.rms_norm_eps, m, s);
+        }
         for (j, (out, cur, msg, _)) in items.iter().enumerate() {
             self.backend.loop_control_apply(*out, *cur, *msg, sl(pf.ctrl_gain, j, h), sl(pf.ctrl_forget, j, h), m * h, s)?;
         }
@@ -511,11 +522,53 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let b = &*backend;
 
         b.seg_mark("pf: mix,ctrl,norm", s);
-        b.vec_copy(pf.inp_sa, pf.cur, m * h, s)?;
+        // Speculative verify: copy + mixes (+ norms) in one launch per side of the attention.
+        let fuse_mix = verify && self.rows_decode && std::env::var_os("SMALLTIDE_VERIFY_UNFUSED").is_none();
+        if !fuse_mix {
+            b.vec_copy(pf.inp_sa, pf.cur, m * h, s)?;
+        }
         let blocks_view = (*nb > 0).then(|| pf.blocks.slice(0, *nb * hb));
+        let nrm = [part(pf.norm_qkv, 0, m, h), part(pf.norm_qkv, 1, m, h), part(pf.norm_qkv, 2, m, h)];
+        let mut pre_normed: Option<(DeviceBuf, DeviceBuf, DeviceBuf)> = None;
 
         // 1. attention-residual mix
-        let (in0, in1, in2) = if let Some(attn_q) = layer.attn_res_query {
+        let (in0, in1, in2) = if fuse_mix {
+            let nqm = if is_local { 1 } else { 3 };
+            let norms = match (messages.is_none(), is_local) {
+                (true, true) => [layer.attn_norm, None, None],
+                (true, false) => [layer.q_input_norm, layer.k_input_norm, layer.v_input_norm],
+                (false, _) => [None, None, None],
+            };
+            let mix_out = (messages.is_some() && layer.attn_res_query.is_some()).then_some(pf.in_qkv);
+            b.mix_rows(
+                smalltide_core::backend::MixRowsParams {
+                    cur: pf.cur,
+                    add_src: None,
+                    residual: None,
+                    blocks: blocks_view,
+                    copy_out: Some(pf.inp_sa),
+                    queries: layer.attn_res_query,
+                    mix_out,
+                    norm_w: norms,
+                    norm_out: Some(pf.norm_qkv),
+                    nb: *nb,
+                    boundary: false,
+                    nq: nqm,
+                    hidden: h,
+                    rows: m,
+                    eps,
+                },
+                s,
+            )?;
+            if messages.is_none() {
+                pre_normed = Some(if is_local { (nrm[0], nrm[0], nrm[0]) } else { (nrm[0], nrm[1], nrm[2]) });
+            }
+            match (layer.attn_res_query.is_some(), is_local) {
+                (true, true) => (part(pf.in_qkv, 0, m, h), part(pf.in_qkv, 0, m, h), part(pf.in_qkv, 0, m, h)),
+                (true, false) => (part(pf.in_qkv, 0, m, h), part(pf.in_qkv, 1, m, h), part(pf.in_qkv, 2, m, h)),
+                (false, _) => (pf.cur, pf.cur, pf.cur),
+            }
+        } else if let Some(attn_q) = layer.attn_res_query {
             if is_local {
                 let d0 = part(pf.in_qkv, 0, m, h);
                 b.attn_res_mix_rows(d0, blocks_view, pf.cur, attn_q, *nb, 1, h, eps, m, s)?;
@@ -534,7 +587,19 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let ins = [in0, in1, in2];
             if self.rows_decode {
                 let items: Vec<_> = (0..3).map(|j| (c[j], ins[j], part(msgs, j, m, h), &ctrls[j])).collect();
-                self.control_rows_multi(&items, m, s)?;
+                if fuse_mix {
+                    let ws = if is_local {
+                        let w = layer.attn_norm.expect("attn_norm");
+                        [w, w, w]
+                    } else {
+                        [layer.q_input_norm.unwrap(), layer.k_input_norm.unwrap(), layer.v_input_norm.unwrap()]
+                    };
+                    let nr: Vec<_> = (0..3).map(|j| (ws[j], nrm[j])).collect();
+                    self.control_rows_multi(&items, Some(&nr), m, s)?;
+                    pre_normed = Some((nrm[0], nrm[1], nrm[2]));
+                } else {
+                    self.control_rows_multi(&items, None, m, s)?;
+                }
             } else {
                 for j in 0..3 {
                     self.control_rows(c[j], ins[j], part(msgs, j, m, h), &ctrls[j], m, s)?;
@@ -549,7 +614,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let has_msg = messages.is_some();
         // 3. input norms
         let n = [part(pf.norm_qkv, 0, m, h), part(pf.norm_qkv, 1, m, h), part(pf.norm_qkv, 2, m, h)];
-        let (nq, nk, nv) = if is_local {
+        let (nq, nk, nv) = if let Some(x) = pre_normed {
+            x
+        } else if is_local {
             let w = layer.attn_norm.expect("attn_norm");
             if has_msg {
                 b.rms_norm(n[0], in0, w, m, h, eps, s)?;
@@ -782,22 +849,52 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 }
             }
         }
-        // 8. block boundary
-        if ip % cfg.n_layers_per_attn_res_block == 0 {
-            b.vec_copy(pf.blocks.slice(*nb * hb, hb), pf.inp_sa, m * h, s)?;
-            *nb += 1;
-            b.vec_copy(pf.cur, pf.sconv_tmp, m * h, s)?;
+        // 8. block boundary, 9. MLP input mix -> controller -> norm -> router
+        let boundary = ip % cfg.n_layers_per_attn_res_block == 0;
+        let mut post_normed = false;
+        if fuse_mix {
+            b.mix_rows(
+                smalltide_core::backend::MixRowsParams {
+                    cur: pf.cur,
+                    add_src: Some(pf.sconv_tmp),
+                    residual: Some(pf.inp_sa),
+                    blocks: Some(pf.blocks.slice(0, (*nb + 1) * hb)),
+                    copy_out: Some(pf.ffn_inp),
+                    queries: Some(layer.mlp_res_query),
+                    mix_out: messages.is_some().then_some(pf.moe_in),
+                    norm_w: [messages.is_none().then_some(layer.mlp_norm), None, None],
+                    norm_out: Some(pf.moe_norm),
+                    nb: *nb,
+                    boundary,
+                    nq: 1,
+                    hidden: h,
+                    rows: m,
+                    eps,
+                },
+                s,
+            )?;
+            if boundary {
+                *nb += 1;
+            }
+            post_normed = messages.is_none();
         } else {
-            b.vec_add(pf.cur, pf.inp_sa, pf.sconv_tmp, m * h, s)?;
+            if boundary {
+                b.vec_copy(pf.blocks.slice(*nb * hb, hb), pf.inp_sa, m * h, s)?;
+                *nb += 1;
+                b.vec_copy(pf.cur, pf.sconv_tmp, m * h, s)?;
+            } else {
+                b.vec_add(pf.cur, pf.inp_sa, pf.sconv_tmp, m * h, s)?;
+            }
+            b.vec_copy(pf.ffn_inp, pf.cur, m * h, s)?;
+            let bv = Some(pf.blocks.slice(0, *nb * hb));
+            b.attn_res_mix_rows(pf.moe_in, bv, pf.cur, layer.mlp_res_query, *nb, 1, h, eps, m, s)?;
         }
-        b.vec_copy(pf.ffn_inp, pf.cur, m * h, s)?;
-        // 9. MLP input mix -> controller -> norm -> router
-        let bv = Some(pf.blocks.slice(0, *nb * hb));
-        b.attn_res_mix_rows(pf.moe_in, bv, pf.cur, layer.mlp_res_query, *nb, 1, h, eps, m, s)?;
         let moe_x = if let Some(msgs) = messages {
             let ctrls = layer.controllers.as_ref().unwrap();
             if self.rows_decode {
-                self.control_rows_multi(&[(pf.moe_ctrl, pf.moe_in, part(msgs, 3, m, h), &ctrls[3])], m, s)?;
+                let nr = [(layer.mlp_norm, pf.moe_norm)];
+                self.control_rows_multi(&[(pf.moe_ctrl, pf.moe_in, part(msgs, 3, m, h), &ctrls[3])], fuse_mix.then_some(&nr[..]), m, s)?;
+                post_normed = fuse_mix;
             } else {
                 self.control_rows(pf.moe_ctrl, pf.moe_in, part(msgs, 3, m, h), &ctrls[3], m, s)?;
             }
@@ -807,9 +904,17 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         };
         let pf = self.pf.as_ref().unwrap();
         let layer = &self.dense.layers[ip];
-        b.rms_norm(pf.moe_norm, moe_x, layer.mlp_norm, m, h, eps, s)?;
+        if !post_normed {
+            b.rms_norm(pf.moe_norm, moe_x, layer.mlp_norm, m, h, eps, s)?;
+        }
         b.gemm_f32_rows(pf.router_logits, pf.moe_norm, layer.router_weight, m, cfg.n_routed_experts, h, s)?;
-        b.router_topk8_rows(pf.route, pf.router_logits, Some(layer.router_bias), cfg.route_scale, m, 16, s)?;
+        // Batched decode / verify: the router writes straight into this layer's routing-log rows.
+        let route = if self.rows_decode {
+            self.batch_route_log.expect("batch route log").slice(il * crate::engine::MAX_BATCH_ROWS * 64, m * 64)
+        } else {
+            pf.route
+        };
+        b.router_topk8_rows(route, pf.router_logits, Some(layer.router_bias), cfg.route_scale, m, 16, s)?;
 
         // 10. expert-grouped MoE (host plan from the routed ids)
         b.seg_mark("pf: moe route sync + host plan", s);
@@ -834,12 +939,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 expert_stride_bytes: stride,
             };
             if std::env::var_os("SMALLTIDE_BATCH_MOE_DEDUP").is_some() {
-                b.moe_decode_rows(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pool, slot_table, pf.route, m, params, s)?;
+                b.moe_decode_rows(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pool, slot_table, route, m, params, s)?;
             } else {
-                b.moe_rows_grouped(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pf.moe_out, pf.route, slot_table, pool, pf.desc, m, params, s)?;
+                b.moe_rows_grouped(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pf.moe_out, route, slot_table, pool, pf.desc, m, params, s)?;
             }
-            let log = self.batch_route_log.expect("batch route log");
-            b.vec_copy(log.slice(il * crate::engine::MAX_BATCH_ROWS * 64, m * 64), pf.route.slice(0, m * 64), m * 16, s)?;
             let layer = &self.dense.layers[ip];
             for (r, &(lane, _)) in rows.iter().enumerate() {
                 let ls = self.lane_layer_state(lane, il);
@@ -847,8 +950,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     row(pf.cur, r, h),
                     pf.moe_tmp.slice(r * 8 * h * 4, 8 * h * 4),
                     slot_table,
-                    pf.route.slice(r * 64, 32),
-                    pf.route.slice(r * 64 + 32, 32),
+                    route.slice(r * 64, 32),
+                    route.slice(r * 64 + 32, 32),
                     cfg.num_experts_per_tok,
                     Some((ls.sconv_mlp, layer.mlp_sconv, row(pf.ffn_inp, r, h))),
                     h,
@@ -877,18 +980,16 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 weight_dtype: dtype,
                 expert_stride_bytes: stride,
             };
-            b.moe_rows_grouped(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pf.moe_out, pf.route, slot_table, pool, pf.desc, m, params, s)?;
-            let log = self.batch_route_log.expect("batch route log");
-            b.vec_copy(log.slice(il * crate::engine::MAX_BATCH_ROWS * 64, m * 64), pf.route.slice(0, m * 64), m * 16, s)?;
+            b.moe_rows_grouped(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pf.moe_out, route, slot_table, pool, pf.desc, m, params, s)?;
             if std::env::var_os("SMALLTIDE_VERIFY_UNFUSED").is_none() {
                 // Fused epilogue: weighted sum + MLP conv (+history) + residual; done here.
                 let st = &self.layer_states[il];
                 let layer = &self.dense.layers[ip];
-                b.moe_post_sconv_rows(pf.cur, pf.ffn_inp, pf.moe_tmp, slot_table, pf.route, st.sconv_mlp, layer.mlp_sconv, hist(3), h, m, s)?;
+                b.moe_post_sconv_rows(pf.cur, pf.ffn_inp, pf.moe_tmp, slot_table, route, st.sconv_mlp, layer.mlp_sconv, hist(3), h, m, s)?;
                 b.seg_mark("pf: moe post", s);
                 return Ok(Vec::new());
             }
-            b.moe_post_rows(pf.moe_out, pf.moe_tmp, slot_table, pf.route, m, h, s)?;
+            b.moe_post_rows(pf.moe_out, pf.moe_tmp, slot_table, route, m, h, s)?;
             Vec::new()
         } else {
             self.prefill_moe(ip, m)?

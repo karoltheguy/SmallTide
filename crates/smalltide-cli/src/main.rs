@@ -1150,7 +1150,13 @@ fn run_generate(args: &[String]) {
     // Speculative decoding (greedy): the drafter proposes width - 1 tokens, one verify pass
     // checks them; accepted drafts plus the target's next token are emitted per step.
     let spec = engine.drafter.is_some() && temperature <= 0.0;
-    let spec_width = std::env::var("SMALLTIDE_SPEC_WIDTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(2, 8);
+    // Width: fixed (SMALLTIDE_SPEC_WIDTH=n) or adaptive (default): per step the width maximizing
+    // expected tokens per ms from the recent per-draft acceptance rate.
+    let fixed_width = std::env::var("SMALLTIDE_SPEC_WIDTH").ok().and_then(|v| v.parse::<usize>().ok()).map(|w| w.clamp(2, 8));
+    let spec_width = fixed_width.unwrap_or(8);
+    let mut acc_s = 2.0f64; // decayed accepted drafts
+    let mut acc_f = 2.0f64; // decayed rejections
+    let mut width_hist = [0usize; 9];
     let (mut spec_steps, mut spec_accepted, mut draft_ms, mut verify_ms) = (0usize, 0usize, 0f64, 0f64);
     let mut spec_hist = [0usize; 8];
     if spec {
@@ -1169,6 +1175,16 @@ fn run_generate(args: &[String]) {
             done = true;
         }
         while !done && pos + spec_width <= max_ctx {
+            let spec_width = fixed_width.unwrap_or_else(|| {
+                let a = ((acc_s + 1.0) / (acc_s + acc_f + 2.0)).min(0.98);
+                (2..=8usize)
+                    .max_by(|&x, &y| {
+                        let gain = |w: usize| (1.0 - a.powi(w as i32)) / (1.0 - a) / (17.0 + 2.5 * (w - 1) as f64);
+                        gain(x).total_cmp(&gain(y))
+                    })
+                    .unwrap()
+            });
+            width_hist[spec_width] += 1;
             let n = spec_width - 1;
             let td = Instant::now();
             let drafts = engine.draft(next_tok, pos, tap_row, n).expect("draft");
@@ -1189,6 +1205,8 @@ fn run_generate(args: &[String]) {
             spec_steps += 1;
             spec_accepted += c;
             spec_hist[c] += 1;
+            acc_s = 0.85 * acc_s + c as f64;
+            acc_f = 0.85 * acc_f + if c < n { 1.0 } else { 0.0 };
             for &t in &block[1..=c] {
                 if !emit(t, &mut generated) {
                     done = true;
@@ -1234,9 +1252,15 @@ fn run_generate(args: &[String]) {
     let dec_toks = generated.len();
     if spec && spec_steps > 0 {
         let hist: Vec<String> = spec_hist[..spec_width].iter().enumerate().map(|(i, c)| format!("{i}:{c}")).collect();
+        if fixed_width.is_none() {
+            let wh: Vec<String> = (2..=8).filter(|&w| width_hist[w] > 0).map(|w| format!("w{w}:{}", width_hist[w])).collect();
+            println!("
+[spec] adaptive width per step: {}", wh.join(" "));
+        }
         println!(
-            "\n[spec] distinct resident experts per verify step {:.1} | width {spec_width}: {spec_steps} steps, mean accepted {:.2} -> {:.2} tokens/step | draft {:.2} ms + verify {:.2} ms per step | accepted per step {}",
+            "\n[spec] distinct resident experts per verify step {:.1} | width {}: {spec_steps} steps, mean accepted {:.2} -> {:.2} tokens/step | draft {:.2} ms + verify {:.2} ms per step | accepted per step {}",
             engine.dev_unique_resident as f64 / engine.dev_rounds.max(1) as f64,
+            fixed_width.map_or("adaptive".to_string(), |w| w.to_string()),
             spec_accepted as f64 / spec_steps as f64,
             1.0 + spec_accepted as f64 / spec_steps as f64,
             draft_ms / spec_steps as f64,

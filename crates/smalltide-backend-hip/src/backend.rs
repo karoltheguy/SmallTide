@@ -99,7 +99,25 @@ pub struct HostStats {
 unsafe impl Send for HipBackend {}
 unsafe impl Sync for HipBackend {}
 
+#[repr(C)]
+struct CtrlMultiC {
+    out: [*mut c_void; 4],
+    cur: [*mut c_void; 4],
+    msg: [*mut c_void; 4],
+    gain: [*mut c_void; 4],
+    forget: [*mut c_void; 4],
+    norm_w: [*mut c_void; 4],
+    norm_out: [*mut c_void; 4],
+    hidden: u32,
+    eps: f32,
+}
+
 impl HipBackend {
+    fn ctrl_args(&self, hidden: usize, eps: f32) -> CtrlMultiC {
+        let z = [ptr::null_mut(); 4];
+        CtrlMultiC { out: z, cur: z, msg: z, gain: z, forget: z, norm_w: z, norm_out: z, hidden: hidden as u32, eps }
+    }
+
     /// Whether new device allocations are zeroed (committed) immediately. On during model load
     /// so residency measurements see every buffer; turn off once the engine is built.
     pub fn set_touch_on_alloc(&self, on: bool) {
@@ -330,7 +348,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, attn_prep_rows, moe_post_sconv_rows, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, moe_w2_rows)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, moe_w2_rows)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -1823,13 +1841,11 @@ impl ComputeBackend for HipBackend {
         // 1. plan on the GPU
         let (mut w, mut pr, mut rt, mut stb, mut nr) = (self.dev_ptr(desc)?, self.dev_ptr(desc.slice(1024, desc.size_bytes - 1024))?,
             self.dev_ptr(route)?, self.dev_ptr(slot_table)?, rows as u32);
-        let mut args = [p(&mut w), p(&mut pr), p(&mut rt), p(&mut stb), p(&mut nr)];
-        self.launch(self.kernels.moe_group_rows2, (1, 1, 1), 64, &mut args, stream, "launch(moe_group_rows2)")?;
-        // 2. x -> f16
+        // 2. x -> f16 in the same launch
         let n = (rows * mp.hidden_size) as u32;
         let (mut xo, mut xi, mut nn) = (self.dev_ptr(xscratch)?, self.dev_ptr(x)?, n);
-        let mut cargs = [p(&mut xo), p(&mut xi), p(&mut nn)];
-        self.launch(self.kernels.f32_to_f16, (n.div_ceil(1024), 1, 1), 256, &mut cargs, stream, "launch(f32_to_f16)")?;
+        let mut args = [p(&mut w), p(&mut pr), p(&mut rt), p(&mut stb), p(&mut nr), p(&mut xo), p(&mut xi), p(&mut nn)];
+        self.launch(self.kernels.moe_group_rows3, (1, 1, 1), 256, &mut args, stream, "launch(moe_group_rows3)")?;
         // 3. WMMA grouped w13 / w2 over the 64 work items (unused ones exit)
         let (mut a, mut x16, mut c, mut d, mut e) = (self.dev_ptr(mid)?, self.dev_ptr(xscratch)?, self.dev_ptr(pool)?, w, pr);
         let (mut st, mut h, mut i, mut gc, mut uc) = (mp.expert_stride_bytes as u64, mp.hidden_size as u32, mp.intermediate_size as u32, 4.0f32, 25.0f32);
@@ -1889,6 +1905,88 @@ impl ComputeBackend for HipBackend {
         let (mut hd, mut r) = (hidden as u32, rows as u32);
         let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut g), p(&mut hh), p(&mut hd), p(&mut r)];
         self.launch(self.kernels.moe_post_sconv_rows, (hd.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(moe_post_sconv_rows)")
+    }
+
+    fn mix_rows(&self, pp: smalltide_core::backend::MixRowsParams, stream: Stream) -> Result<()> {
+        #[repr(C)]
+        struct ArgsC {
+            cur: *mut c_void,
+            add_src: *mut c_void,
+            residual: *mut c_void,
+            blocks: *mut c_void,
+            copy_out: *mut c_void,
+            queries: *mut c_void,
+            mix_out: *mut c_void,
+            norm_w0: *mut c_void,
+            norm_w1: *mut c_void,
+            norm_w2: *mut c_void,
+            norm_out: *mut c_void,
+            nb: u32,
+            boundary: u32,
+            nq: u32,
+            hidden: u32,
+            rows: u32,
+            eps: f32,
+        }
+        if pp.hidden > 3072 || pp.nq == 0 || pp.nq > 3 || pp.nb + 1 > 15 || pp.rows == 0 {
+            return Err(SmallTideError::Backend { backend: "hip", message: "mix_rows: unsupported shape".into() });
+        }
+        let mut a = ArgsC {
+            cur: self.dev_ptr(pp.cur)?,
+            add_src: self.opt_dev_ptr(pp.add_src)?,
+            residual: self.opt_dev_ptr(pp.residual)?,
+            blocks: self.opt_dev_ptr(pp.blocks)?,
+            copy_out: self.opt_dev_ptr(pp.copy_out)?,
+            queries: self.opt_dev_ptr(pp.queries)?,
+            mix_out: self.opt_dev_ptr(pp.mix_out)?,
+            norm_w0: self.opt_dev_ptr(pp.norm_w[0])?,
+            norm_w1: self.opt_dev_ptr(pp.norm_w[1])?,
+            norm_w2: self.opt_dev_ptr(pp.norm_w[2])?,
+            norm_out: self.opt_dev_ptr(pp.norm_out)?,
+            nb: pp.nb as u32,
+            boundary: pp.boundary as u32,
+            nq: pp.nq as u32,
+            hidden: pp.hidden as u32,
+            rows: pp.rows as u32,
+            eps: pp.eps,
+        };
+        let mut args = [p(&mut a)];
+        self.launch(self.kernels.mix_rows, (pp.rows as u32, 1, 1), 1024, &mut args, stream, "launch(mix_rows)")
+    }
+
+    fn ctrl_prep_multi(&self, items: &[(DeviceBuf, DeviceBuf, DeviceBuf)], hidden: usize, eps: f32, rows: usize, stream: Stream) -> Result<()> {
+        let mut a = self.ctrl_args(hidden, eps);
+        if items.is_empty() || items.len() > 4 {
+            return Err(SmallTideError::Backend { backend: "hip", message: "ctrl_prep_multi: 1..=4 items".into() });
+        }
+        for (i, &(o, c, m)) in items.iter().enumerate() {
+            a.out[i] = self.dev_ptr(o)?;
+            a.cur[i] = self.dev_ptr(c)?;
+            a.msg[i] = self.dev_ptr(m)?;
+        }
+        let mut args = [p(&mut a)];
+        self.launch(self.kernels.ctrl_prep_multi, (2, rows as u32, items.len() as u32), 256, &mut args, stream, "launch(ctrl_prep_multi)")
+    }
+
+    fn ctrl_apply_norm_multi(&self, items: &[(DeviceBuf, DeviceBuf, DeviceBuf, DeviceBuf, DeviceBuf, Option<(DeviceBuf, DeviceBuf)>)],
+        hidden: usize, eps: f32, rows: usize, stream: Stream) -> Result<()> {
+        let mut a = self.ctrl_args(hidden, eps);
+        if items.is_empty() || items.len() > 4 || hidden > 3072 {
+            return Err(SmallTideError::Backend { backend: "hip", message: "ctrl_apply_norm_multi: bad shape".into() });
+        }
+        for (i, &(o, c, m, g, f, n)) in items.iter().enumerate() {
+            a.out[i] = self.dev_ptr(o)?;
+            a.cur[i] = self.dev_ptr(c)?;
+            a.msg[i] = self.dev_ptr(m)?;
+            a.gain[i] = self.dev_ptr(g)?;
+            a.forget[i] = self.dev_ptr(f)?;
+            if let Some((w, no)) = n {
+                a.norm_w[i] = self.dev_ptr(w)?;
+                a.norm_out[i] = self.dev_ptr(no)?;
+            }
+        }
+        let mut args = [p(&mut a)];
+        self.launch(self.kernels.ctrl_apply_norm_multi, (rows as u32, items.len() as u32, 1), 1024, &mut args, stream, "launch(ctrl_apply_norm_multi)")
     }
 
     fn f32_to_f16(&self, out: DeviceBuf, x: DeviceBuf, n: usize, stream: Stream) -> Result<()> {

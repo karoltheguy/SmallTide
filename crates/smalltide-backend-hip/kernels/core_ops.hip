@@ -830,3 +830,279 @@ extern "C" __global__ void smalltide_attn_prep_rows(AttnPrepArgs a, AttnPrepRows
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Rows version of the fused decode mix (one block per row, hidden <= 3072, <= 15 blocks):
+//   A (add_src != null): boundary ? (blocks[nb][r] = residual[r], cur[r] = add_src[r])
+//                                 : cur[r] = residual[r] + add_src[r]
+//   B (copy_out != null): copy_out[r] = cur[r]
+//   C: m_q = attention-residual mix of [blocks[0..nb'][r], cur[r]] with query q (identity if
+//      queries == null); D: mix_out[q][r] = m_q (optional), norm_out[q][r] = rmsnorm(m_q) * w_q.
+//   blocks: [nb][M][H]; mix_out / norm_out: [nq][M][H].   Grid: M, Block: 1024
+// ---------------------------------------------------------------------------
+struct MixRowsArgs {
+    float* cur;
+    const float* add_src;
+    const float* residual;
+    float* blocks;
+    float* copy_out;
+    const float* queries;
+    float* mix_out;
+    const float* norm_w0;
+    const float* norm_w1;
+    const float* norm_w2;
+    float* norm_out;
+    uint32_t nb;
+    uint32_t boundary;
+    uint32_t nq;
+    uint32_t hidden;
+    uint32_t rows;
+    float eps;
+};
+
+extern "C" __global__ void smalltide_mix_rows(MixRowsArgs a) {
+    __shared__ float red[4][32];
+    __shared__ float tot[4];
+    __shared__ float s_inv[16];
+    __shared__ float s_w[16][3];
+    const uint32_t H = a.hidden, nt = blockDim.x, t = threadIdx.x, r = blockIdx.x, M = a.rows;
+    const size_t ro = static_cast<size_t>(r) * H;
+    float c[3];
+    uint32_t nbm = a.nb;
+    if (a.add_src != nullptr) {
+        #pragma unroll
+        for (uint32_t e = 0u; e < 3u; ++e) {
+            uint32_t h = t + e * nt;
+            c[e] = 0.0f;
+            if (h < H) {
+                float res = a.residual[ro + h], y = a.add_src[ro + h];
+                if (a.boundary != 0u) {
+                    a.blocks[(static_cast<size_t>(a.nb) * M + r) * H + h] = res;
+                    c[e] = y;
+                } else {
+                    c[e] = res + y;
+                }
+                a.cur[ro + h] = c[e];
+            }
+        }
+        if (a.boundary != 0u) nbm = a.nb + 1u;
+    } else {
+        #pragma unroll
+        for (uint32_t e = 0u; e < 3u; ++e) {
+            uint32_t h = t + e * nt;
+            c[e] = (h < H) ? a.cur[ro + h] : 0.0f;
+        }
+    }
+    if (a.copy_out != nullptr) {
+        #pragma unroll
+        for (uint32_t e = 0u; e < 3u; ++e) {
+            uint32_t h = t + e * nt;
+            if (h < H) a.copy_out[ro + h] = c[e];
+        }
+    }
+    const uint32_t nq = a.nq;
+    float m[3][3];
+    if (a.queries == nullptr) {
+        #pragma unroll
+        for (uint32_t q = 0u; q < 3u; ++q) {
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) m[q][e] = c[e];
+        }
+    } else {
+        float inv_sqrt_h = rsqrtf(static_cast<float>(H));
+        float qv[3][3];
+        #pragma unroll
+        for (uint32_t q = 0u; q < 3u; ++q) {
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                qv[q][e] = (q < nq && h < H) ? a.queries[static_cast<size_t>(q) * H + h] : 0.0f;
+            }
+        }
+        for (uint32_t s = 0u; s <= nbm; ++s) {
+            float sq = 0.0f, d0 = 0.0f, d1 = 0.0f, d2 = 0.0f;
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                float x = (h < H) ? ((s < nbm) ? a.blocks[(static_cast<size_t>(s) * M + r) * H + h] : c[e]) : 0.0f;
+                sq = fmaf(x, x, sq);
+                d0 = fmaf(x, qv[0][e], d0); d1 = fmaf(x, qv[1][e], d1); d2 = fmaf(x, qv[2][e], d2);
+            }
+            fm_reduce4(sq, d0, d1, d2, red, tot);
+            if (t == 0u) {
+                float ir = rsqrtf(tot[0] / static_cast<float>(H) + a.eps);
+                s_inv[s] = ir;
+                s_w[s][0] = tot[1] * ir * inv_sqrt_h;
+                s_w[s][1] = tot[2] * ir * inv_sqrt_h;
+                s_w[s][2] = tot[3] * ir * inv_sqrt_h;
+            }
+            __syncthreads();
+        }
+        if (t < nq) {
+            float mx = s_w[0][t];
+            for (uint32_t s = 1u; s <= nbm; ++s) mx = fmaxf(mx, s_w[s][t]);
+            float sum = 0.0f;
+            for (uint32_t s = 0u; s <= nbm; ++s) { float e_ = expf(s_w[s][t] - mx); s_w[s][t] = e_; sum += e_; }
+            float inv = 1.0f / fmaxf(sum, 1e-12f);
+            for (uint32_t s = 0u; s <= nbm; ++s) s_w[s][t] *= inv;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (uint32_t q = 0u; q < 3u; ++q) {
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) m[q][e] = 0.0f;
+        }
+        for (uint32_t s = 0u; s <= nbm; ++s) {
+            float ir = s_inv[s];
+            float w0 = s_w[s][0], w1 = s_w[s][1], w2 = s_w[s][2];
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                float x = (h < H) ? ((s < nbm) ? a.blocks[(static_cast<size_t>(s) * M + r) * H + h] : c[e]) * ir : 0.0f;
+                m[0][e] = fmaf(w0, x, m[0][e]); m[1][e] = fmaf(w1, x, m[1][e]); m[2][e] = fmaf(w2, x, m[2][e]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint32_t q = 0u; q < 3u; ++q) {
+        if (q >= nq) break;
+        const size_t qo = (static_cast<size_t>(q) * M + r) * H;
+        if (a.mix_out != nullptr) {
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                if (h < H) a.mix_out[qo + h] = m[q][e];
+            }
+        }
+        const float* nw = (q == 0u) ? a.norm_w0 : ((q == 1u) ? a.norm_w1 : a.norm_w2);
+        if (nw != nullptr) {
+            float sq = 0.0f;
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) sq = fmaf(m[q][e], m[q][e], sq);
+            fm_reduce4(sq, 0.0f, 0.0f, 0.0f, red, tot);
+            float ir = rsqrtf(tot[0] / static_cast<float>(H) + a.eps);
+            #pragma unroll
+            for (uint32_t e = 0u; e < 3u; ++e) {
+                uint32_t h = t + e * nt;
+                if (h < H) a.norm_out[qo + h] = m[q][e] * ir * nw[h];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loop controllers for up to 4 items over the same rows (speculative verify / batched decode):
+//   prep:  out_i[r] = [rms(cur_i[r]), rms(msg_i[r])]           Grid: (2, rows, items), Block 256
+//   apply: c = (1 - tanh(f)) * cur + tanh(g) * msg -> out_i; norm_out_i = rmsnorm(c) * w_i
+//                                                             Grid: (rows, items), Block 1024
+// ---------------------------------------------------------------------------
+struct CtrlMultiArgs {
+    float* out[4];
+    const float* cur[4];
+    const float* msg[4];
+    const float* gain[4];
+    const float* forget[4];
+    const float* norm_w[4];
+    float* norm_out[4];
+    uint32_t hidden;
+    float eps;
+};
+
+extern "C" __global__ void smalltide_ctrl_prep_multi(CtrlMultiArgs a) {
+    uint32_t side = blockIdx.x, row = blockIdx.y, it = blockIdx.z, H = a.hidden;
+    const float* src = ((side == 0u) ? a.cur[it] : a.msg[it]) + static_cast<size_t>(row) * H;
+    float* dst = a.out[it] + (static_cast<size_t>(row) * 2u + side) * H;
+    float sq = 0.0f;
+    for (uint32_t d = threadIdx.x; d < H; d += blockDim.x) { float v = src[d]; sq = fmaf(v, v, sq); }
+    __shared__ float s_w[32];
+    __shared__ float inv;
+    float ws = wave32_sum(sq);
+    if ((threadIdx.x & 31u) == 0u) s_w[threadIdx.x >> 5] = ws;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float t = 0.0f;
+        for (uint32_t w = 0u; w < (blockDim.x >> 5); ++w) t += s_w[w];
+        inv = rsqrtf(t / static_cast<float>(H) + a.eps);
+    }
+    __syncthreads();
+    for (uint32_t d = threadIdx.x; d < H; d += blockDim.x) dst[d] = src[d] * inv;
+}
+
+extern "C" __global__ void smalltide_ctrl_apply_norm_multi(CtrlMultiArgs a) {
+    __shared__ float red[4][32];
+    __shared__ float tot[4];
+    uint32_t row = blockIdx.x, it = blockIdx.y, H = a.hidden, nt = blockDim.x, t = threadIdx.x;
+    size_t ro = static_cast<size_t>(row) * H;
+    float c[3];
+    float sq = 0.0f;
+    #pragma unroll
+    for (uint32_t e = 0u; e < 3u; ++e) {
+        uint32_t h = t + e * nt;
+        c[e] = 0.0f;
+        if (h < H) {
+            float g = tanhf(a.gain[it][ro + h]);
+            float f = tanhf(a.forget[it][ro + h]);
+            c[e] = (1.0f - f) * a.cur[it][ro + h] + g * a.msg[it][ro + h];
+            a.out[it][ro + h] = c[e];
+            sq = fmaf(c[e], c[e], sq);
+        }
+    }
+    const float* nw = a.norm_w[it];
+    if (nw == nullptr) return;
+    fm_reduce4(sq, 0.0f, 0.0f, 0.0f, red, tot);
+    float ir = rsqrtf(tot[0] / static_cast<float>(H) + a.eps);
+    #pragma unroll
+    for (uint32_t e = 0u; e < 3u; ++e) {
+        uint32_t h = t + e * nt;
+        if (h < H) a.norm_out[it][ro + h] = c[e] * ir * nw[h];
+    }
+}
+
+// Expert grouping (as smalltide_moe_group_rows2) plus the f32 -> f16 copy of the MoE input in the
+// same launch.   Grid: 1, Block: 256 (threads < 64 plan; all convert)
+extern "C" __global__ void smalltide_moe_group_rows3(
+    uint32_t* __restrict__ work, uint32_t* __restrict__ pairs, const uint32_t* __restrict__ route,
+    const uint32_t* __restrict__ slot_table, uint32_t rows, _Float16* __restrict__ x16,
+    const float* __restrict__ x, uint32_t n_x
+) {
+    for (uint32_t i = threadIdx.x * 4u; i < n_x; i += blockDim.x * 4u) {
+        if (i + 3u < n_x) {
+            float4 v = *reinterpret_cast<const float4*>(x + i);
+            x16[i] = (_Float16)v.x; x16[i + 1u] = (_Float16)v.y; x16[i + 2u] = (_Float16)v.z; x16[i + 3u] = (_Float16)v.w;
+        } else {
+            for (uint32_t j = i; j < n_x; ++j) x16[j] = (_Float16)x[j];
+        }
+    }
+    __shared__ uint32_t s_e[64], s_cnt[64], s_wi[64], s_off[64];
+    __shared__ uint32_t s_nw;
+    uint32_t p = threadIdx.x, np_total = rows * 8u;
+    bool lead = p < 64u;
+    bool valid = p < np_total;
+    uint32_t e = valid ? route[(p >> 3) * 16u + (p & 7u)] : 0xFFFFFFFFu;
+    if (lead) s_e[p] = e;
+    __syncthreads();
+    uint32_t slot = valid ? slot_table[e] : 0xFFFFFFFFu;
+    bool first = valid && slot != 0xFFFFFFFFu;
+    for (uint32_t q = 0u; q < p && first; ++q) if (s_e[q] == e) first = false;
+    uint32_t cnt = 0u;
+    if (first) for (uint32_t q = p; q < np_total; ++q) cnt += (s_e[q] == e) ? 1u : 0u;
+    if (lead) { s_cnt[p] = first ? cnt : 0u; s_wi[p] = first ? 1u : 0u; }
+    __syncthreads();
+    if (p == 0u) {
+        uint32_t wsum = 0u, osum = 0u;
+        for (uint32_t q = 0u; q < 64u; ++q) {
+            uint32_t f = s_wi[q], c = s_cnt[q];
+            s_wi[q] = wsum; s_off[q] = osum;
+            wsum += f; osum += c;
+        }
+        s_nw = wsum;
+    }
+    __syncthreads();
+    if (first) {
+        uint32_t wi = s_wi[p], off = s_off[p];
+        work[wi * 4u] = slot; work[wi * 4u + 1u] = off; work[wi * 4u + 2u] = cnt; work[wi * 4u + 3u] = 0u;
+        uint32_t j = 0u;
+        for (uint32_t q = p; q < np_total; ++q) if (s_e[q] == e) pairs[off + j++] = q;
+    }
+    if (lead && p >= s_nw) { work[p * 4u] = 0u; work[p * 4u + 1u] = 0u; work[p * 4u + 2u] = 0u; work[p * 4u + 3u] = 0u; }
+}

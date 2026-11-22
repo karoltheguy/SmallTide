@@ -167,6 +167,26 @@ pub struct AttnPrepParams {
     pub eps: f32,
 }
 
+/// Rows residual / attention-residual mix / RMSNorm (see `ComputeBackend::mix_rows`).
+#[derive(Debug, Clone, Copy)]
+pub struct MixRowsParams {
+    pub cur: DeviceBuf,
+    pub add_src: Option<DeviceBuf>,
+    pub residual: Option<DeviceBuf>,
+    pub blocks: Option<DeviceBuf>,
+    pub copy_out: Option<DeviceBuf>,
+    pub queries: Option<DeviceBuf>,
+    pub mix_out: Option<DeviceBuf>,
+    pub norm_w: [Option<DeviceBuf>; 3],
+    pub norm_out: Option<DeviceBuf>,
+    pub nb: usize,
+    pub boundary: bool,
+    pub nq: usize,
+    pub hidden: usize,
+    pub rows: usize,
+    pub eps: f32,
+}
+
 /// Fused decode residual / attention-residual mix / RMSNorm (see `ComputeBackend::fused_mix_decode`).
 #[derive(Debug, Clone, Copy)]
 pub struct FusedMixParams {
@@ -611,6 +631,18 @@ pub trait ComputeBackend: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn moe_post_sconv_rows(&self, cur: DeviceBuf, ffn_inp: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, route: DeviceBuf,
         state: DeviceBuf, weight: DeviceBuf, hist: Option<DeviceBuf>, hidden: usize, rows: usize, stream: Stream) -> Result<()>;
+
+    /// Rows (<= 8, one sequence or lanes) version of `fused_mix_decode` without the short conv:
+    /// residual add / block boundary, copy, attention-residual mix, per-query RMSNorm.
+    fn mix_rows(&self, p: MixRowsParams, stream: Stream) -> Result<()>;
+
+    /// Loop-controller prep for up to 4 items `(out, cur, msg)` over the same `rows`.
+    fn ctrl_prep_multi(&self, items: &[(DeviceBuf, DeviceBuf, DeviceBuf)], hidden: usize, eps: f32, rows: usize, stream: Stream) -> Result<()>;
+    /// Loop-controller apply for up to 4 items `(out, cur, msg, gain, forget, norm)` (`norm`:
+    /// optional `(weight, norm_out)` RMSNorm of the result) over the same `rows`.
+    #[allow(clippy::type_complexity)]
+    fn ctrl_apply_norm_multi(&self, items: &[(DeviceBuf, DeviceBuf, DeviceBuf, DeviceBuf, DeviceBuf, Option<(DeviceBuf, DeviceBuf)>)],
+        hidden: usize, eps: f32, rows: usize, stream: Stream) -> Result<()>;
 
     /// `out` (f16) = `x` (f32) over `n` elements.
     fn f32_to_f16(&self, out: DeviceBuf, x: DeviceBuf, n: usize, stream: Stream) -> Result<()>;

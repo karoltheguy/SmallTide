@@ -716,7 +716,15 @@ impl ComputeBackend for HipBackend {
             )
         };
         if r != 0 || hptr.is_null() {
+            static LOGGED_FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED_FALLBACK.swap(true, Ordering::Relaxed) {
+                eprintln!("[hip] alloc_host_signal: HIP_HOST_MALLOC_COHERENT failed (hipError_t={r}); falling back to non-coherent mapped host memory");
+            }
             return self.alloc_host_mapped(size_bytes);
+        }
+        static LOGGED_COHERENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED_COHERENT.swap(true, Ordering::Relaxed) {
+            eprintln!("[hip] alloc_host_signal: coherent mapped host memory active");
         }
         let mut dptr: *mut c_void = ptr::null_mut();
         let r2 = unsafe { (self.rt.hip_host_get_device_pointer)(&mut dptr, hptr, 0) };
@@ -757,14 +765,61 @@ impl ComputeBackend for HipBackend {
         patch_hdr: DeviceBuf,
         full_table: DeviceBuf,
         total_entries: usize,
+        probe: Option<DeviceBuf>,
+        layer_id: usize,
+        ticket: u32,
         stream: Stream,
     ) -> Result<()> {
         let mut d_tbl = self.dev_ptr(slot_table)?;
         let mut d_pat = self.dev_ptr(patch_hdr)?;
         let mut d_full = self.dev_ptr(full_table)?;
         let mut tot = total_entries as u32;
-        let mut args = [p(&mut d_tbl), p(&mut d_pat), p(&mut d_full), p(&mut tot)];
+        let mut d_probe = self.opt_dev_ptr(probe)?;
+        let mut lid = layer_id as u32;
+        let mut tkt = ticket;
+        let mut args = [
+            p(&mut d_tbl),
+            p(&mut d_pat),
+            p(&mut d_full),
+            p(&mut tot),
+            p(&mut d_probe),
+            p(&mut lid),
+            p(&mut tkt),
+        ];
         self.launch(self.kernels.rescue_apply_patch, (1, 1, 1), 256, &mut args, stream, "launch(rescue_apply_patch)")
+    }
+
+    fn rescue_wait_and_patch(
+        &self,
+        slot_table: DeviceBuf,
+        flag: DeviceBuf,
+        ticket: u32,
+        patch_hdr: DeviceBuf,
+        full_table: DeviceBuf,
+        total_entries: usize,
+        probe: Option<DeviceBuf>,
+        layer_id: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        let mut d_tbl = self.dev_ptr(slot_table)?;
+        let mut d_flag = self.dev_ptr(flag)?;
+        let mut tkt = ticket;
+        let mut d_pat = self.dev_ptr(patch_hdr)?;
+        let mut d_full = self.dev_ptr(full_table)?;
+        let mut tot = total_entries as u32;
+        let mut d_probe = self.opt_dev_ptr(probe)?;
+        let mut lid = layer_id as u32;
+        let mut args = [
+            p(&mut d_tbl),
+            p(&mut d_flag),
+            p(&mut tkt),
+            p(&mut d_pat),
+            p(&mut d_full),
+            p(&mut tot),
+            p(&mut d_probe),
+            p(&mut lid),
+        ];
+        self.launch(self.kernels.rescue_wait_and_patch, (1, 1, 1), 256, &mut args, stream, "launch(rescue_wait_and_patch)")
     }
 
     fn alloc_host_mapped(&self, size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {

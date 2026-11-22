@@ -325,6 +325,34 @@ impl<B: ComputeBackend> TideExecutor<B> {
     /// Writes one slab from the staging ring into its pool slot: async DMA on the copy stream
     /// for device pools, a CPU copy for the host-mapped MXFP8 pool.
     fn upload_slab(&mut self, expert: ExpertId, dst_pool: DeviceBuf, dst_off: usize, src_offset: usize, len: usize) -> Result<()> {
+        if dst_off + len > dst_pool.size_bytes {
+            return Err(SmallTideError::Backend {
+                backend: "tide",
+                message: format!(
+                    "upload_slab OOB: expert={expert:?} dst_off={dst_off} len={len} pool_size={}",
+                    dst_pool.size_bytes
+                ),
+            });
+        }
+        unsafe {
+            let staging = self.backend.pinned_as_mut_slice(self.pinned_staging)?;
+            if len >= 28 {
+                let h = &staging[src_offset..src_offset + 28];
+                let w13_w = u32::from_le_bytes(h[8..12].try_into().unwrap()) as usize;
+                let w13_s = u32::from_le_bytes(h[12..16].try_into().unwrap()) as usize;
+                let w2_w = u32::from_le_bytes(h[16..20].try_into().unwrap()) as usize;
+                let w2_s = u32::from_le_bytes(h[20..24].try_into().unwrap()) as usize;
+                let tag = u32::from_le_bytes(h[24..28].try_into().unwrap());
+                if tag > 1 || w13_w >= len || w13_s >= len || w2_w >= len || w2_s >= len {
+                    return Err(SmallTideError::Backend {
+                        backend: "tide",
+                        message: format!(
+                            "upload_slab corrupt header for {expert:?}: tag={tag} w13=({w13_w},{w13_s}) w2=({w2_w},{w2_s}) len={len}"
+                        ),
+                    });
+                }
+            }
+        }
         if self.mxfp8_host_mapped && self.scheduler.cache.expert_class(expert) == ExpertClass::Mxfp8 {
             let host = self.mxfp8_host.expect("mxfp8 host pool");
             unsafe {

@@ -32,6 +32,11 @@ fn main() {
         Some("probe") => run_probe(),
         Some("vram-probe") => run_vram_probe(),
         Some("bench-gpu") => run_bench_gpu(),
+        Some("stress-rescue") => {
+            let mode = args.get(2).map(String::as_str).unwrap_or("spin");
+            let tokens: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(500);
+            run_stress_rescue(mode, tokens);
+        }
         Some("bench-nvme") => run_bench_nvme(),
         Some("load-test") => {
             let dir = args
@@ -1443,4 +1448,270 @@ fn run_generate(args: &[String]) {
             p.lm_head_ms / n,
         );
     }
+}
+
+/// Fast (~0.2s boot) GPU stress microbench for GPU-side rescue waits (`spin` vs `waitvalue`),
+/// running real `rescue_write_route`, wait+patch, 4.27 MiB SDMA slab copies on `copy_stream`,
+/// and real `moe_decode_experts` kernels reading freshly DMA'd slabs across 48 layers/token.
+fn run_stress_rescue(mode: &str, tokens: usize) {
+    let use_spin = match mode {
+        "spin" => true,
+        "waitvalue" => false,
+        other => {
+            eprintln!("Usage: smalltide-cli stress-rescue [spin|waitvalue] [tokens]");
+            eprintln!("Unknown mode: {other}");
+            std::process::exit(1);
+        }
+    };
+    let t_boot = Instant::now();
+    let cfg = Inkling2Config::default();
+    let dev = HipRuntime::load().expect("HIP").select_device().expect("select device");
+    let backend = Arc::new(HipBackend::new(dev).expect("HipBackend"));
+    let compute_stream = backend.create_stream(smalltide_core::QueueKind::Compute).expect("compute stream");
+    let copy_stream = backend.create_stream(smalltide_core::QueueKind::AsyncCopyH2D).expect("copy stream");
+    let ev = backend.create_event().expect("ev");
+
+    let n_log = cfg.num_logical_layers();
+    let n_exp = cfg.n_routed_experts;
+    let total_experts = cfg.num_physical_layers * n_exp;
+    let layout = ExpertSlabLayout::for_inkling2(&cfg, DType::NVFP4);
+    let slab_bytes = layout.aligned_slab_bytes;
+    let pool_slots = 48usize; // 40 resident + 8 scratch
+    let pool = backend.alloc_device(pool_slots * slab_bytes).expect("pool");
+    let slot_table = backend.alloc_device(total_experts * 4).expect("slot_table");
+
+    // Build one valid NVFP4 slab template in pinned staging and initialize all pool slots.
+    let staging_slots = 16usize;
+    let staging = backend.alloc_pinned(staging_slots * slab_bytes).expect("staging");
+    let mut hdr = ExpertSlabHeader {
+        w13_outer_scale: 0.25,
+        w2_outer_scale: 0.25,
+        w13_weight_offset: layout.w13_weight_offset as u32,
+        w13_scale_offset: layout.w13_scale_offset as u32,
+        w2_weight_offset: layout.w2_weight_offset as u32,
+        w2_scale_offset: layout.w2_scale_offset as u32,
+        dtype_tag: 0,
+        _reserved: [0; 9],
+    };
+    let hdr_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(&hdr as *const ExpertSlabHeader as *const u8, std::mem::size_of::<ExpertSlabHeader>())
+    };
+    unsafe {
+        let st = backend.pinned_as_mut_slice(staging).expect("staging slice");
+        for s in 0..staging_slots {
+            let base = s * slab_bytes;
+            st[base..base + slab_bytes].fill(0x38);
+            st[base..base + hdr_bytes.len()].copy_from_slice(hdr_bytes);
+        }
+    }
+    for s in 0..pool_slots {
+        backend.memcpy_h2d_async(pool, s * slab_bytes, staging, 0, slab_bytes, copy_stream).expect("init slab");
+    }
+    backend.sync_stream(copy_stream).expect("sync init pool");
+
+    // Initial slot_table: experts 0..6 resident in slots 0..6, experts 6..128 missing (u32::MAX).
+    let init_tbl = backend.alloc_pinned(total_experts * 4).expect("init_tbl");
+    unsafe {
+        let p = backend.pinned_as_mut_slice(init_tbl).unwrap().as_mut_ptr() as *mut u32;
+        for l in 0..cfg.num_physical_layers {
+            for e in 0..n_exp {
+                let v = if e < 6 { e as u32 } else { u32::MAX };
+                std::ptr::write(p.add(l * n_exp + e), v);
+            }
+        }
+    }
+    backend.memcpy_h2d_async(slot_table, 0, init_tbl, 0, total_experts * 4, compute_stream).expect("upload tbl");
+
+    // Routing log: 48 layers x 16 u32s (ids 0..8, weights 0.125 each).
+    let route_log = backend.alloc_device(n_log * 16 * 4).expect("route_log");
+    let route_init = backend.alloc_pinned(n_log * 16 * 4).expect("route_init");
+    unsafe {
+        let p = backend.pinned_as_mut_slice(route_init).unwrap().as_mut_ptr() as *mut u32;
+        for il in 0..n_log {
+            for k in 0..8 {
+                std::ptr::write(p.add(il * 16 + k), k as u32);
+                std::ptr::write(p.add(il * 16 + 8 + k), 0.125f32.to_bits());
+            }
+        }
+    }
+    backend.memcpy_h2d_async(route_log, 0, route_init, 0, n_log * 16 * 4, compute_stream).expect("upload route_log");
+
+    // MoE activation scratch buffers
+    let h = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let x_buf = backend.alloc_device(h * 4).expect("x");
+    let mid_buf = backend.alloc_device(8 * inter * 4).expect("mid");
+    let tmp_buf = backend.alloc_device(8 * h * 4).expect("tmp");
+    backend.zero_f32(x_buf, h, compute_stream).expect("zero x");
+
+    // Coherent signal buffers matching engine.rs
+    const ROUTE_STRIDE: usize = 32;
+    const FLAG_STRIDE: usize = 16;
+    const PATCH_STRIDE: usize = 512;
+    let (rview, rhost) = backend.alloc_host_signal(n_log * ROUTE_STRIDE * 4).expect("route_pinned");
+    let (fview, fhost) = backend.alloc_host_signal(n_log * FLAG_STRIDE * 4).expect("wait_flags");
+    let (pview, phost) = backend.alloc_host_signal(n_log * PATCH_STRIDE * 4).expect("patches");
+    let (ftview, _fthost) = backend.alloc_host_signal(total_experts * 4).expect("full_tbl");
+    let (prview, prhost) = backend.alloc_host_signal(8 * 4).expect("probe");
+    unsafe {
+        for (hbuf, words) in [(rhost, n_log * ROUTE_STRIDE), (fhost, n_log * FLAG_STRIDE), (phost, n_log * PATCH_STRIDE), (prhost, 8)] {
+            let p = backend.pinned_as_mut_slice(hbuf).unwrap().as_mut_ptr() as *mut u32;
+            for i in 0..words { std::ptr::write_volatile(p.add(i), 0); }
+        }
+    }
+    backend.sync_stream(compute_stream).expect("sync init");
+    let boot_ms = t_boot.elapsed().as_secs_f64() * 1000.0;
+
+    let moe_params = smalltide_core::backend::MoeDispatchParams {
+        batch_size: 1,
+        hidden_size: h,
+        intermediate_size: inter,
+        top_k: 8,
+        weight_dtype: DType::NVFP4,
+        expert_stride_bytes: slab_bytes,
+    };
+
+    let t0 = Instant::now();
+    let mut total_wait_us = 0.0f64;
+    let mut total_rescue_us = 0.0f64;
+    let mut total_rescues = 0u64;
+    let mut total_waits = 0u64;
+    let mut scratch_cur = 0usize;
+    let mut staging_cur = 0usize;
+    let mut prev_rescued_idx: Option<usize> = None;
+
+    for tok in 1..=tokens {
+        let ticket = tok as u32;
+        unsafe {
+            let pp = backend.pinned_as_mut_slice(phost).unwrap().as_mut_ptr() as *mut u32;
+            for il in 0..n_log {
+                std::ptr::write_volatile(pp.add(il * PATCH_STRIDE), 0);
+            }
+        }
+        // Queue all 48 layers up front (exact engine.rs pattern)
+        for il in 0..n_log {
+            let ip = il % cfg.num_physical_layers;
+            let route_row = route_log.slice(il * 16 * 4, 16 * 4);
+            let topk_ids = route_log.slice(il * 16 * 4, 32);
+            let layer_tbl = slot_table.slice(ip * n_exp * 4, n_exp * 4);
+            backend.rescue_write_route(
+                rview.slice(il * ROUTE_STRIDE * 4, ROUTE_STRIDE * 4),
+                route_row,
+                16,
+                ticket,
+                compute_stream,
+            ).expect("rescue_write_route");
+            let flag_sl = fview.slice(il * FLAG_STRIDE * 4, 4);
+            let patch_sl = pview.slice(il * PATCH_STRIDE * 4, PATCH_STRIDE * 4);
+            if use_spin {
+                backend.rescue_wait_and_patch(
+                    slot_table, flag_sl, ticket, patch_sl, ftview, total_experts, Some(prview), il, compute_stream,
+                ).expect("rescue_wait_and_patch");
+            } else {
+                backend.stream_wait_value_ge(compute_stream, flag_sl, ticket).expect("stream_wait_value_ge");
+                backend.rescue_apply_patch(
+                    slot_table, patch_sl, ftview, total_experts, Some(prview), il, ticket, compute_stream,
+                ).expect("rescue_apply_patch");
+            }
+            backend.moe_decode_experts(mid_buf, tmp_buf, x_buf, pool, layer_tbl, topk_ids, moe_params, compute_stream)
+                .expect("moe_decode_experts");
+        }
+        backend.record_event(ev, compute_stream).expect("record_event");
+        let _ = backend.query_event(ev).expect("query_event");
+
+        // Service all 48 checks on host
+        for il in 0..n_log {
+            let tw = Instant::now();
+            let row = unsafe {
+                backend.pinned_as_mut_slice(rhost).unwrap()[il * ROUTE_STRIDE * 4..].as_ptr() as *const u32
+            };
+            let mut spins = 0u64;
+            loop {
+                if unsafe { std::ptr::read_volatile(row.add(16)) } == ticket {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+                    break;
+                }
+                spins += 1;
+                if spins % 8192 == 0 {
+                    backend.query_event(ev).expect("query_event in spin");
+                    if tw.elapsed().as_secs() > 5 {
+                        let (pr0, pr1) = unsafe {
+                            let p = backend.pinned_as_mut_slice(prhost).unwrap().as_ptr() as *const u32;
+                            (std::ptr::read_volatile(p), std::ptr::read_volatile(p.add(1)))
+                        };
+                        eprintln!(
+                            "[stress-rescue] TIMEOUT at tok={tok} il={il} mode={mode}: probe=0x{pr0:08x} (tkt={} il={} st={}) last_n={pr1}",
+                            pr0 >> 12, (pr0 >> 4) & 0xFF, pr0 & 0xF
+                        );
+                        // Release remaining flags so stream doesn't hang on exit
+                        unsafe {
+                            let fp = backend.pinned_as_mut_slice(fhost).unwrap().as_mut_ptr() as *mut u32;
+                            for rem in il..n_log {
+                                std::ptr::write_volatile(fp.add(rem * FLAG_STRIDE), ticket);
+                            }
+                        }
+                        std::process::exit(2);
+                    }
+                }
+                std::hint::spin_loop();
+            }
+            total_wait_us += tw.elapsed().as_secs_f64() * 1e6;
+            total_waits += 1;
+
+            // Perform 12 real 4.27 MiB SDMA rescues per token (il % 4 == 0)
+            if il % 4 == 0 {
+                let tr = Instant::now();
+                let ip = il % cfg.num_physical_layers;
+                let dst_slot = 40 + (scratch_cur % 8);
+                scratch_cur += 1;
+                let src_off = (staging_cur % staging_slots) * slab_bytes;
+                staging_cur += 1;
+                // Rewrite header with distinct outer_scale to verify live DMA + GL2 inv
+                hdr.w13_outer_scale = 0.25 + (tok as f32) * 1e-5;
+                let hb: &[u8] = unsafe {
+                    std::slice::from_raw_parts(&hdr as *const ExpertSlabHeader as *const u8, std::mem::size_of::<ExpertSlabHeader>())
+                };
+                unsafe {
+                    let st = backend.pinned_as_mut_slice(staging).unwrap();
+                    st[src_off..src_off + hb.len()].copy_from_slice(hb);
+                }
+                backend.memcpy_h2d_async(pool, dst_slot * slab_bytes, staging, src_off, slab_bytes, copy_stream)
+                    .expect("rescue memcpy_h2d_async");
+                backend.sync_stream(copy_stream).expect("rescue sync copy_stream");
+                let new_idx = ip * n_exp + 6; // expert 6 rescued into scratch slot
+                unsafe {
+                    let pp = backend.pinned_as_mut_slice(phost).unwrap().as_mut_ptr() as *mut u32;
+                    let dst = pp.add(il * PATCH_STRIDE);
+                    let mut n_p = 0u32;
+                    if let Some(old) = prev_rescued_idx {
+                        std::ptr::write_volatile(dst.add(1 + 2 * n_p as usize), old as u32);
+                        std::ptr::write_volatile(dst.add(2 + 2 * n_p as usize), u32::MAX);
+                        n_p += 1;
+                    }
+                    std::ptr::write_volatile(dst.add(1 + 2 * n_p as usize), new_idx as u32);
+                    std::ptr::write_volatile(dst.add(2 + 2 * n_p as usize), dst_slot as u32);
+                    n_p += 1;
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                    std::ptr::write_volatile(dst, n_p);
+                }
+                prev_rescued_idx = Some(new_idx);
+                total_rescue_us += tr.elapsed().as_secs_f64() * 1e6;
+                total_rescues += 1;
+            }
+            unsafe {
+                let fp = backend.pinned_as_mut_slice(fhost).unwrap().as_mut_ptr() as *mut u32;
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                std::ptr::write_volatile(fp.add(il * FLAG_STRIDE), ticket);
+            }
+        }
+        backend.sync_stream(compute_stream).expect("sync token end");
+    }
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "[stress-rescue] PASS mode={mode} tokens={tokens} waits={total_waits} rescues={total_rescues} (boot={boot_ms:.0}ms, run={elapsed_ms:.1}ms, {:.2} ms/tok, wait_avg={:.1} us, rescue_dma_avg={:.1} us ({:.1} GB/s))",
+        elapsed_ms / tokens as f64,
+        total_wait_us / total_waits as f64,
+        total_rescue_us / total_rescues.max(1) as f64,
+        (slab_bytes as f64 / 1e9) / (total_rescue_us / total_rescues.max(1) as f64 / 1e6),
+    );
 }

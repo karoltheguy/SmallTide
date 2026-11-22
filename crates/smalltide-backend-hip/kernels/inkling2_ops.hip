@@ -472,23 +472,91 @@ extern "C" __global__ void smalltide_rescue_apply_patch(
     uint32_t* __restrict__ slot_table,
     const uint32_t* __restrict__ patch_hdr,
     const uint32_t* __restrict__ full_table,
-    uint32_t total_entries
+    uint32_t total_entries,
+    uint32_t* __restrict__ probe,
+    uint32_t layer_id,
+    uint32_t ticket
 ) {
+    if (threadIdx.x == 0u && probe != nullptr) {
+        __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 3u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+    }
     uint32_t n = __scoped_atomic_load_n(patch_hdr, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-    if (n == 0u) return;
+    if (n == 0u) {
+        if (threadIdx.x == 0u && probe != nullptr) {
+            __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 4u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+        }
+        return;
+    }
     // System-scope acquire invalidates GPU GL0/GL1/GL2 so freshly SDMA'd slabs in vram_pool
     // and host-written patch entries are visible to this kernel and subsequent MoE kernels.
     __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
-    if (n == 0xFFFFFFFEu) return;
-    if (n == 0xFFFFFFFFu) {
-        for (uint32_t i = threadIdx.x; i < total_entries; i += blockDim.x) {
-            slot_table[i] = __scoped_atomic_load_n(full_table + i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    if (n != 0xFFFFFFFEu) {
+        if (n == 0xFFFFFFFFu) {
+            for (uint32_t i = threadIdx.x; i < total_entries; i += blockDim.x) {
+                slot_table[i] = __scoped_atomic_load_n(full_table + i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+                uint32_t idx = __scoped_atomic_load_n(patch_hdr + 1u + 2u * i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+                uint32_t val = __scoped_atomic_load_n(patch_hdr + 2u + 2u * i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+                if (idx < total_entries) slot_table[idx] = val;
+            }
         }
-    } else {
-        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-            uint32_t idx = __scoped_atomic_load_n(patch_hdr + 1u + 2u * i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-            uint32_t val = __scoped_atomic_load_n(patch_hdr + 2u + 2u * i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-            if (idx < total_entries) slot_table[idx] = val;
+    }
+    if (threadIdx.x == 0u && probe != nullptr) {
+        __scoped_atomic_store_n(probe + 1, n, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 5u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+// Fused GPU-side spin-wait + post-wait slot-table patch & system-scope GL2 invalidate.
+// Avoids beta hipStreamWaitValue32 CP packets entirely while keeping 1 launch per layer.
+// Grid: (1, 1, 1), Block: (256, 1, 1)
+extern "C" __global__ void smalltide_rescue_wait_and_patch(
+    uint32_t* __restrict__ slot_table,
+    const uint32_t* __restrict__ flag,
+    uint32_t ticket,
+    const uint32_t* __restrict__ patch_hdr,
+    const uint32_t* __restrict__ full_table,
+    uint32_t total_entries,
+    uint32_t* __restrict__ probe,
+    uint32_t layer_id
+) {
+    if (threadIdx.x == 0u) {
+        if (probe != nullptr) {
+            __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 2u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
         }
+        while (__scoped_atomic_load_n(flag, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) < ticket) {
+            __builtin_amdgcn_s_sleep(2);
+        }
+        if (probe != nullptr) {
+            __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 3u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+        }
+    }
+    __syncthreads();
+    uint32_t n = __scoped_atomic_load_n(patch_hdr, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    if (n == 0u) {
+        if (threadIdx.x == 0u && probe != nullptr) {
+            __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 4u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+        }
+        return;
+    }
+    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
+    if (n != 0xFFFFFFFEu) {
+        if (n == 0xFFFFFFFFu) {
+            for (uint32_t i = threadIdx.x; i < total_entries; i += blockDim.x) {
+                slot_table[i] = __scoped_atomic_load_n(full_table + i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+                uint32_t idx = __scoped_atomic_load_n(patch_hdr + 1u + 2u * i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+                uint32_t val = __scoped_atomic_load_n(patch_hdr + 2u + 2u * i, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+                if (idx < total_entries) slot_table[idx] = val;
+            }
+        }
+    }
+    if (threadIdx.x == 0u && probe != nullptr) {
+        __scoped_atomic_store_n(probe + 1, n, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 5u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
     }
 }

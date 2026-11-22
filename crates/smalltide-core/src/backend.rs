@@ -281,15 +281,37 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Post-wait compute-stream rescue barrier: if `patch_hdr[0] != 0`, invalidates GPU L2
     /// (system-scope acquire) and applies slot-table updates on `stream`.
+    #[allow(clippy::too_many_arguments)]
     fn rescue_apply_patch(
         &self,
         _slot_table: DeviceBuf,
         _patch_hdr: DeviceBuf,
         _full_table: DeviceBuf,
         _total_entries: usize,
+        _probe: Option<DeviceBuf>,
+        _layer_id: usize,
+        _ticket: u32,
         _stream: Stream,
     ) -> Result<()> {
         Err(crate::SmallTideError::Unsupported("rescue_apply_patch".into()))
+    }
+
+    /// Fused GPU-side spin-wait (`*flag >= ticket`) + compute-stream slot-table patch + GL2
+    /// invalidate. Replaces `stream_wait_value_ge` + `rescue_apply_patch` in one kernel launch.
+    #[allow(clippy::too_many_arguments)]
+    fn rescue_wait_and_patch(
+        &self,
+        _slot_table: DeviceBuf,
+        _flag: DeviceBuf,
+        _ticket: u32,
+        _patch_hdr: DeviceBuf,
+        _full_table: DeviceBuf,
+        _total_entries: usize,
+        _probe: Option<DeviceBuf>,
+        _layer_id: usize,
+        _stream: Stream,
+    ) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("rescue_wait_and_patch".into()))
     }
 
     fn alloc_host_mapped(&self, _size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {

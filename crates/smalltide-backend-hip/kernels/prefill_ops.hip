@@ -716,40 +716,39 @@ __device__ __forceinline__ st_half8 as_half8(uint4 v) {
 }
 
 // c += A[16 x K] (f16 rows `ar`, this lane's row) x B[K x 16] (weight rows, this lane's column).
-// K % 64 == 0. `kh` = this lane's k offset within a 16-step (0 or 8).
+// K % 64 == 0. k is permuted consistently for A and B (a dot product is order-free): in each
+// 64-wide block, half-wave h owns the 32 consecutive k at h*32, step s uses 8 of them - so a lane
+// fetches its 4 steps' weights in one 16-byte (NVFP4) / two 16-byte (MXFP8) loads and its
+// activations in four 16-byte loads. `kh` = half-wave index (0 or 1).
 __device__ __forceinline__ st_float8 wmma_dot_k(uint32_t tag, const _Float16* __restrict__ ar, bool valid,
                                                 const uint8_t* __restrict__ w, const uint8_t* __restrict__ sc,
                                                 uint32_t K, uint32_t kh, st_float8 c) {
     const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    uint32_t hoff = (kh != 0u) ? 32u : 0u;
     if (tag == 0u) {
         for (uint32_t k = 0u; k < K; k += 64u) {
-            uint4 av[4]; uint32_t wv[4]; float sv[4];
-            #pragma unroll
-            for (uint32_t j = 0u; j < 4u; ++j) {
-                uint32_t kk = k + 16u * j + kh;
-                av[j] = valid ? *reinterpret_cast<const uint4*>(ar + kk) : zero;
-                wv[j] = *reinterpret_cast<const uint32_t*>(w + (kk >> 1));
-                sv[j] = decode_fp8_e4m3fn(sc[kk >> 4]);
-            }
-            #pragma unroll
-            for (uint32_t j = 0u; j < 4u; ++j) {
-                c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av[j]), wmma_nvfp4_frag(wv[j], sv[j]), c);
-            }
+            uint32_t base = k + hoff;
+            const uint4* ap = reinterpret_cast<const uint4*>(ar + base);
+            uint4 av0 = valid ? ap[0] : zero, av1 = valid ? ap[1] : zero, av2 = valid ? ap[2] : zero, av3 = valid ? ap[3] : zero;
+            uint4 wv = *reinterpret_cast<const uint4*>(w + (base >> 1));
+            float s0 = decode_fp8_e4m3fn(sc[base >> 4]), s1 = decode_fp8_e4m3fn(sc[(base >> 4) + 1u]);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av0), wmma_nvfp4_frag(wv.x, s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av1), wmma_nvfp4_frag(wv.y, s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av2), wmma_nvfp4_frag(wv.z, s1), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av3), wmma_nvfp4_frag(wv.w, s1), c);
         }
     } else {
         for (uint32_t k = 0u; k < K; k += 64u) {
-            uint4 av[4]; uint2 wv[4]; float sv[4];
-            #pragma unroll
-            for (uint32_t j = 0u; j < 4u; ++j) {
-                uint32_t kk = k + 16u * j + kh;
-                av[j] = valid ? *reinterpret_cast<const uint4*>(ar + kk) : zero;
-                wv[j] = *reinterpret_cast<const uint2*>(w + kk);
-                sv[j] = decode_ue8m0(sc[kk >> 5]);
-            }
-            #pragma unroll
-            for (uint32_t j = 0u; j < 4u; ++j) {
-                c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av[j]), wmma_mxfp8_frag(wv[j], sv[j]), c);
-            }
+            uint32_t base = k + hoff;
+            const uint4* ap = reinterpret_cast<const uint4*>(ar + base);
+            uint4 av0 = valid ? ap[0] : zero, av1 = valid ? ap[1] : zero, av2 = valid ? ap[2] : zero, av3 = valid ? ap[3] : zero;
+            const uint4* wp = reinterpret_cast<const uint4*>(w + base);
+            uint4 wa = wp[0], wb = wp[1];
+            float s0 = decode_ue8m0(sc[base >> 5]);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av0), wmma_mxfp8_frag(make_uint2(wa.x, wa.y), s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av1), wmma_mxfp8_frag(make_uint2(wa.z, wa.w), s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av2), wmma_mxfp8_frag(make_uint2(wb.x, wb.y), s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av3), wmma_mxfp8_frag(make_uint2(wb.z, wb.w), s0), c);
         }
     }
     return c;
@@ -780,7 +779,7 @@ extern "C" __global__ void smalltide_moe_w13_grouped_wmma2(
     bool valid = m < np;
     const _Float16* xr = x16 + static_cast<size_t>(valid ? (s_pairs[m] >> 3) : 0u) * hidden;
     st_float8 c = {};
-    c = wmma_dot_k(tag, xr, valid, w, sc, hidden, (l >> 4) * 8u, c);
+    c = wmma_dot_k(tag, xr, valid, w, sc, hidden, l >> 4, c);
     float osc = (tag == 0u) ? hdr->w13_outer_scale : 1.0f;
     uint32_t r = (n0 + (l & 15u)) >> 1;
     #pragma unroll
@@ -824,7 +823,7 @@ extern "C" __global__ void smalltide_moe_w2_grouped_wmma2(
     bool valid = m < np;
     const _Float16* ar = mid16 + static_cast<size_t>(valid ? s_pairs[m] : 0u) * inter;
     st_float8 c = {};
-    c = wmma_dot_k(tag, ar, valid, w, sc, inter, (l >> 4) * 8u, c);
+    c = wmma_dot_k(tag, ar, valid, w, sc, inter, l >> 4, c);
     float osc = (tag == 0u) ? hdr->w2_outer_scale : 1.0f;
     uint32_t hh = n0 + (l & 15u);
     #pragma unroll
@@ -1044,7 +1043,6 @@ extern "C" __global__ void smalltide_gemm_fp8_rows_wmma(
     uint32_t am = m0 + (l & 15u);
     bool a_ok = am < m_rows;
     const float* xr = x + static_cast<size_t>(a_ok ? am : 0u) * k_cols;
-    uint32_t kh = (l >> 4) * 8u;
     const uint8_t* wr[4];
     bool b_ok[4];
     #pragma unroll
@@ -1054,27 +1052,26 @@ extern "C" __global__ void smalltide_gemm_fp8_rows_wmma(
         wr[j] = w_fp8 + static_cast<size_t>(b_ok[j] ? n : 0u) * k_cols;
     }
     st_float8 c[4] = {};
+    // k permuted consistently for A and B: in each 32-wide block half-wave h owns the 16
+    // consecutive k at h*16 (step s uses 8 of them): one 16-byte weight load per N tile.
+    uint32_t hoff = (l >> 4) * 16u;
     for (uint32_t k = 0u; k < k_cols; k += 32u) {
-        float4 xa[2][2];
-        uint2 wv[2][4];
+        uint32_t base = k + hoff;
+        const float4* xp = reinterpret_cast<const float4*>(xr + base);
+        float4 x0 = a_ok ? xp[0] : make_float4(0, 0, 0, 0), x1 = a_ok ? xp[1] : make_float4(0, 0, 0, 0);
+        float4 x2 = a_ok ? xp[2] : make_float4(0, 0, 0, 0), x3 = a_ok ? xp[3] : make_float4(0, 0, 0, 0);
+        uint4 wv[4];
         #pragma unroll
-        for (uint32_t s = 0u; s < 2u; ++s) {
-            uint32_t kk = k + 16u * s + kh;
-            const float4* xp = reinterpret_cast<const float4*>(xr + kk);
-            xa[s][0] = a_ok ? xp[0] : make_float4(0, 0, 0, 0);
-            xa[s][1] = a_ok ? xp[1] : make_float4(0, 0, 0, 0);
-            #pragma unroll
-            for (uint32_t j = 0u; j < 4u; ++j) wv[s][j] = b_ok[j] ? *reinterpret_cast<const uint2*>(wr[j] + kk) : make_uint2(0u, 0u);
-        }
+        for (uint32_t j = 0u; j < 4u; ++j) wv[j] = b_ok[j] ? *reinterpret_cast<const uint4*>(wr[j] + base) : make_uint4(0u, 0u, 0u, 0u);
+        st_half8 a0, a1;
+        a0[0] = (_Float16)x0.x; a0[1] = (_Float16)x0.y; a0[2] = (_Float16)x0.z; a0[3] = (_Float16)x0.w;
+        a0[4] = (_Float16)x1.x; a0[5] = (_Float16)x1.y; a0[6] = (_Float16)x1.z; a0[7] = (_Float16)x1.w;
+        a1[0] = (_Float16)x2.x; a1[1] = (_Float16)x2.y; a1[2] = (_Float16)x2.z; a1[3] = (_Float16)x2.w;
+        a1[4] = (_Float16)x3.x; a1[5] = (_Float16)x3.y; a1[6] = (_Float16)x3.z; a1[7] = (_Float16)x3.w;
         #pragma unroll
-        for (uint32_t s = 0u; s < 2u; ++s) {
-            st_half8 a;
-            a[0] = (_Float16)xa[s][0].x; a[1] = (_Float16)xa[s][0].y; a[2] = (_Float16)xa[s][0].z; a[3] = (_Float16)xa[s][0].w;
-            a[4] = (_Float16)xa[s][1].x; a[5] = (_Float16)xa[s][1].y; a[6] = (_Float16)xa[s][1].z; a[7] = (_Float16)xa[s][1].w;
-            #pragma unroll
-            for (uint32_t j = 0u; j < 4u; ++j) {
-                c[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, fp8x8_to_half8(wv[s][j]), c[j]);
-            }
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            c[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, fp8x8_to_half8(make_uint2(wv[j].x, wv[j].y)), c[j]);
+            c[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, fp8x8_to_half8(make_uint2(wv[j].z, wv[j].w)), c[j]);
         }
     }
     #pragma unroll

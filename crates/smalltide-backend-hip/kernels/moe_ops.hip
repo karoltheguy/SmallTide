@@ -561,3 +561,166 @@ extern "C" __global__ void smalltide_moe_w2_decode3(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Batched decode MoE (one row per concurrent sequence, up to MOE_MAXR rows):
+// the M*8 routed (row, k) pairs are deduplicated by expert on the GPU - the block of an
+// expert's first pair dequantizes each weight row once and applies it to every row routed to
+// that expert. Missing experts (unpublished slot) are skipped (0 output; the post kernel
+// renormalizes).
+//   route: [M][16] u32 (8 ids, 8 f32 weights); x: [M][H]; mid: [M*8][I]; tmp: [M*8][H]
+// ---------------------------------------------------------------------------
+#define MOE_MAXR 8
+
+// Rows of the expert at pair `p` (first occurrence only): returns the count, fills pair ids.
+__device__ __forceinline__ uint32_t moe_rows_members(const uint32_t* __restrict__ route, uint32_t rows,
+                                                     uint32_t p, uint32_t* members) {
+    uint32_t e = route[(p >> 3) * 16u + (p & 7u)];
+    for (uint32_t q = 0u; q < p; ++q) {
+        if (route[(q >> 3) * 16u + (q & 7u)] == e) return 0u; // not the first pair of this expert
+    }
+    uint32_t n = 0u;
+    for (uint32_t q = p; q < rows * 8u; ++q) {
+        if (route[(q >> 3) * 16u + (q & 7u)] == e) members[n++] = q;
+    }
+    return n;
+}
+
+// Weight row (NVFP4 or MXFP8) dotted with `nr` input vectors, decoding each 16-byte chunk once.
+__device__ __forceinline__ void moe_row_dot_rows(uint32_t dtype_tag, const uint8_t* __restrict__ w_row,
+    const uint8_t* __restrict__ s_row, const float* __restrict__ xs, size_t x_stride, const uint32_t* xrow,
+    uint32_t nr, uint32_t k_cols, uint32_t lane, float* out) {
+    float acc[MOE_MAXR];
+    #pragma unroll
+    for (uint32_t i = 0u; i < MOE_MAXR; ++i) acc[i] = 0.0f;
+    const uint4* wv = reinterpret_cast<const uint4*>(w_row);
+    if (dtype_tag == 0u) {
+        uint32_t n16 = k_cols >> 5; // 32 values per 16-byte chunk
+        for (uint32_t c = lane; c < n16; c += 32u) {
+            float s0 = decode_fp8_e4m3fn(s_row[2u * c]);
+            float s1 = decode_fp8_e4m3fn(s_row[2u * c + 1u]);
+            uint4 w = wv[c];
+            uint32_t wd[4] = {w.x, w.y, w.z, w.w};
+            float4 ev[4], od[4];
+            #pragma unroll
+            for (uint32_t j = 0u; j < 4u; ++j) e2m1x8(wd[j], ev[j], od[j]);
+            #pragma unroll
+            for (uint32_t i = 0u; i < MOE_MAXR; ++i) {
+                if (i < nr) {
+                    const float4* x8 = reinterpret_cast<const float4*>(xs + static_cast<size_t>(xrow[i]) * x_stride) + 8u * c;
+                    float a0 = 0.0f, a1 = 0.0f;
+                    #pragma unroll
+                    for (uint32_t j = 0u; j < 4u; ++j) {
+                        float4 xa = x8[2u * j], xb = x8[2u * j + 1u];
+                        float a = ev[j].x * xa.x;
+                        a = fmaf(od[j].x, xa.y, a); a = fmaf(ev[j].y, xa.z, a); a = fmaf(od[j].y, xa.w, a);
+                        a = fmaf(ev[j].z, xb.x, a); a = fmaf(od[j].z, xb.y, a); a = fmaf(ev[j].w, xb.z, a); a = fmaf(od[j].w, xb.w, a);
+                        if (j < 2u) a0 += a; else a1 += a;
+                    }
+                    acc[i] += a0 * s0 + a1 * s1;
+                }
+            }
+        }
+    } else {
+        uint32_t n16 = k_cols >> 4; // 16 values per chunk, scale per 32
+        for (uint32_t c = lane; c < n16; c += 32u) {
+            float sc = decode_ue8m0(s_row[c >> 1]);
+            uint4 w = wv[c];
+            float4 a = decode_fp8x4(w.x), b = decode_fp8x4(w.y), cc = decode_fp8x4(w.z), d = decode_fp8x4(w.w);
+            #pragma unroll
+            for (uint32_t i = 0u; i < MOE_MAXR; ++i) {
+                if (i < nr) {
+                    const float4* x4 = reinterpret_cast<const float4*>(xs + static_cast<size_t>(xrow[i]) * x_stride) + 4u * c;
+                    float4 xa = x4[0], xb = x4[1], xc = x4[2], xd = x4[3];
+                    float s = a.x * xa.x;
+                    s = fmaf(a.y, xa.y, s); s = fmaf(a.z, xa.z, s); s = fmaf(a.w, xa.w, s);
+                    s = fmaf(b.x, xb.x, s); s = fmaf(b.y, xb.y, s); s = fmaf(b.z, xb.z, s); s = fmaf(b.w, xb.w, s);
+                    s = fmaf(cc.x, xc.x, s); s = fmaf(cc.y, xc.y, s); s = fmaf(cc.z, xc.z, s); s = fmaf(cc.w, xc.w, s);
+                    s = fmaf(d.x, xd.x, s); s = fmaf(d.y, xd.y, s); s = fmaf(d.z, xd.z, s); s = fmaf(d.w, xd.w, s);
+                    acc[i] = fmaf(s, sc, acc[i]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (uint32_t i = 0u; i < MOE_MAXR; ++i) {
+        if (i < nr) out[i] = wave32_sum(acc[i]);
+    }
+}
+
+//   mid[pair][i] = situ(w1_i . x[row], w3_i . x[row]).  Grid: (ceil(I / 8), M * 8), Block: 256
+extern "C" __global__ void smalltide_moe_w13_rows(
+    float* __restrict__ mid, const float* __restrict__ x, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ slot_table, const uint32_t* __restrict__ route, uint32_t rows,
+    uint64_t slab_stride, uint32_t hidden, uint32_t inter, float gate_cap, float up_cap
+) {
+    uint32_t p = blockIdx.y;
+    uint32_t members[MOE_MAXR];
+    uint32_t nr = moe_rows_members(route, rows, p, members);
+    if (nr == 0u) return;
+    uint32_t slot = slot_table[route[(p >> 3) * 16u + (p & 7u)]];
+    if (slot == 0xFFFFFFFFu) return;
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t r = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (r >= inter) return;
+    uint32_t xrow[MOE_MAXR];
+    #pragma unroll
+    for (uint32_t i = 0u; i < MOE_MAXR; ++i) xrow[i] = (i < nr) ? (members[i] >> 3) : 0u;
+    const uint8_t* slab = pool + static_cast<size_t>(slot) * slab_stride;
+    const ExpertSlabHeaderGpu* hdr = reinterpret_cast<const ExpertSlabHeaderGpu*>(slab);
+    const uint8_t* w = slab + hdr->w13_weight_offset;
+    const uint8_t* sc = slab + hdr->w13_scale_offset;
+    size_t wrow = (hdr->dtype_tag == 0u) ? (hidden >> 1) : hidden;
+    size_t srow = (hdr->dtype_tag == 0u) ? (hidden >> 4) : (hidden >> 5);
+    float g[MOE_MAXR], u[MOE_MAXR];
+    moe_row_dot_rows(hdr->dtype_tag, w + (2u * r) * wrow, sc + (2u * r) * srow, x, hidden, xrow, nr, hidden, lane, g);
+    moe_row_dot_rows(hdr->dtype_tag, w + (2u * r + 1u) * wrow, sc + (2u * r + 1u) * srow, x, hidden, xrow, nr, hidden, lane, u);
+    if (lane == 0u) {
+        float os = (hdr->dtype_tag == 0u) ? hdr->w13_outer_scale : 1.0f;
+        #pragma unroll
+        for (uint32_t i = 0u; i < MOE_MAXR; ++i) {
+            if (i < nr) mid[static_cast<size_t>(members[i]) * inter + r] = situ_f32(g[i] * os, u[i] * os, gate_cap, up_cap);
+        }
+    }
+}
+
+//   tmp[pair][h] = w2_h . mid[pair] (unweighted).  Grid: (ceil(H / 8), M * 8), Block: 256
+extern "C" __global__ void smalltide_moe_w2_rows(
+    float* __restrict__ tmp, const float* __restrict__ mid, const uint8_t* __restrict__ pool,
+    const uint32_t* __restrict__ slot_table, const uint32_t* __restrict__ route, uint32_t rows,
+    uint64_t slab_stride, uint32_t hidden, uint32_t inter
+) {
+    uint32_t p = blockIdx.y;
+    uint32_t members[MOE_MAXR];
+    uint32_t nr = moe_rows_members(route, rows, p, members);
+    if (nr == 0u) return;
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t hh = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (hh >= hidden) return;
+    uint32_t slot = slot_table[route[(p >> 3) * 16u + (p & 7u)]];
+    if (slot == 0xFFFFFFFFu) {
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint32_t i = 0u; i < MOE_MAXR; ++i) {
+                if (i < nr) tmp[static_cast<size_t>(members[i]) * hidden + hh] = 0.0f;
+            }
+        }
+        return;
+    }
+    const uint8_t* slab = pool + static_cast<size_t>(slot) * slab_stride;
+    const ExpertSlabHeaderGpu* hdr = reinterpret_cast<const ExpertSlabHeaderGpu*>(slab);
+    const uint8_t* w = slab + hdr->w2_weight_offset;
+    const uint8_t* sc = slab + hdr->w2_scale_offset;
+    size_t wrow = (hdr->dtype_tag == 0u) ? (inter >> 1) : inter;
+    size_t srow = (hdr->dtype_tag == 0u) ? (inter >> 4) : (inter >> 5);
+    // Each member reads its own mid row: xs = mid indexed by pair.
+    float v[MOE_MAXR];
+    moe_row_dot_rows(hdr->dtype_tag, w + hh * wrow, sc + hh * srow, mid, inter, members, nr, inter, lane, v);
+    if (lane == 0u) {
+        float os = (hdr->dtype_tag == 0u) ? hdr->w2_outer_scale : 1.0f;
+        #pragma unroll
+        for (uint32_t i = 0u; i < MOE_MAXR; ++i) {
+            if (i < nr) tmp[static_cast<size_t>(members[i]) * hidden + hh] = v[i] * os;
+        }
+    }
+}

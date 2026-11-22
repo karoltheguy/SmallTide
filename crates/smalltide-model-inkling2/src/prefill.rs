@@ -144,6 +144,22 @@ impl PrefillScratch {
     }
 }
 
+/// What the rows of a rows-batched forward are.
+#[derive(Clone, Copy)]
+pub(crate) enum RowsMode<'a> {
+    /// Consecutive tokens of the active lane at positions `pos0..pos0 + m`.
+    Prefill { pos0: usize },
+    /// One decode token per row: `(lane, pos)`. Lane-specific state (KV caches, short-conv
+    /// histories) is per row; everything weight-heavy runs once over all rows.
+    Decode { rows: &'a [(usize, usize)] },
+}
+
+/// Row `r` of a `[m][n]` f32 buffer.
+#[inline]
+fn row(buf: DeviceBuf, r: usize, n: usize) -> DeviceBuf {
+    buf.slice(r * n * 4, n * 4)
+}
+
 /// `[nq][m][H]` slice helper.
 #[inline]
 fn part(buf: DeviceBuf, idx: usize, m: usize, h: usize) -> DeviceBuf {
@@ -170,13 +186,21 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         while off < tokens.len() {
             let m = (tokens.len() - off).min(PREFILL_CHUNK);
             let last = off + m == tokens.len();
-            self.prefill_chunk(&tokens[off..off + m], pos0 + off, need_logits && last)?;
+            self.rows_forward(&tokens[off..off + m], RowsMode::Prefill { pos0: pos0 + off }, need_logits && last)?;
             off += m;
         }
         Ok(())
     }
 
-    fn prefill_chunk(&mut self, tokens: &[u32], pos0: usize, need_logits: bool) -> Result<()> {
+    /// Rows-batched forward of `tokens` (one per row) per `mode`. Prefill: logits of the last row
+    /// into the logits buffer when `need_logits`. Decode: logits of every row into the batch
+    /// logits buffer (`need_logits` ignored).
+    pub(crate) fn rows_forward(&mut self, tokens: &[u32], mode: RowsMode, need_logits: bool) -> Result<()> {
+        let pos0 = match mode {
+            RowsMode::Prefill { pos0 } => pos0,
+            RowsMode::Decode { .. } => 0,
+        };
+        let decode = matches!(mode, RowsMode::Decode { .. });
         let s = self.tide.compute_stream;
         let h = self.cfg.hidden_size;
         let eps = self.cfg.rms_norm_eps;
@@ -203,15 +227,16 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.backend.rms_norm(cur, embed, self.dense.embed_norm, m, h, eps, s)?;
 
         let n_log = self.layer_states.len();
-        let mut dump_hidden = self.dump.as_ref().map(|_| vec![0f32; n_log * m * h]);
-        let mut dump_routes = self.dump.as_ref().map(|_| vec![0u32; n_log * m * 8]);
+        let dumping = self.dump.is_some() && !decode;
+        let mut dump_hidden = dumping.then(|| vec![0f32; n_log * m * h]);
+        let mut dump_routes = dumping.then(|| vec![0u32; n_log * m * 8]);
 
         let start = self.cfg.loop_start_layer;
         let end = self.cfg.loop_end_exclusive;
         let core_len = end - start;
         let mut nb = 0usize;
         let mut run = |eng: &mut Self, il: usize, ip: usize, nb: &mut usize, msgs: Option<DeviceBuf>| -> Result<()> {
-            let routes = eng.prefill_layer(il, ip, pos0, m, nb, msgs)?;
+            let routes = eng.prefill_layer(il, ip, mode, m, nb, msgs)?;
             if let (Some(dh), Some(dr)) = (dump_hidden.as_mut(), dump_routes.as_mut()) {
                 let mut hb = vec![0u8; m * h * 4];
                 let cur = eng.pf.as_ref().unwrap().cur;
@@ -271,6 +296,21 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         drop(run);
 
+        if decode {
+            // Final mix + norm and lm_head for every row.
+            let pf = self.pf.as_ref().unwrap();
+            let (moe_in, moe_norm) = (pf.moe_in, pf.moe_norm);
+            let bv = Some(blocks.slice(0, nb * m * h * 4));
+            self.backend.attn_res_mix_rows(moe_in, bv, cur, self.dense.output_res_query, nb, 1, h, eps, m, s)?;
+            self.backend.rms_norm(moe_norm, moe_in, self.dense.final_norm, m, h, eps, s)?;
+            let vocab = self.cfg.unpadded_vocab_size;
+            let logits = self.batch_logits.expect("batch logits");
+            self.backend.gemm_fp8_rows(logits, moe_norm, self.dense.unembed_fp8.data, self.dense.unembed_fp8.row_scales, m, vocab, h, s)?;
+            if self.cfg.final_logit_softcapping > 0.0 {
+                self.backend.final_logit_softcap(logits, m * vocab, self.cfg.final_logit_softcapping, s)?;
+            }
+            return Ok(());
+        }
         let logits_needed = need_logits || self.dump.is_some();
         if logits_needed {
             // Final mix + norm for all rows (cheap), lm_head for the last row only.
@@ -340,11 +380,15 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         &mut self,
         il: usize,
         ip: usize,
-        pos0: usize,
+        mode: RowsMode,
         m: usize,
         nb: &mut usize,
         messages: Option<DeviceBuf>,
     ) -> Result<Vec<u32>> {
+        let (pos0, lanes) = match mode {
+            RowsMode::Prefill { pos0 } => (pos0, None),
+            RowsMode::Decode { rows } => (0, Some(rows)),
+        };
         let s = self.tide.compute_stream;
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -427,7 +471,16 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             None => None,
         };
-        b.sconv_k4_rows(pf.k, st.sconv_k, pf.k_raw, layer.k_sconv_static, k_dyn, kv_dim, hd, m, taps, s)?;
+        match lanes {
+            None => b.sconv_k4_rows(pf.k, st.sconv_k, pf.k_raw, layer.k_sconv_static, k_dyn, kv_dim, hd, m, taps, s)?,
+            Some(rows) => {
+                for (r, &(lane, _)) in rows.iter().enumerate() {
+                    let ls = self.lane_layer_state(lane, il);
+                    b.sconv_k4_rows(row(pf.k, r, kv_dim), ls.sconv_k, row(pf.k_raw, r, kv_dim), layer.k_sconv_static,
+                        k_dyn.map(|d| row(d, r, taps)), kv_dim, hd, 1, taps, s)?;
+                }
+            }
+        }
         let v_dyn = match layer.v_sconv_dyn_proj {
             Some(w) => {
                 b.gemm_f32_rows(pf.v_dyn, nv, w, m, taps, h, s)?;
@@ -435,39 +488,107 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             None => None,
         };
-        b.sconv_k4_rows(pf.v, st.sconv_v, pf.v_raw, layer.v_sconv_static, v_dyn, kv_dim, hd, m, taps, s)?;
+        match lanes {
+            None => b.sconv_k4_rows(pf.v, st.sconv_v, pf.v_raw, layer.v_sconv_static, v_dyn, kv_dim, hd, m, taps, s)?,
+            Some(rows) => {
+                for (r, &(lane, _)) in rows.iter().enumerate() {
+                    let ls = self.lane_layer_state(lane, il);
+                    b.sconv_k4_rows(row(pf.v, r, kv_dim), ls.sconv_v, row(pf.v_raw, r, kv_dim), layer.v_sconv_static,
+                        v_dyn.map(|d| row(d, r, taps)), kv_dim, hd, 1, taps, s)?;
+                }
+            }
+        }
         // 5. clips, value norm, tau (global layers)
-        let tau = (!is_local).then_some((pos0, cfg.log_scaling_alpha, cfg.log_scaling_n_floor as f32));
-        b.head_l2_clip_rows(pf.q, Some(layer.q_l2_clip_scale), m * nqh, hd, nqh, cfg.qk_l2_clip_threshold, tau, s)?;
+        let tau_at = |p: usize| (!is_local).then_some((p, cfg.log_scaling_alpha, cfg.log_scaling_n_floor as f32));
+        match lanes {
+            Some(rows) if !is_local => {
+                // tau depends on each row's own position.
+                for (r, &(_, p)) in rows.iter().enumerate() {
+                    b.head_l2_clip_rows(row(pf.q, r, q_dim), Some(layer.q_l2_clip_scale), nqh, hd, nqh, cfg.qk_l2_clip_threshold, tau_at(p), s)?;
+                    b.head_l2_clip_rows(row(pf.r, r, nqh * cfg.d_rel), Some(layer.rel_l2_clip_scale), nqh, cfg.d_rel, nqh,
+                        cfg.rel_l2_clip_threshold, tau_at(p), s)?;
+                }
+            }
+            _ => {
+                b.head_l2_clip_rows(pf.q, Some(layer.q_l2_clip_scale), m * nqh, hd, nqh, cfg.qk_l2_clip_threshold, tau_at(pos0), s)?;
+                b.head_l2_clip_rows(pf.r, Some(layer.rel_l2_clip_scale), m * nqh, cfg.d_rel, nqh, cfg.rel_l2_clip_threshold, tau_at(pos0), s)?;
+            }
+        }
         b.head_l2_clip_rows(pf.k, None, m * nkv, hd, nkv, cfg.qk_l2_clip_threshold, None, s)?;
         b.value_norm_no_gamma(pf.v, m * nkv, hd, eps, s)?;
-        b.head_l2_clip_rows(pf.r, Some(layer.rel_l2_clip_scale), m * nqh, cfg.d_rel, nqh, cfg.rel_l2_clip_threshold, tau, s)?;
         // 6. sinks, relative bias, KV store, attention
         b.seg_mark("pf: sinks,rel,kv,attention", s);
         b.gemm_f32_rows(pf.sinks, nq, layer.attn_sink, m, nqh, h, s)?;
         b.rel_table(pf.rel_table, pf.r, layer.rel_logits_proj, m * nqh, cfg.rel_extent, s)?;
-        b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, s)?;
-        b.attn_prefill_fp8(
-            pf.attn_out, pf.q, st.k_cache, st.k_scales, st.v_cache, st.v_scales,
-            Some(pf.rel_table), Some(pf.sinks),
-            PrefillAttnParams {
-                n_q_heads: nqh,
-                n_kv_heads: nkv,
-                max_seq: st.max_seq,
-                window: if is_local { st.window } else { 0 },
-                pos0,
-                rows: m,
-                rel_extent: cfg.rel_extent,
-                inv_sqrt_d: 1.0 / (hd as f32).sqrt(),
-            },
-            s,
-        )?;
+        match lanes {
+            None => {
+                b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, s)?;
+                b.attn_prefill_fp8(
+                    pf.attn_out, pf.q, st.k_cache, st.k_scales, st.v_cache, st.v_scales,
+                    Some(pf.rel_table), Some(pf.sinks),
+                    PrefillAttnParams {
+                        n_q_heads: nqh,
+                        n_kv_heads: nkv,
+                        max_seq: st.max_seq,
+                        window: if is_local { st.window } else { 0 },
+                        pos0,
+                        rows: m,
+                        rel_extent: cfg.rel_extent,
+                        inv_sqrt_d: 1.0 / (hd as f32).sqrt(),
+                    },
+                    s,
+                )?;
+            }
+            Some(rows) => {
+                // Each row attends over its own lane's cache (decode flash attention).
+                for (r, &(lane, p)) in rows.iter().enumerate() {
+                    let ls = self.lane_layer_state(lane, il);
+                    b.kv_store_fp8_rows(ls.k_cache, ls.k_scales, ls.v_cache, ls.v_scales, row(pf.k, r, kv_dim), row(pf.v, r, kv_dim),
+                        nkv, ls.max_seq, hd, p, 1, is_local, s)?;
+                    let n_valid = if is_local { (p + 1).min(ls.window) } else { p + 1 };
+                    let num_splits = n_valid.div_ceil(128).clamp(1, crate::engine::MAX_FLASH_SPLITS);
+                    b.flash_decode_fp8(
+                        row(pf.attn_out, r, q_dim),
+                        self.scratch.partial_out,
+                        self.scratch.partial_m,
+                        self.scratch.partial_l,
+                        row(pf.q, r, q_dim),
+                        ls.k_cache,
+                        ls.k_scales,
+                        ls.v_cache,
+                        ls.v_scales,
+                        Some(row(pf.rel_table, r, nqh * cfg.rel_extent)),
+                        Some(row(pf.sinks, r, nqh)),
+                        smalltide_core::backend::FlashDecodeParams {
+                            n_q_heads: nqh,
+                            n_kv_heads: nkv,
+                            max_seq: ls.max_seq,
+                            q_pos: p,
+                            rel_extent: cfg.rel_extent,
+                            is_local,
+                            num_splits,
+                            inv_sqrt_d: 1.0 / (hd as f32).sqrt(),
+                            window: if is_local { ls.window } else { 0 },
+                        },
+                        s,
+                    )?;
+                }
+            }
+        }
         // 7. output gate, wo, post-attention conv
         b.seg_mark("pf: gate,wo,conv,mix,router", s);
         self.mm_rows(pf.gate_out, nq, &layer.gate_attn, m, s)?;
         b.gate_attn_sigmoid_mul(pf.attn_out, pf.attn_out, pf.gate_out, m * q_dim, s)?;
         self.mm_rows(pf.o_raw, pf.attn_out, &layer.wo, m, s)?;
-        b.sconv_k4_rows(pf.sconv_tmp, st.sconv_attn, pf.o_raw, layer.attn_sconv, None, h, 0, m, 0, s)?;
+        match lanes {
+            None => b.sconv_k4_rows(pf.sconv_tmp, st.sconv_attn, pf.o_raw, layer.attn_sconv, None, h, 0, m, 0, s)?,
+            Some(rows) => {
+                for (r, &(lane, _)) in rows.iter().enumerate() {
+                    let ls = self.lane_layer_state(lane, il);
+                    b.sconv_k4_rows(row(pf.sconv_tmp, r, h), ls.sconv_attn, row(pf.o_raw, r, h), layer.attn_sconv, None, h, 0, 1, 0, s)?;
+                }
+            }
+        }
         // 8. block boundary
         if ip % cfg.n_layers_per_attn_res_block == 0 {
             b.vec_copy(pf.blocks.slice(*nb * hb, hb), pf.inp_sa, m * h, s)?;
@@ -495,6 +616,46 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
         // 10. expert-grouped MoE (host plan from the routed ids)
         b.seg_mark("pf: moe (sync,plan,kernels)", s);
+        if let Some(rows) = lanes {
+            // Batched decode MoE: device-side routing, experts deduplicated across rows, no host
+            // sync; per-row renormalized sum + MLP short conv + residual.
+            let pf = self.pf.as_ref().unwrap();
+            let is_mx = cfg.is_mxfp8_layer(ip);
+            let (pool, stride, dtype) = if is_mx {
+                (self.tide.vram_pool_mxfp8, self.tide.mxfp8_layout.aligned_slab_bytes, smalltide_core::DType::MXFP8)
+            } else {
+                (self.tide.vram_pool_nvfp4, self.tide.nvfp4_layout.aligned_slab_bytes, smalltide_core::DType::NVFP4)
+            };
+            let n_exp = cfg.n_routed_experts;
+            let slot_table = self.tide.gpu_slot_table.slice(ip * n_exp * 4, n_exp * 4);
+            let params = smalltide_core::backend::MoeDispatchParams {
+                batch_size: m,
+                hidden_size: h,
+                intermediate_size: cfg.intermediate_size,
+                top_k: cfg.num_experts_per_tok,
+                weight_dtype: dtype,
+                expert_stride_bytes: stride,
+            };
+            b.moe_decode_rows(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pool, slot_table, pf.route, m, params, s)?;
+            let log = self.batch_route_log.expect("batch route log");
+            b.vec_copy(log.slice(il * crate::engine::MAX_BATCH_ROWS * 64, m * 64), pf.route.slice(0, m * 64), m * 16, s)?;
+            let layer = &self.dense.layers[ip];
+            for (r, &(lane, _)) in rows.iter().enumerate() {
+                let ls = self.lane_layer_state(lane, il);
+                b.moe_decode_post(
+                    row(pf.cur, r, h),
+                    pf.moe_tmp.slice(r * 8 * h * 4, 8 * h * 4),
+                    slot_table,
+                    pf.route.slice(r * 64, 32),
+                    pf.route.slice(r * 64 + 32, 32),
+                    cfg.num_experts_per_tok,
+                    Some((ls.sconv_mlp, layer.mlp_sconv, row(pf.ffn_inp, r, h))),
+                    h,
+                    s,
+                )?;
+            }
+            return Ok(Vec::new());
+        }
         let ids = self.prefill_moe(ip, m)?;
         b.seg_mark("pf: moe post", s);
 

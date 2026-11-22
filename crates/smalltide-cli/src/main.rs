@@ -716,7 +716,11 @@ fn run_generate(args: &[String]) {
     let max_ctx = s.max_ctx;
     let enable_profile = s.profile;
     let prefill_mode = if s.batched_prefill { "batched" } else { "token" };
-    let settings::Loaded { mut engine, tok, backend, nvfp4_slots, mxfp8_slots } = settings::build_engine(&s, 1);
+    let settings::Loaded { mut engine, tok, backend, nvfp4_slots, mxfp8_slots } = settings::build_engine(&s, if std::env::var_os("SMALLTIDE_BATCH_SELFTEST").is_some() {
+        3
+    } else {
+        std::env::var("SMALLTIDE_BATCH_BENCH").ok().and_then(|v| v.parse::<usize>().ok()).map_or(1, |m| m + 1)
+    });
 
     if std::env::var_os("SMALLTIDE_BENCH_MOE").is_some() {
         let n4 = nvfp4_slots as u32;
@@ -811,6 +815,108 @@ fn run_generate(args: &[String]) {
     let mut next_tok = engine
         .sample_next_token(&sampling, &generated)
         .expect("sample first token");
+
+    if let Some(mrows) = std::env::var("SMALLTIDE_BATCH_BENCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+        // Dev: time batched decode rounds of 1..=M rows (lanes 1..=M, same prompt) with GPU segments.
+        for l in 1..=mrows {
+            engine.select_lane(l);
+            engine.reset_sequence().expect("reset");
+            engine.prefill(&prompt_ids, 0, true).expect("prefill lane");
+        }
+        let first = next_tok;
+        for m in 1..=mrows {
+            let mut pos = prompt_ids.len();
+            let mut toks = vec![first; m];
+            let rounds = 24usize;
+            for warm in [true, false] {
+                if !warm {
+                    backend.set_segment_timing(true).expect("seg");
+                    let _ = backend.take_segment_times();
+                }
+                let t0 = Instant::now();
+                for _ in 0..(if warm { 4 } else { rounds }) {
+                    let rows: Vec<(usize, u32, usize)> = (0..m).map(|i| (i + 1, toks[i], pos)).collect();
+                    engine.forward_batch(&rows).expect("batch");
+                    for i in 0..m {
+                        toks[i] = engine.sample_batch_row(i, i + 1, &sampling, &[]).expect("sample");
+                    }
+                    engine.post_batch_tide_step().expect("post");
+                    pos += 1;
+                }
+                if !warm {
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+                    let st = backend.take_segment_times();
+                    backend.set_segment_timing(false).expect("seg off");
+                    println!("[batch-bench] {m} rows: {ms:.2} ms/round ({:.1} tok/s aggregate)", m as f64 * 1000.0 / ms);
+                    let total: f64 = st.iter().map(|k| k.2).sum();
+                    for (name, cnt, t) in st.iter().filter(|k| k.2 > total * 0.03) {
+                        println!("    {:<30} {:>6.1}x {:>8.3} ms/round", name, *cnt as f64 / rounds as f64, t / rounds as f64);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(n) = std::env::var("SMALLTIDE_BATCH_SELFTEST").ok().and_then(|v| v.parse::<usize>().ok()) {
+        // Numerics of batched decode vs the single-row path: lane 0 decodes with forward_token,
+        // lanes 1 and 2 (same prompt) together with forward_batch, all teacher-forced on lane 0's
+        // greedy tokens.
+        let vocab = engine.cfg.unpadded_vocab_size;
+        let read = |eng: &smalltide_model_inkling2::engine::Inkling2Engine<smalltide_backend_hip::HipBackend>, buf: smalltide_core::DeviceBuf| -> Vec<f32> {
+            let mut b = vec![0u8; vocab * 4];
+            eng.backend.memcpy_d2h_sync(&mut b, buf, 0, eng.tide.compute_stream).expect("d2h");
+            b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        };
+        let argmax = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0;
+        // Two different prompts; single-path references first (lane 0), then both in one batch
+        // (lanes 1 and 2), teacher-forced on the reference tokens.
+        let other = tok.encode("<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Write a haiku about winter rain on a tin roof.<|end_message|><|message_model|>");
+        let prompts = [prompt_ids.clone(), other];
+        let mut refs: Vec<(Vec<u32>, Vec<Vec<f32>>)> = Vec::new();
+        for pr in &prompts {
+            engine.select_lane(0);
+            engine.reset_sequence().expect("reset");
+            engine.prefill(pr, 0, true).expect("prefill ref");
+            let mut toks = vec![argmax(&read(&engine, engine.logits_buf())) as u32];
+            let mut lg = Vec::new();
+            for st in 0..n {
+                engine.forward_token(toks[st], pr.len() + st, false, true).expect("single");
+                engine.post_decode_tide_step().expect("post");
+                let a = read(&engine, engine.logits_buf());
+                toks.push(argmax(&a) as u32);
+                lg.push(a);
+            }
+            refs.push((toks, lg));
+        }
+        for (l, pr) in [(1usize, &prompts[0]), (2usize, &prompts[1])] {
+            engine.select_lane(l);
+            engine.reset_sequence().expect("reset");
+            engine.prefill(pr, 0, true).expect("prefill lane");
+        }
+        let (mut agree, mut worst, mut total) = (0usize, 0f32, 0usize);
+        for step in 0..n {
+            let rows = [(1usize, refs[0].0[step], prompts[0].len() + step), (2usize, refs[1].0[step], prompts[1].len() + step)];
+            engine.forward_batch(&rows).expect("batch");
+            let bl = engine.batch_logits_buf().expect("batch logits");
+            for r in 0..2 {
+                let b = read(&engine, bl.slice(r * vocab * 4, vocab * 4));
+                let a = &refs[r].1[step];
+                let d = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                let (ia, ib) = (argmax(a), argmax(&b));
+                agree += (ia == ib) as usize;
+                total += 1;
+                worst = worst.max(d);
+                if step < 3 || ia != ib {
+                    println!("[batch-selftest] step {step:3} row {r}: max|single-batch| {d:.4} argmax {ia} vs {ib}");
+                }
+            }
+            engine.post_batch_tide_step().expect("post batch");
+        }
+        let n = total;
+        println!("[batch-selftest] {n} steps: argmax agreement {agree}/{n}, worst max|dlogit| {worst:.4}");
+        return;
+    }
 
     if std::env::var_os("SMALLTIDE_GRAPH_BENCH").is_some() {
         // Dev experiment: GPU time of one decode token, eager vs replayed HIP graph (the graph

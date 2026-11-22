@@ -20,7 +20,7 @@ use smalltide_tide::runtime::TideExecutor;
 use std::sync::Arc;
 use std::time::Instant;
 
-const MAX_FLASH_SPLITS: usize = 64;
+pub(crate) const MAX_FLASH_SPLITS: usize = 64;
 /// Maximum tokens per batched prefill chunk. Local KV rings hold `window + PREFILL_CHUNK` slots so
 /// a chunk's own keys never overwrite keys an earlier row of the same chunk still attends to.
 pub const PREFILL_CHUNK: usize = 128;
@@ -128,9 +128,9 @@ pub(crate) struct ActivationScratch {
     sinks: DeviceBuf,       // [24]
     rel_table: DeviceBuf,   // [24 * 1024]
 
-    partial_out: DeviceBuf, // [24 * MAX_FLASH_SPLITS * 128]
-    partial_m: DeviceBuf,   // [24 * MAX_FLASH_SPLITS]
-    partial_l: DeviceBuf,   // [24 * MAX_FLASH_SPLITS]
+    pub(crate) partial_out: DeviceBuf, // [24 * MAX_FLASH_SPLITS * 128]
+    pub(crate) partial_m: DeviceBuf,   // [24 * MAX_FLASH_SPLITS]
+    pub(crate) partial_l: DeviceBuf,   // [24 * MAX_FLASH_SPLITS]
     attn_out: DeviceBuf,    // [3072]
     gate_out: DeviceBuf,    // [3072]
     o_raw: DeviceBuf,       // [H]
@@ -195,7 +195,16 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     lane_store: Vec<Option<ParkedLane>>,
     lane_max_seq: Vec<usize>,
     active_lane: usize,
+    /// Batched decode: `[MAX_BATCH_ROWS][unpadded_vocab]` logits and `[logical][MAX_BATCH_ROWS][16]`
+    /// routing log (allocated on first use).
+    pub(crate) batch_logits: Option<DeviceBuf>,
+    pub(crate) batch_route_log: Option<DeviceBuf>,
+    /// Rows of the batched round whose routing log awaits `post_batch_tide_step`.
+    batch_pending_rows: usize,
 }
+
+/// Most rows (concurrent sequences) one batched decode round can carry.
+pub const MAX_BATCH_ROWS: usize = 8;
 
 /// A lane's sequence state while another lane is active.
 pub(crate) struct ParkedLane {
@@ -354,6 +363,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             lane_store: vec![None],
             lane_max_seq: vec![global_max_seq],
             active_lane: 0,
+            batch_logits: None,
+            batch_route_log: None,
+            batch_pending_rows: 0,
             profile: StepProfile::default(),
         })
     }
@@ -698,6 +710,96 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.rng_state = next.rng_state;
         self.global_max_seq = self.lane_max_seq[i];
         self.active_lane = i;
+    }
+
+    /// The single-row logits buffer (`[unpadded_vocab]` f32).
+    pub fn logits_buf(&self) -> DeviceBuf {
+        self.scratch.logits
+    }
+
+    /// The batched-decode logits buffer (`[MAX_BATCH_ROWS][unpadded_vocab]` f32), once allocated.
+    pub fn batch_logits_buf(&self) -> Option<DeviceBuf> {
+        self.batch_logits
+    }
+
+    /// Layer `il`'s state of `lane` (active or parked).
+    pub(crate) fn lane_layer_state(&self, lane: usize, il: usize) -> &LogicalLayerState {
+        if lane == self.active_lane {
+            &self.layer_states[il]
+        } else {
+            &self.lane_store[lane].as_ref().expect("parked lane").layer_states[il]
+        }
+    }
+
+    /// One decode token for each of several lanes in a single batched pass: `rows[i] =
+    /// (lane, token, pos)` with distinct lanes. Weight-heavy work (projections, router, experts,
+    /// lm_head) runs once over all rows; KV caches and short-conv state are each row's lane's.
+    /// Missing experts are skipped (no rescue in batched rounds). Then sample each row with
+    /// `sample_batch_row` and call `post_batch_tide_step`.
+    pub fn forward_batch(&mut self, rows: &[(usize, u32, usize)]) -> Result<()> {
+        let m = rows.len();
+        if m == 0 || m > MAX_BATCH_ROWS {
+            return Err(smalltide_core::SmallTideError::Backend {
+                backend: "engine",
+                message: format!("forward_batch: {m} rows (1..={MAX_BATCH_ROWS})"),
+            });
+        }
+        if self.pf.is_none() {
+            self.pf = Some(crate::prefill::PrefillScratch::new(&*self.backend, &self.cfg)?);
+        }
+        if self.batch_logits.is_none() {
+            self.batch_logits = Some(self.backend.alloc_device(MAX_BATCH_ROWS * self.cfg.unpadded_vocab_size * 4)?);
+            self.batch_route_log = Some(self.backend.alloc_device(self.layer_states.len() * MAX_BATCH_ROWS * 64)?);
+        }
+        // Token boundary bookkeeping, as in forward_token.
+        self.consume_route_log()?;
+        self.run_deferred_tide_step()?;
+        let published = self.tide.poll_pending()?;
+        self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+        let tokens: Vec<u32> = rows.iter().map(|r| r.1).collect();
+        let lp: Vec<(usize, usize)> = rows.iter().map(|r| (r.0, r.2)).collect();
+        self.rows_forward(&tokens, crate::prefill::RowsMode::Decode { rows: &lp }, true)?;
+        self.batch_pending_rows = m;
+        Ok(())
+    }
+
+    /// Samples row `i` of the last `forward_batch` with `lane`'s RNG.
+    pub fn sample_batch_row(&mut self, i: usize, lane: usize, params: &SamplingParams, recent: &[u32]) -> Result<u32> {
+        self.select_lane(lane);
+        let vocab = self.cfg.unpadded_vocab_size;
+        let logits = self.batch_logits.expect("batch logits").slice(i * vocab * 4, vocab * 4);
+        self.sample_logits(logits, params, recent)
+    }
+
+    /// Tide bookkeeping of the last batched round (one readback of its routing log): hits,
+    /// misses, heat, skipped weight, async promotion queue; the async step itself is deferred
+    /// into the next forward like after a single-row token.
+    pub fn post_batch_tide_step(&mut self) -> Result<()> {
+        let m = std::mem::take(&mut self.batch_pending_rows);
+        if m == 0 {
+            return Ok(());
+        }
+        let n_log = self.layer_states.len();
+        let log = self.batch_route_log.expect("batch route log");
+        let mut bytes = vec![0u8; n_log * MAX_BATCH_ROWS * 64];
+        self.backend.memcpy_d2h_sync(&mut bytes, log, 0, self.tide.compute_stream)?;
+        let word = |i: usize| u32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]);
+        for il in 0..n_log {
+            let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
+            for r in 0..m {
+                let base = (il * MAX_BATCH_ROWS + r) * 16;
+                let mut ids = [0u16; 8];
+                let mut ws = [0f32; 8];
+                for k in 0..8 {
+                    ids[k] = word(base + k) as u16;
+                    ws[k] = f32::from_bits(word(base + 8 + k));
+                }
+                self.tide.scheduler.record_batch_dispatch(phys, &ids, &ws);
+            }
+        }
+        self.tokens_decoded += m as u64;
+        self.tide_step_pending = true;
+        Ok(())
     }
 
     /// Dev: drop the pending routing-log readback (used before graph capture experiments).
@@ -1460,6 +1562,17 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         params: &SamplingParams,
         recent_tokens: &[u32],
     ) -> Result<u32> {
+        let logits = self.scratch.logits;
+        self.sample_logits(logits, params, recent_tokens)
+    }
+
+    /// Samples from `logits` (`[unpadded_vocab]` f32 on the device) with this lane's RNG.
+    pub(crate) fn sample_logits(
+        &mut self,
+        logits_buf: DeviceBuf,
+        params: &SamplingParams,
+        recent_tokens: &[u32],
+    ) -> Result<u32> {
         let s = self.tide.compute_stream;
         let vocab = self.cfg.unpadded_vocab_size;
 
@@ -1469,7 +1582,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.backend.argmax_partial_f32(
                 self.scratch.argmax_buf.slice(0, 256),
                 self.scratch.argmax_buf.slice(256, 256),
-                self.scratch.logits,
+                logits_buf,
                 vocab,
                 s,
             )?;
@@ -1494,7 +1607,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let logits_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(logits.as_mut_ptr() as *mut u8, vocab * 4) };
         self.backend
-            .memcpy_d2h_sync(logits_bytes, self.scratch.logits, 0, s)?;
+            .memcpy_d2h_sync(logits_bytes, logits_buf, 0, s)?;
 
         if (params.repetition_penalty - 1.0).abs() > 1e-6 {
             for &t in recent_tokens {

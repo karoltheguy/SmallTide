@@ -402,6 +402,7 @@ fn engine_worker_loop(
     let mut last_decode_tok_s: f64 = 0.0;
     let mut last_prefill_tok_s: f64 = 0.0;
     let max_lane_ctx = (0..n_lanes).map(|l| engine.lane_max_seq(l)).max().unwrap_or(0);
+    let batch_decode = std::env::var("SMALLTIDE_BATCH_DECODE").map(|v| v != "0").unwrap_or(true);
 
     loop {
         // 1. Commands: block only when there is nothing to do.
@@ -556,7 +557,53 @@ fn engine_worker_loop(
             }
         }
 
-        // 3. Decode: one token for every active lane.
+        // 3. Decode: one token for every active lane - one batched pass when several are active.
+        let act: Vec<usize> = (0..n_lanes).filter(|&l| active[l].is_some()).collect();
+        if act.len() >= 2 && batch_decode {
+            let rows: Vec<(usize, u32, usize)> = act
+                .iter()
+                .map(|&l| {
+                    let r = active[l].as_ref().unwrap();
+                    (l, r.next_tok, r.pos)
+                })
+                .collect();
+            let fwd = engine.forward_batch(&rows);
+            let mut sampled: Vec<std::result::Result<u32, String>> = Vec::with_capacity(act.len());
+            if let Err(e) = &fwd {
+                sampled.extend(act.iter().map(|_| Err(format!("decode error: {e}"))));
+            } else {
+                for (i, &l) in act.iter().enumerate() {
+                    let req = active[l].as_mut().unwrap();
+                    pc.live[l].push(req.next_tok);
+                    req.pos += 1;
+                    sampled.push(engine.sample_batch_row(i, l, &req.sampling, &req.generated).map_err(|e| format!("sample error: {e}")));
+                }
+                let _ = engine.post_batch_tide_step();
+            }
+            for (&l, res) in act.iter().zip(sampled) {
+                let req = active[l].as_mut().unwrap();
+                let done = match res {
+                    Ok(t) => {
+                        req.next_tok = t;
+                        !req.accept(&tok, engine.lane_max_seq(l))
+                    }
+                    Err(msg) => {
+                        let _ = req.event_tx.send(StreamEvent::Error(msg));
+                        pc.invalidate(l);
+                        true
+                    }
+                };
+                if done {
+                    let req = active[l].take().unwrap();
+                    let hit = engine.telemetry().total_vram_hit_rate();
+                    last_decode_tok_s = req.finish(hit);
+                    if let Some(line) = engine.tide.scheduler.finish_request() {
+                        println!("{line}");
+                    }
+                }
+            }
+            continue;
+        }
         for l in 0..n_lanes {
             let Some(req) = active[l].as_mut() else { continue };
             engine.select_lane(l);

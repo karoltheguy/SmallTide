@@ -1810,6 +1810,24 @@ impl ComputeBackend for HipBackend {
         }
     }
 
+    fn moe_decode_rows(&self, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, pool: DeviceBuf,
+        slot_table: DeviceBuf, route: DeviceBuf, rows: usize, mp: MoeDispatchParams, stream: Stream) -> Result<()> {
+        if rows == 0 || rows > 8 {
+            return Err(SmallTideError::Backend { backend: "hip", message: format!("moe_decode_rows: {rows} rows (1..=8)") });
+        }
+        let (mut a, mut bx, mut c, mut d, mut e) =
+            (self.dev_ptr(mid)?, self.dev_ptr(x)?, self.dev_ptr(pool)?, self.dev_ptr(slot_table)?, self.dev_ptr(route)?);
+        let mut nr = rows as u32;
+        let (mut st, mut h, mut i, mut gc, mut uc) =
+            (mp.expert_stride_bytes as u64, mp.hidden_size as u32, mp.intermediate_size as u32, 4.0f32, 25.0f32);
+        let pairs = nr * 8;
+        let mut args = [p(&mut a), p(&mut bx), p(&mut c), p(&mut d), p(&mut e), p(&mut nr), p(&mut st), p(&mut h), p(&mut i), p(&mut gc), p(&mut uc)];
+        self.launch(self.kernels.moe_w13_rows, (i.div_ceil(8), pairs, 1), 256, &mut args, stream, "launch(moe_w13_rows)")?;
+        let (mut a, mut bm) = (self.dev_ptr(tmp)?, self.dev_ptr(mid)?);
+        let mut args = [p(&mut a), p(&mut bm), p(&mut c), p(&mut d), p(&mut e), p(&mut nr), p(&mut st), p(&mut h), p(&mut i)];
+        self.launch(self.kernels.moe_w2_rows, (h.div_ceil(8), pairs, 1), 256, &mut args, stream, "launch(moe_w2_rows)")
+    }
+
     fn moe_decode_post(&self, out: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, topk_ids: DeviceBuf,
         topk_weights: DeviceBuf, top_k: usize, sconv: Option<(DeviceBuf, DeviceBuf, DeviceBuf)>,
         hidden: usize, stream: Stream) -> Result<()> {

@@ -618,6 +618,13 @@ pub trait ComputeBackend: Send + Sync {
     fn moe_decode_experts(&self, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, pool: DeviceBuf,
         slot_table: DeviceBuf, topk_ids: DeviceBuf, params: MoeDispatchParams, stream: Stream) -> Result<()>;
 
+    /// Batched decode MoE over `rows` independent rows (<= 8): `route` is `[rows][16]` (8 ids,
+    /// 8 weights), `x` `[rows][H]`, `mid` `[rows*8][I]`, `tmp` `[rows*8][H]` (unweighted, 0 for
+    /// missing experts). Experts routed by several rows are dequantized once for all of them.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_decode_rows(&self, mid: DeviceBuf, tmp: DeviceBuf, x: DeviceBuf, pool: DeviceBuf,
+        slot_table: DeviceBuf, route: DeviceBuf, rows: usize, params: MoeDispatchParams, stream: Stream) -> Result<()>;
+
     /// `out = residual + sconv(sum_k w_k*renorm*tmp[k])` (or just the weighted sum when
     /// `sconv` is None), renormalized over the experts present in `slot_table`.
     #[allow(clippy::too_many_arguments)]

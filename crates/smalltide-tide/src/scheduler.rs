@@ -429,6 +429,32 @@ impl TideScheduler {
         }
     }
 
+    /// Bookkeeping for one layer of one row of a batched decode round. Batched rounds never rescue
+    /// (that would stall every lane): the kernels skipped unpublished experts, so this counts hits
+    /// and misses, adds heat and skipped routing weight, and queues misses for async promotion.
+    pub fn record_batch_dispatch(&mut self, layer: PhysicalLayerId, topk_ids: &[u16], topk_weights: &[f32]) {
+        let total: f32 = topk_weights.iter().sum();
+        let inv = if total > 1e-8 { 1.0 / total } else { 1.0 };
+        self.telemetry.routed_weight_total += 1.0;
+        for (&exp, &w) in topk_ids.iter().zip(topk_weights.iter()) {
+            let id = ExpertId { layer, expert: exp };
+            let norm_w = w * inv;
+            self.cache.touch_expert(id, norm_w);
+            if self.cache.is_vram_hit(id) {
+                self.record_hit(layer);
+                continue;
+            }
+            self.record_miss(layer);
+            self.telemetry.stage1_skipped_tail_misses += 1;
+            self.telemetry.routed_weight_skipped += norm_w as f64;
+            let entry = self.cache.entry(id);
+            if entry.ram_slot.is_missing() {
+                *self.pending_async_ram.entry(id).or_insert(0.0) += norm_w;
+            }
+            *self.pending_async_vram.entry(id).or_insert(0.0) += norm_w;
+        }
+    }
+
     /// Mode 3: Paced Async Background Tide Rise (called once per decode token).
     /// Emits up to `max_async_ram_promotions_per_token` Stage 2 (Disk->RAM) ops and
     /// `max_async_vram_promotions_per_token` Stage 1 (RAM->VRAM) ops.

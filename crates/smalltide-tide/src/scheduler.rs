@@ -67,6 +67,9 @@ pub struct TideScheduler {
     /// `RescuePolicy::Threshold`: most synchronous rescues per decode token (TideLM's
     /// `RESCUE_STEP` is 2); once spent, the token's remaining layers need no routing readback.
     pub rescue_budget: usize,
+    /// Threshold gate for loop-core layers (their experts run once per loop pass), if it differs
+    /// from the policy's gate.
+    pub loop_core_gate: Option<f32>,
     rescues_this_token: usize,
 }
 
@@ -95,6 +98,7 @@ impl TideScheduler {
             priors_store: None,
             async_hysteresis: 2.0,
             rescue_budget: 4,
+            loop_core_gate: None,
             rescues_this_token: 0,
         }
     }
@@ -425,7 +429,12 @@ impl TideScheduler {
         // Threshold (TideLM's inline rescue): only the heaviest missed pick at or above the gate,
         // and at most `rescue_budget` rescues per token.
         let threshold_pick: Option<usize> = match self.tide_cfg.rescue_policy {
-            RescuePolicy::Threshold(tau) if self.rescues_this_token < self.rescue_budget => topk_ids
+            RescuePolicy::Threshold(gate) if self.rescues_this_token < self.rescue_budget => {
+                let tau = match self.loop_core_gate {
+                    Some(g) if self.model_cfg.is_loop_core_layer(layer.0 as usize) => g,
+                    _ => gate,
+                };
+                topk_ids
                 .iter()
                 .zip(topk_weights.iter())
                 .enumerate()
@@ -434,7 +443,8 @@ impl TideScheduler {
                     w * inv_total_w >= tau && self.cache.entry(id).vram_slot.is_missing()
                 })
                 .max_by(|a, b| a.1 .1.total_cmp(b.1 .1))
-                .map(|(i, _)| i),
+                .map(|(i, _)| i)
+            }
             _ => None,
         };
         if threshold_pick.is_some() {

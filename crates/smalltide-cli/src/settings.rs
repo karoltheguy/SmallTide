@@ -351,6 +351,7 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     }
     engine.prefill_min_share = parse("SMALLTIDE_PREFILL_MIN_SHARE", 1.0f32, "tokens of routing share");
     engine.tide.scheduler.rescue_budget = parse("SMALLTIDE_RESCUE_BUDGET", 4usize, "rescues per token");
+    engine.tide.scheduler.loop_core_gate = std::env::var("SMALLTIDE_RESCUE_THRESHOLD_CORE").ok().and_then(|v| v.trim().parse::<f32>().ok());
     engine.prefill_chunk_swaps = parse("SMALLTIDE_PREFILL_CHUNK_SWAPS", 96usize, "a swap count");
     engine.anticipate_swaps = parse("SMALLTIDE_ANTICIPATE_SWAPS", 256usize, "a swap count");
     engine.anticipate_wait = parse::<u8>("SMALLTIDE_ANTICIPATE_WAIT", 0, "0 or 1") != 0;

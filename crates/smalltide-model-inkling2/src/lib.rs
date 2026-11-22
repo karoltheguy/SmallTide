@@ -9,6 +9,7 @@
 
 pub mod drafter;
 pub mod engine;
+pub mod kv_pager;
 pub mod prefill;
 pub mod weights;
 

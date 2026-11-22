@@ -430,6 +430,7 @@ fn finish_req(
     req: ActiveReq,
 ) -> f64 {
     let lane = req.lane;
+    engine.set_lane_pinned(lane, false);
     let demand = engine.tide.scheduler.cache.take_lane_demand(lane);
     if demand.iter().any(|&d| d > 0.0) {
         pc.set_demand(&req.prompt_key, &demand);
@@ -584,6 +585,11 @@ fn engine_worker_loop(
             }
         }
 
+        // Paged KV: lanes whose pages went to another lane no longer hold their sequence on the
+        // device (their conversations live on in the prefix cache's snapshots).
+        for l in engine.take_lost_lanes() {
+            pc.invalidate(l);
+        }
         // 2. Admission: at most one queued request per round (its prefill pauses the others).
         if let Some(EngineCommand::Generate { .. }) = queue.front() {
             let free: Vec<usize> = (0..n_lanes).filter(|&l| active[l].is_none()).collect();
@@ -640,6 +646,7 @@ fn engine_worker_loop(
                             PrefixPlan::Reset => None,
                         };
                         engine.select_lane(lane);
+                        engine.set_lane_pinned(lane, true);
                         let _ = engine.tide.scheduler.cache.take_lane_demand(lane);
                         if let Some(d) = &memory {
                             let _ = engine.anticipate(d);
@@ -655,6 +662,11 @@ fn engine_worker_loop(
                             } else {
                                 last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
                             }
+                        } else {
+                            engine.set_lane_pinned(lane, false);
+                        }
+                        for l in engine.take_lost_lanes() {
+                            pc.invalidate(l);
                         }
                     }
                 }
@@ -662,6 +674,18 @@ fn engine_worker_loop(
         }
 
         // 3. Decode: one token for every active lane - one batched pass when several are active.
+        // Paged KV: back each lane's next position first; a lane the pool cannot hold any more
+        // ends its request (finish_reason "length").
+        for l in 0..n_lanes {
+            let Some(req) = active[l].as_ref() else { continue };
+            if !engine.kv_reserve(l, req.pos + 1).unwrap_or(false) {
+                let req = active[l].take().unwrap();
+                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+            }
+        }
+        for l in engine.take_lost_lanes() {
+            pc.invalidate(l);
+        }
         let act: Vec<usize> = (0..n_lanes).filter(|&l| active[l].is_some()).collect();
         if act.len() >= 2 && batch_decode {
             let rows: Vec<(usize, u32, usize)> = act

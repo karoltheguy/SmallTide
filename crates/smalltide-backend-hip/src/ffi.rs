@@ -48,6 +48,43 @@ type FnHipEventRecord = unsafe extern "C" fn(HipEvent, HipStream) -> HipError;
 type FnHipEventSynchronize = unsafe extern "C" fn(HipEvent) -> HipError;
 type FnHipEventQuery = unsafe extern "C" fn(HipEvent) -> HipError;
 type FnHipStreamWaitValue32 = unsafe extern "C" fn(HipStream, *mut c_void, u32, u32, u32) -> HipError;
+
+/// hipMemAllocationProp (HIP virtual memory management).
+#[repr(C)]
+pub struct HipMemAllocationProp {
+    pub kind: i32,
+    pub requested_handle_type: i32,
+    pub location_type: i32,
+    pub location_id: i32,
+    pub win32_handle_meta_data: *mut c_void,
+    pub compression_type: u8,
+    pub gpu_direct_rdma_capable: u8,
+    pub usage: u16,
+}
+/// hipMemAccessDesc.
+#[repr(C)]
+pub struct HipMemAccessDesc {
+    pub location_type: i32,
+    pub location_id: i32,
+    pub flags: i32,
+}
+pub type FnHipMemGetAllocationGranularity = unsafe extern "C" fn(*mut usize, *const HipMemAllocationProp, u32) -> HipError;
+pub type FnHipMemAddressReserve = unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> HipError;
+pub type FnHipMemCreate = unsafe extern "C" fn(*mut *mut c_void, usize, *const HipMemAllocationProp, u64) -> HipError;
+pub type FnHipMemMap = unsafe extern "C" fn(*mut c_void, usize, usize, *mut c_void, u64) -> HipError;
+pub type FnHipMemSetAccess = unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> HipError;
+pub type FnHipMemUnmap = unsafe extern "C" fn(*mut c_void, usize) -> HipError;
+
+/// Optional virtual-memory entry points (paged KV); all present or the set is `None`.
+#[derive(Clone, Copy)]
+pub struct HipVmm {
+    pub granularity: FnHipMemGetAllocationGranularity,
+    pub reserve: FnHipMemAddressReserve,
+    pub create: FnHipMemCreate,
+    pub map: FnHipMemMap,
+    pub set_access: FnHipMemSetAccess,
+    pub unmap: FnHipMemUnmap,
+}
 type FnHipEventElapsedTime = unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> HipError;
 type FnHipMemcpy = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> HipError;
 type FnHipMemcpyAsync =
@@ -234,6 +271,7 @@ pub struct HipRuntime {
     pub hip_event_query: FnHipEventQuery,
     /// Optional (older runtimes may lack it): GPU-side wait on a 32-bit value in memory.
     pub hip_stream_wait_value32: Option<FnHipStreamWaitValue32>,
+    pub vmm: Option<HipVmm>,
     pub hip_event_elapsed_time: FnHipEventElapsedTime,
     pub hip_memcpy: FnHipMemcpy,
     pub hip_memcpy_async: FnHipMemcpyAsync,
@@ -319,6 +357,18 @@ impl HipRuntime {
             hip_event_synchronize: load_sym!(b"hipEventSynchronize\0", FnHipEventSynchronize),
             hip_event_query: load_sym!(b"hipEventQuery\0", FnHipEventQuery),
             hip_stream_wait_value32: unsafe { lib.get::<FnHipStreamWaitValue32>(b"hipStreamWaitValue32\0").ok().map(|f| *f) },
+            vmm: unsafe {
+                (|| {
+                    Some(HipVmm {
+                        granularity: *lib.get::<FnHipMemGetAllocationGranularity>(b"hipMemGetAllocationGranularity\0").ok()?,
+                        reserve: *lib.get::<FnHipMemAddressReserve>(b"hipMemAddressReserve\0").ok()?,
+                        create: *lib.get::<FnHipMemCreate>(b"hipMemCreate\0").ok()?,
+                        map: *lib.get::<FnHipMemMap>(b"hipMemMap\0").ok()?,
+                        set_access: *lib.get::<FnHipMemSetAccess>(b"hipMemSetAccess\0").ok()?,
+                        unmap: *lib.get::<FnHipMemUnmap>(b"hipMemUnmap\0").ok()?,
+                    })
+                })()
+            },
             hip_event_elapsed_time: load_sym!(b"hipEventElapsedTime\0", FnHipEventElapsedTime),
             hip_memcpy: load_sym!(b"hipMemcpy\0", FnHipMemcpy),
             hip_memcpy_async: load_sym!(b"hipMemcpyAsync\0", FnHipMemcpyAsync),

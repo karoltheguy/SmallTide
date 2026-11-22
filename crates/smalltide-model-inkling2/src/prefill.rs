@@ -178,6 +178,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if tokens.is_empty() {
             return Ok(());
         }
+        self.kv_ensure(self.active_lane(), pos0 + tokens.len())?;
         if self.pf.is_none() {
             self.pf = Some(PrefillScratch::new(&*self.backend, &self.cfg)?);
         }

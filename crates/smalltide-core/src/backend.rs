@@ -227,6 +227,28 @@ pub trait ComputeBackend: Send + Sync {
     /// Pinned host memory that kernels can read/write directly over PCIe (zero-copy): returns a
     /// `DeviceBuf` view for kernels and the owning `PinnedBuf` for host access. Free the
     /// `PinnedBuf` (the `DeviceBuf` view is released with `free_device`).
+    // ---- Virtual-memory paging (paged KV) ----
+    /// Mapping granularity in bytes, or `None` when the backend cannot page memory.
+    fn vmm_granularity(&self) -> Option<usize> {
+        None
+    }
+    /// Reserves `size` bytes of device address space (nothing behind it until mapped).
+    fn vmm_reserve(&self, _size: usize) -> Result<DeviceBuf> {
+        Err(crate::SmallTideError::Unsupported("vmm".into()))
+    }
+    /// Creates a physical allocation of `size` bytes (a multiple of the granularity).
+    fn vmm_create(&self, _size: usize) -> Result<u64> {
+        Err(crate::SmallTideError::Unsupported("vmm".into()))
+    }
+    /// Maps physical allocation `handle` (all of it) at `va + offset`, read / write.
+    fn vmm_map(&self, _va: DeviceBuf, _offset: usize, _handle: u64) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("vmm".into()))
+    }
+    /// Unmaps `size` bytes at `va + offset`.
+    fn vmm_unmap(&self, _va: DeviceBuf, _offset: usize, _size: usize) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("vmm".into()))
+    }
+
     /// GPU-side wait: `stream` stalls until the u32 at `flag` (device view of mapped host memory)
     /// is >= `value`. Unsupported backends return an error.
     fn stream_wait_value_ge(&self, _stream: Stream, _flag: DeviceBuf, _value: u32) -> Result<()> {

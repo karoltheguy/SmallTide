@@ -189,6 +189,8 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// Expert map: the decoded tokens' routing (host copies of what the engine already read back),
     /// the last single-token decode's (lane, pos, token) and the last batched round's rows.
     pub routes: smalltide_tide::expert_map::RouteLog,
+    /// Paged global KV (one fixed pool shared by the lanes); `None`: every lane owns its caches.
+    kv_pager: Option<crate::kv_pager::KvPager>,
     map_last_tok: Option<(usize, usize, u32)>,
     map_batch_rows: Vec<(usize, usize, u32)>,
     pub(crate) route_log_inflight: bool,
@@ -262,6 +264,36 @@ pub(crate) struct ParkedLane {
 }
 
 
+/// Whether the backend can page the global KV in `kv_pager::PAGE_POS`-position pages.
+pub(crate) fn kv_paging_supported<B: ComputeBackend>(backend: &B, cfg: &Inkling2Config) -> bool {
+    let Some(g) = backend.vmm_granularity() else { return false };
+    kv_page_layout(cfg).iter().all(|&bytes| bytes % g == 0)
+}
+
+/// Bytes a page of each paged buffer: per global logical layer K, K scales, V, V scales.
+pub(crate) fn kv_page_layout(cfg: &Inkling2Config) -> Vec<usize> {
+    let (n, hd) = (cfg.num_key_value_heads, cfg.head_dim);
+    let p = crate::kv_pager::PAGE_POS;
+    let mut v = Vec::new();
+    for il in 0..cfg.num_logical_layers() {
+        let (phys, _) = crate::map_logical_to_physical(cfg, smalltide_core::LogicalLayerId(il as u16));
+        if !cfg.is_local_layer(phys.0 as usize) {
+            v.extend([p * n * hd, p * n * 4, p * n * hd, p * n * 4]);
+        }
+    }
+    v
+}
+
+/// A lane's paged ranges in `kv_page_layout` order.
+fn lane_kv_ranges(cfg: &Inkling2Config, states: &[LogicalLayerState]) -> Vec<(DeviceBuf, usize)> {
+    let layout = kv_page_layout(cfg);
+    let mut v = Vec::new();
+    for st in states.iter().filter(|st| !st._is_local) {
+        v.extend([st.k_cache, st.k_scales, st.v_cache, st.v_scales]);
+    }
+    v.into_iter().zip(layout).collect()
+}
+
 /// One sequence's per-logical-layer KV caches (local rings + global KV of `global_max_seq`
 /// positions) and short-conv histories.
 pub(crate) fn alloc_layer_states<B: ComputeBackend>(
@@ -269,6 +301,7 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
     cfg: &Inkling2Config,
     global_max_seq: usize,
     stream: smalltide_core::Stream,
+    paged: bool,
 ) -> Result<Vec<LogicalLayerState>> {
     let h = cfg.hidden_size;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
@@ -285,6 +318,16 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
         };
         let kv_bytes = cfg.num_key_value_heads * max_seq * cfg.head_dim;
         let sc_bytes = cfg.num_key_value_heads * max_seq * 4;
+        // Paged global caches: address ranges of whole pages, backed by the KV pool on demand.
+        let paged_global = paged && !is_local;
+        let pages = max_seq.div_ceil(crate::kv_pager::PAGE_POS) * crate::kv_pager::PAGE_POS;
+        let alloc_kv = |bytes_per_pos: usize| -> Result<DeviceBuf> {
+            if paged_global {
+                backend.vmm_reserve(pages * bytes_per_pos)
+            } else {
+                backend.alloc_device(max_seq * bytes_per_pos)
+            }
+        };
         let sconv_k = backend.alloc_device(3 * kv_dim * 4)?;
         let sconv_v = backend.alloc_device(3 * kv_dim * 4)?;
         let sconv_attn = backend.alloc_device(3 * h * 4)?;
@@ -297,10 +340,10 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
             _is_local: is_local,
             max_seq,
             window,
-            k_cache: backend.alloc_device(kv_bytes)?,
-            k_scales: backend.alloc_device(sc_bytes)?,
-            v_cache: backend.alloc_device(kv_bytes)?,
-            v_scales: backend.alloc_device(sc_bytes)?,
+            k_cache: alloc_kv(kv_bytes / max_seq)?,
+            k_scales: alloc_kv(sc_bytes / max_seq)?,
+            v_cache: alloc_kv(kv_bytes / max_seq)?,
+            v_scales: alloc_kv(sc_bytes / max_seq)?,
             sconv_k,
             sconv_v,
             sconv_attn,
@@ -311,11 +354,14 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
 }
 
 impl<B: ComputeBackend> Inkling2Engine<B> {
+    /// `kv_pool_pages`: page the global KV out of a pool of that many pages (when the backend can
+    /// page memory); `None` keeps one fixed cache per lane.
     pub fn new(
         cfg: Inkling2Config,
         dense: Inkling2DenseGpu<B>,
         tide: TideExecutor<B>,
         global_max_seq: usize,
+        kv_pool_pages: Option<usize>,
     ) -> Result<Self> {
         let backend = dense.backend.clone();
         let stream = tide.compute_stream;
@@ -324,7 +370,15 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let num_logical = cfg.num_logical_layers();
 
-        let layer_states = alloc_layer_states(&*backend, &cfg, global_max_seq, stream)?;
+        let paged = kv_pool_pages.is_some() && kv_paging_supported(&*backend, &cfg);
+        let layer_states = alloc_layer_states(&*backend, &cfg, global_max_seq, stream, paged)?;
+        let kv_pager = if paged {
+            let mut pg = crate::kv_pager::KvPager::new(&*backend, kv_page_layout(&cfg), kv_pool_pages.unwrap())?;
+            pg.add_lane(lane_kv_ranges(&cfg, &layer_states));
+            Some(pg)
+        } else {
+            None
+        };
 
         let alloc_f32 = |n: usize| backend.alloc_device(n * 4);
         let scratch = ActivationScratch {
@@ -428,6 +482,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             wait_ticket: 0,
             pending_checks: Vec::new(),
             routes: smalltide_tide::expert_map::RouteLog::default(),
+            kv_pager,
             map_last_tok: None,
             map_batch_rows: Vec::new(),
             last_tap_rows: 0,
@@ -541,6 +596,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// sequence starts with it) and is not copied back.
     pub fn restore_state(&mut self, snap: &SeqSnapshot, global: bool) -> Result<()> {
         let s = self.tide.compute_stream;
+        self.kv_release(self.active_lane, snap.pos)?;
+        self.kv_ensure(self.active_lane, snap.pos)?;
         let mut off = 0usize;
         for b in self.snapshot_regions() {
             self.backend.memcpy_h2d_async(b, 0, snap.host, off, b.size_bytes, s)?;
@@ -568,6 +625,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// Resets all 48 logical layers' short-conv history for a fresh sequence (pos = 0).
     pub fn reset_sequence(&mut self) -> Result<()> {
         let s = self.tide.compute_stream;
+        self.kv_release(self.active_lane, 0)?;
         let h = self.cfg.hidden_size;
         let kv_dim = self.cfg.num_key_value_heads * self.cfg.head_dim;
         for st in &self.layer_states {
@@ -762,8 +820,14 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// the expert pools are allocated (VRAM placement order).
     pub fn add_lanes(&mut self, extra: usize, max_seq: usize) -> Result<()> {
         let s = self.tide.compute_stream;
+        let paged = self.kv_pager.is_some();
+        // Paged: every lane may reach the full context (the pool, not the lane, bounds it).
+        let max_seq = if paged { self.lane_max_seq[0] } else { max_seq };
         for _ in 0..extra {
-            let states = alloc_layer_states(&*self.backend, &self.cfg, max_seq, s)?;
+            let states = alloc_layer_states(&*self.backend, &self.cfg, max_seq, s, paged)?;
+            if let Some(pg) = self.kv_pager.as_mut() {
+                pg.add_lane(lane_kv_ranges(&self.cfg, &states));
+            }
             self.lane_store.push(Some(ParkedLane { layer_states: states, rng_state: 0x9E37_79B9_7F4A_7C15 ^ (self.lane_store.len() as u64) }));
             self.lane_max_seq.push(max_seq.max(self.cfg.local_window_size));
         }
@@ -829,6 +893,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// Missing experts are skipped (no rescue in batched rounds). Then sample each row with
     /// `sample_batch_row` and call `post_batch_tide_step`.
     pub fn forward_batch(&mut self, rows: &[(usize, u32, usize)]) -> Result<()> {
+        for &(lane, _, pos) in rows {
+            self.kv_ensure(lane, pos + 1)?;
+        }
         self.map_batch_rows = rows.iter().map(|&(lane, tok, pos)| (lane, pos, tok)).collect();
         let m = rows.len();
         if m == 0 || m > MAX_BATCH_ROWS {
@@ -1089,6 +1156,84 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
     }
 
+    /// Backs `lane`'s global KV up to position `end` (exclusive); an error when the pool cannot.
+    pub(crate) fn kv_ensure(&mut self, lane: usize, end: usize) -> Result<()> {
+        if self.kv_reserve(lane, end)? {
+            Ok(())
+        } else {
+            Err(smalltide_core::SmallTideError::Backend {
+                backend: "engine",
+                message: format!("KV pool full: lane {lane} needs {end} positions and no idle lane can give pages back"),
+            })
+        }
+    }
+
+    /// Like `kv_ensure`, but returns false instead of failing (the server stops that request).
+    pub fn kv_reserve(&mut self, lane: usize, end: usize) -> Result<bool> {
+        let Some(pg) = self.kv_pager.as_mut() else { return Ok(true) };
+        if end > self.lane_max_seq[lane] {
+            return Ok(false);
+        }
+        let (b, s) = (self.backend.clone(), self.tide.compute_stream);
+        pg.ensure(&*b, lane, end, || b.sync_stream(s))
+    }
+
+    /// Returns `lane`'s global KV pages past position `keep` to the pool (waits for the device).
+    pub fn kv_release(&mut self, lane: usize, keep: usize) -> Result<()> {
+        let Some(pg) = self.kv_pager.as_mut() else { return Ok(()) };
+        if pg.mapped_positions(lane) <= keep.div_ceil(crate::kv_pager::PAGE_POS) * crate::kv_pager::PAGE_POS {
+            return Ok(());
+        }
+        self.backend.sync_stream(self.tide.compute_stream)?;
+        pg.release(&*self.backend, lane, keep)
+    }
+
+    /// Marks `lane` as serving a request: its KV pages are never reclaimed.
+    pub fn set_lane_pinned(&mut self, lane: usize, pinned: bool) {
+        if let Some(pg) = self.kv_pager.as_mut() {
+            pg.pinned[lane] = pinned;
+        }
+    }
+
+    /// Lanes whose KV pages were reclaimed for another lane since the last call: their device
+    /// sequence is gone (their conversations survive only in host snapshots).
+    pub fn take_lost_lanes(&mut self) -> Vec<usize> {
+        self.kv_pager.as_mut().map(|p| p.take_lost()).unwrap_or_default()
+    }
+
+    /// Paged KV: (pages in the pool, free pages, positions a page, bytes a page).
+    pub fn kv_pool_info(&self) -> Option<(usize, usize, usize, usize)> {
+        self.kv_pager.as_ref().map(|p| (p.pages_total(), p.pages_free(), crate::kv_pager::PAGE_POS, p.page_bytes()))
+    }
+
+    /// Dev: the first global layer's cache at positions 0..2 (K bytes [0..8] of head 0, K scale
+    /// of head 0, V bytes [0..8]) per position.
+    pub fn debug_kv_peek(&self) -> Result<Vec<(Vec<u8>, f32, Vec<u8>)>> {
+        let st = self.layer_states.iter().find(|st| !st._is_local).expect("a global layer");
+        let (n, hd) = (self.cfg.num_key_value_heads, self.cfg.head_dim);
+        let s = self.tide.compute_stream;
+        let mut out = Vec::new();
+        for p in 0..2usize {
+            let mut k = vec![0u8; 8];
+            self.backend.memcpy_d2h_sync(&mut k, st.k_cache.slice(p * n * hd, 8), 0, s)?;
+            let mut v = vec![0u8; 8];
+            self.backend.memcpy_d2h_sync(&mut v, st.v_cache.slice(p * n * hd, 8), 0, s)?;
+            let mut sc = [0u8; 4];
+            self.backend.memcpy_d2h_sync(&mut sc, st.k_scales.slice(p * n * 4, 4), 0, s)?;
+            out.push((k, f32::from_le_bytes(sc), v));
+        }
+        Ok(out)
+    }
+
+    /// Commits every pool page once (call before the expert pools are sized, see `KvPager::touch_all`).
+    pub fn kv_touch_pool(&mut self) -> Result<()> {
+        let (b, s) = (self.backend.clone(), self.tide.compute_stream);
+        if let Some(pg) = self.kv_pager.as_mut() {
+            pg.touch_all(&*b, |buf, bytes| b.zero_f32(buf, bytes / 4, s), || b.sync_stream(s))?;
+        }
+        Ok(())
+    }
+
     /// Dev: redirect the per-token dump (`SMALLTIDE_DUMP_DIR`) to `dir`.
     pub fn set_dump_dir(&mut self, dir: std::path::PathBuf) {
         if let Some(d) = self.dump.as_mut() {
@@ -1126,6 +1271,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// drafter taps in `taps_buf` (if `capture_taps`). Then `verify_argmax`, `verify_rewind`.
     pub fn verify(&mut self, tokens: &[u32], pos0: usize) -> Result<()> {
         let m = tokens.len();
+        self.kv_ensure(self.active_lane, pos0 + m)?;
         if m == 0 || m > MAX_BATCH_ROWS {
             return Err(smalltide_core::SmallTideError::Backend { backend: "engine", message: format!("verify: {m} rows") });
         }
@@ -1928,6 +2074,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let h = self.cfg.hidden_size;
         let h_bytes = h * 4;
         let eps = self.cfg.rms_norm_eps;
+        self.kv_ensure(self.active_lane, pos + 1)?;
 
         // Token boundary: fold the previous token's routing log into heat, then publish any async
         // promotions whose DMA has landed (non-blocking query; table upload is stream-ordered).

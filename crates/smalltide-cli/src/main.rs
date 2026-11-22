@@ -807,7 +807,7 @@ fn run_generate(args: &[String]) {
 
     // Mode 2: Prefill -> Decode Boundary Rebalance
     let t_reb = Instant::now();
-    let reb_swaps = engine.rebalance_after_prefill(128).expect("Mode 2 rebalance");
+    let reb_swaps = engine.rebalance_after_prefill(std::env::var("SMALLTIDE_REBALANCE_SWAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(128)).expect("Mode 2 rebalance");
     let reb_ms = t_reb.elapsed().as_secs_f64() * 1000.0;
 
     let sampling = SamplingParams {
@@ -839,6 +839,13 @@ fn run_generate(args: &[String]) {
     let mut next_tok = engine
         .sample_next_token(&sampling, &generated)
         .expect("sample first token");
+
+    if std::env::var_os("SMALLTIDE_KV_DEBUG").is_some() {
+        println!("[kv-debug] pool {:?}", engine.kv_pool_info());
+        for (p, (k, sc, v)) in engine.debug_kv_peek().expect("peek").into_iter().enumerate() {
+            println!("[kv-debug] pos {p}: K {:?} scale {sc} V {:?}", k, v);
+        }
+    }
 
     if std::env::var_os("SMALLTIDE_WAITVALUE_TEST").is_some() {
         // Dev: does a GPU-side wait on a host-written flag work, and what does a release cost?

@@ -66,6 +66,8 @@ pub struct HipBackend {
     /// Zero (touch) every new device allocation so it is committed - and counted by the
     /// residency query - right away (load phase; see `set_touch_on_alloc`).
     touch_on_alloc: std::sync::atomic::AtomicBool,
+    /// Physical allocations for paged memory: handle id -> (hip handle, bytes).
+    vmm_handles: Mutex<HashMap<u64, (usize, usize)>>,
     #[cfg(windows)]
     wddm: Option<crate::wddm::Adapter>,
 }
@@ -113,6 +115,19 @@ struct CtrlMultiC {
 }
 
 impl HipBackend {
+    fn vmm_prop(&self) -> crate::ffi::HipMemAllocationProp {
+        crate::ffi::HipMemAllocationProp {
+            kind: 1, // hipMemAllocationTypePinned
+            requested_handle_type: 0,
+            location_type: 1, // hipMemLocationTypeDevice
+            location_id: self.device_id,
+            win32_handle_meta_data: ptr::null_mut(),
+            compression_type: 0,
+            gpu_direct_rdma_capable: 0,
+            usage: 0,
+        }
+    }
+
     fn ctrl_args(&self, hidden: usize, eps: f32) -> CtrlMultiC {
         let z = [ptr::null_mut(); 4];
         CtrlMultiC { out: z, cur: z, msg: z, gain: z, forget: z, norm_w: z, norm_out: z, hidden: hidden as u32, eps }
@@ -250,6 +265,7 @@ impl HipBackend {
             kernel_timer: Mutex::new(None),
             seg_timer: Mutex::new(None),
             touch_on_alloc: std::sync::atomic::AtomicBool::new(true),
+            vmm_handles: Mutex::new(HashMap::new()),
             #[cfg(windows)]
             wddm: {
                 let a = crate::wddm::Adapter::open_amd();
@@ -621,6 +637,61 @@ impl ComputeBackend for HipBackend {
             }
         }
         Ok(())
+    }
+
+    fn vmm_granularity(&self) -> Option<usize> {
+        let v = self.rt.vmm?;
+        if std::env::var("SMALLTIDE_KV_PAGED").map_or(false, |x| x.trim() == "0") {
+            return None;
+        }
+        self.bind();
+        let prop = self.vmm_prop();
+        let mut g = 0usize;
+        let r = unsafe { (v.granularity)(&mut g, &prop, 0) };
+        (r == 0 && g > 0).then_some(g)
+    }
+
+    fn vmm_reserve(&self, size: usize) -> Result<DeviceBuf> {
+        let v = self.rt.vmm.ok_or_else(|| SmallTideError::Unsupported("hip vmm".into()))?;
+        self.bind();
+        let mut ptr: *mut c_void = ptr::null_mut();
+        unsafe { check_hip((v.reserve)(&mut ptr, size, 0, ptr::null_mut(), 0), "hipMemAddressReserve")? };
+        let id = self.next_handle();
+        // Address space only: never hipFree'd (it lives as long as the process).
+        self.dev_bufs.lock().unwrap().insert(id, DeviceAlloc { ptr, size_bytes: size, borrowed: true });
+        Ok(DeviceBuf { id, offset_bytes: 0, size_bytes: size })
+    }
+
+    fn vmm_create(&self, size: usize) -> Result<u64> {
+        let v = self.rt.vmm.ok_or_else(|| SmallTideError::Unsupported("hip vmm".into()))?;
+        self.bind();
+        let prop = self.vmm_prop();
+        let mut h: *mut c_void = ptr::null_mut();
+        unsafe { check_hip((v.create)(&mut h, size, &prop, 0), "hipMemCreate")? };
+        let id = self.next_handle();
+        self.vmm_handles.lock().unwrap().insert(id, (h as usize, size));
+        Ok(id)
+    }
+
+    fn vmm_map(&self, va: DeviceBuf, offset: usize, handle: u64) -> Result<()> {
+        let v = self.rt.vmm.ok_or_else(|| SmallTideError::Unsupported("hip vmm".into()))?;
+        let (h, size) = *self.vmm_handles.lock().unwrap().get(&handle).ok_or_else(|| SmallTideError::Backend {
+            backend: "hip",
+            message: format!("vmm_map: unknown handle {handle}"),
+        })?;
+        let base = self.dev_ptr(va)? as usize + offset;
+        let desc = crate::ffi::HipMemAccessDesc { location_type: 1, location_id: self.device_id, flags: 3 };
+        unsafe {
+            check_hip((v.map)(base as *mut c_void, size, 0, h as *mut c_void, 0), "hipMemMap")?;
+            check_hip((v.set_access)(base as *mut c_void, size, &desc, 1), "hipMemSetAccess")?;
+        }
+        Ok(())
+    }
+
+    fn vmm_unmap(&self, va: DeviceBuf, offset: usize, size: usize) -> Result<()> {
+        let v = self.rt.vmm.ok_or_else(|| SmallTideError::Unsupported("hip vmm".into()))?;
+        let base = self.dev_ptr(va)? as usize + offset;
+        unsafe { check_hip((v.unmap)(base as *mut c_void, size), "hipMemUnmap") }
     }
 
     fn stream_wait_value_ge(&self, stream: Stream, flag: DeviceBuf, value: u32) -> Result<()> {

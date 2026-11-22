@@ -214,9 +214,22 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     // Extra lanes: their own KV (local rings + global KV of `lane_ctx`), allocated before the pools.
     let extra_lanes = lanes.max(1) - 1;
     let lane_ctx = s.lane_ctx.min(s.max_ctx).max(cfg.local_window_size);
-    let est_kv_bytes = est_kv_bytes
-        + extra_lanes * (40 * (2 * 8 * (cfg.local_window_size + 128) * 128 + 2 * 8 * (cfg.local_window_size + 128) * 4)
-            + 8 * (2 * 8 * lane_ctx * 128 + 2 * 8 * lane_ctx * 4));
+    // Paged global KV (default where the backend can page memory): one pool of
+    // SMALLTIDE_KV_TOKENS positions shared by all lanes (default: what lane 0 at max_ctx plus the
+    // other lanes at lane_ctx held before), any lane up to max_ctx; pages carry one per lane of slack.
+    let page = smalltide_model_inkling2::kv_pager::PAGE_POS;
+    let kv_tokens = parse("SMALLTIDE_KV_TOKENS", s.max_ctx + extra_lanes * lane_ctx, "a token count");
+    // Opt-in: HIP virtual memory on the 26.10 Windows driver backs every mapped allocation with
+    // the same memory (and hangs host copies into mapped ranges), so paging is off by default.
+    let kv_pool_pages = (std::env::var("SMALLTIDE_KV_PAGED").map_or(false, |v| v.trim() == "1"))
+        .then(|| kv_tokens.div_ceil(page) + lanes.max(1));
+    let global_per_pos = 8 * (2 * 8 * 128 + 2 * 8 * 4);
+    let est_kv_bytes = match kv_pool_pages {
+        Some(p) => 40 * (2 * 8 * (cfg.local_window_size + 128) * 132) * lanes.max(1) + p * page * global_per_pos + 64 * 1024 * 1024,
+        None => est_kv_bytes
+            + extra_lanes * (40 * (2 * 8 * (cfg.local_window_size + 128) * 128 + 2 * 8 * (cfg.local_window_size + 128) * 4)
+                + 8 * (2 * 8 * lane_ctx * 128 + 2 * 8 * lane_ctx * 4)),
+    };
     let headroom_bytes = 900 * 1024 * 1024usize;
     let scratch_ring_bytes = 8 * (nvfp4_slab + mxfp8_slab);
     let mut avail = info_after_dense
@@ -303,13 +316,21 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
 
     // Engine buffers (activations, KV, prefill scratch) before the expert pools: on Windows the
     // driver backs allocations beyond the resident budget with system memory, in order.
-    let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, s.max_ctx).expect("create Inkling2Engine");
+    let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, s.max_ctx, kv_pool_pages).expect("create Inkling2Engine");
     if let Some(d) = drafter {
         engine.attach_drafter(d).expect("attach drafter");
     }
     if extra_lanes > 0 {
         engine.add_lanes(extra_lanes, lane_ctx).expect("allocate lanes");
-        println!("[lanes] {} concurrent sequences (lane 0: {} ctx, lanes 1..: {} ctx)", lanes, s.max_ctx, lane_ctx);
+    }
+    match engine.kv_pool_info() {
+        Some((pages, _, per, bytes)) => {
+            engine.kv_touch_pool().expect("commit KV pool");
+            println!("[kv] paged: {} concurrent sequences share {} pages x {} positions ({:.2} GiB, {} positions); any sequence up to {} ctx",
+                lanes.max(1), pages, per, (pages * bytes) as f64 / (1u64 << 30) as f64, pages * per, s.max_ctx);
+        }
+        None if extra_lanes > 0 => println!("[lanes] {} concurrent sequences (lane 0: {} ctx, lanes 1..: {} ctx)", lanes, s.max_ctx, lane_ctx),
+        None => {}
     }
     engine.preallocate_rows_buffers().expect("allocate rows buffers");
     // Re-measure now that every engine buffer exists (lanes, rows scratch, drafter): pools that

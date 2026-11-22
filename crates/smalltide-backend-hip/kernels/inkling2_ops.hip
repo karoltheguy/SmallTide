@@ -442,8 +442,9 @@ extern "C" __global__ void smalltide_argmax_partial_f32(
 // 12. GPU-side rescue check handoff kernels (coherent host-mapped control buffers)
 // ---------------------------------------------------------------------------
 
-// Copies `n` u32 routing words (n <= 32) from `src` to coherent host-mapped `dst[0..n]`, flushes
-// system-scope stores, then publishes `ticket` to `dst[n]`.
+// Copies `n` u32 routing words (16 for single-token decode, up to 128 for 8-row verify) from
+// `src` to coherent host-mapped `dst[0..n]`, flushes system-scope stores, then publishes `ticket`
+// to `dst[n]`.
 // Grid: (1, 1, 1), Block: (32, 1, 1) (single wave32)
 extern "C" __global__ void smalltide_rescue_write_route(
     uint32_t* __restrict__ dst,
@@ -451,13 +452,12 @@ extern "C" __global__ void smalltide_rescue_write_route(
     uint32_t n,
     uint32_t ticket
 ) {
-    uint32_t i = threadIdx.x;
-    if (i < n) {
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         __scoped_atomic_store_n(dst + i, src[i], __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
     }
     __builtin_amdgcn_wave_barrier();
     __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-    if (i == 0u) {
+    if (threadIdx.x == 0u) {
         __scoped_atomic_store_n(dst + n, ticket, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
     }
 }

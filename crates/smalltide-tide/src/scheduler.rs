@@ -557,10 +557,112 @@ impl TideScheduler {
         }
     }
 
+    /// Inline rescue planning for a multi-row speculative `verify` layer (`m <= 8` rows):
+    /// protects every expert routed by any row in this layer, aggregates missing experts across all
+    /// rows, and under `Threshold` rescues up to 1 (for `m < 4`) or 2 (for `m >= 4`) highest-impact
+    /// missing experts whose max single-row normalized share meets the layer gate (capped by
+    /// `rescue_budget` per verify step). Does not update per-token hit/skip telemetry — that runs
+    /// in `record_batch_dispatch_with_rescued` on only the committed rows after `verify_rewind`.
+    pub fn plan_verify_layer_dispatch(
+        &mut self,
+        layer: PhysicalLayerId,
+        rows_ids: &[[u16; 8]],
+        rows_ws: &[[f32; 8]],
+    ) -> (Vec<TransferOp>, bool, Vec<ExpertId>) {
+        let m = rows_ids.len();
+        let mut sync_transfers = Vec::new();
+        let mut rescued = Vec::new();
+        let mut wait_pending = false;
+
+        // Protect every expert routed by any row of this layer so a rescue never evicts one.
+        let mut protect: Vec<ExpertId> = Vec::with_capacity(m * 8);
+        for row in rows_ids {
+            for &e in row {
+                let id = ExpertId { layer, expert: e };
+                if !protect.contains(&id) {
+                    protect.push(id);
+                }
+            }
+        }
+        self.cache.set_protected(&protect);
+
+        for &id in &protect {
+            let entry = self.cache.entry(id);
+            if self.cache.is_vram_pending(id) && !entry.is_scratch_slot {
+                wait_pending = true;
+            }
+        }
+
+        if let RescuePolicy::Threshold(gate) = self.tide_cfg.rescue_policy {
+            if self.rescues_this_token < self.rescue_budget {
+                let tau = match self.loop_core_gate {
+                    Some(g) if self.model_cfg.is_loop_core_layer(layer.0 as usize) => g,
+                    _ => gate,
+                };
+                // Aggregate (max_single_row_share, sum_share_across_rows) per unique missing expert.
+                let mut miss_stats: Vec<(ExpertId, f32, f32)> = Vec::new();
+                for (r_ids, r_ws) in rows_ids.iter().zip(rows_ws.iter()) {
+                    let tot: f32 = r_ws.iter().sum();
+                    let inv = if tot > 1e-8 { 1.0 / tot } else { 1.0 };
+                    for (&e, &w) in r_ids.iter().zip(r_ws.iter()) {
+                        let id = ExpertId { layer, expert: e };
+                        if !self.cache.entry(id).vram_slot.is_missing() {
+                            continue;
+                        }
+                        let nw = w * inv;
+                        if let Some(st) = miss_stats.iter_mut().find(|s| s.0 == id) {
+                            st.1 = st.1.max(nw);
+                            st.2 += nw;
+                        } else {
+                            miss_stats.push((id, nw, nw));
+                        }
+                    }
+                }
+                miss_stats.retain(|s| s.1 >= tau);
+                miss_stats.sort_by(|a, b| b.2.total_cmp(&a.2));
+                let max_per_layer = if m >= 4 { 2 } else { 1 };
+                let rem_budget = self.rescue_budget.saturating_sub(self.rescues_this_token);
+                let take = max_per_layer.min(rem_budget);
+                for (id, max_share, _sum_share) in miss_stats.into_iter().take(take) {
+                    self.rescues_this_token += 1;
+                    self.event_share = max_share;
+                    if self.cache.should_promote_instead_of_scratch(id) {
+                        let pin = !self.cache.has_priors() && self.model_cfg.is_loop_core_layer(layer.0 as usize);
+                        if let Some(op) = self.cache.promote_to_vram(id, pin, true) {
+                            self.record_transfer_telemetry(&op, true);
+                            sync_transfers.push(op);
+                            rescued.push(id);
+                        }
+                    } else {
+                        let op = self.cache.stage_scratch_rescue(id);
+                        self.record_transfer_telemetry(&op, true);
+                        sync_transfers.push(op);
+                        rescued.push(id);
+                    }
+                }
+            }
+        }
+
+        self.cache.clear_protected();
+        (sync_transfers, wait_pending, rescued)
+    }
+
     /// Bookkeeping for one layer of one row of a batched decode round. Batched rounds never rescue
     /// (that would stall every lane): the kernels skipped unpublished experts, so this counts hits
     /// and misses, adds heat and skipped routing weight, and queues misses for async promotion.
     pub fn record_batch_dispatch(&mut self, layer: PhysicalLayerId, topk_ids: &[u16], topk_weights: &[f32]) {
+        self.record_batch_dispatch_with_rescued(layer, topk_ids, topk_weights, &[]);
+    }
+
+    /// Like `record_batch_dispatch`, crediting experts that were rescued inline during a verify
+    /// pass (even if their transient scratch slot was reused by a later layer before this runs).
+    pub fn record_batch_dispatch_with_rescued(
+        &mut self,
+        layer: PhysicalLayerId,
+        topk_ids: &[u16],
+        topk_weights: &[f32],
+        rescued: &[ExpertId],
+    ) {
         let total: f32 = topk_weights.iter().sum();
         let inv = if total > 1e-8 { 1.0 / total } else { 1.0 };
         self.telemetry.routed_weight_total += 1.0;
@@ -570,6 +672,10 @@ impl TideScheduler {
             self.cache.touch_expert(id, norm_w);
             if self.cache.is_vram_hit(id) {
                 self.record_hit(layer);
+                continue;
+            }
+            if rescued.contains(&id) {
+                self.record_miss(layer);
                 continue;
             }
             self.record_miss(layer);
@@ -1082,5 +1188,48 @@ mod tests {
         let ops2 = sched.plan_async_step();
         assert!(ops2.iter().any(|op| matches!(op, TransferOp::RamToVram { expert, .. } if *expert == hot)));
         assert!(ops2.iter().all(|op| !matches!(op, TransferOp::DiskToVramDirect { .. })));
+    }
+
+    #[test]
+    fn test_verify_layer_dispatch_protects_all_rows_and_ranks_shared_misses() {
+        let model_cfg = Inkling2Config::default();
+        let mut tide_cfg = TideConfig::default();
+        tide_cfg.rescue_policy = RescuePolicy::Threshold(0.2);
+        let mut sched = TideScheduler::new(model_cfg, tide_cfg, 16 * GIB, 16 * GIB);
+        // 3 MXFP8 VRAM slots: layer 20 experts 0, 1, 2 start resident.
+        sched.cache.configure_scratch_ring(2560, 3, 8);
+        let _ = sched.plan_pre_prefill(None);
+        sched.cache.publish_all_pending();
+        sched.begin_token();
+        sched.rescue_budget = 4;
+
+        // 4 verify rows:
+        // - expert 0 is hit in row 0 (must stay protected)
+        // - expert 10 is missing in ALL 4 rows with share 0.25 each (sum = 1.0, max = 0.25 >= 0.2)
+        // - expert 11 is missing in 1 row with share 0.35 (sum = 0.35, max = 0.35 >= 0.2)
+        // - expert 12 is missing in 1 row with share 0.22 (sum = 0.22, max = 0.22 >= 0.2)
+        // - expert 13 is missing in 4 rows with share 0.10 each (max = 0.10 < 0.2 -> skipped)
+        let rows_ids = [
+            [0, 10, 11, 13, 1, 2, 1, 2],
+            [0, 10, 12, 13, 1, 2, 1, 2],
+            [0, 10, 1,  13, 1, 2, 1, 2],
+            [0, 10, 1,  13, 1, 2, 1, 2],
+        ];
+        let rows_ws = [
+            [0.20, 0.25, 0.35, 0.10, 0.025, 0.025, 0.025, 0.025],
+            [0.20, 0.25, 0.22, 0.10, 0.0575, 0.0575, 0.0575, 0.0575],
+            [0.30, 0.25, 0.25, 0.10, 0.025, 0.025, 0.025, 0.025],
+            [0.30, 0.25, 0.25, 0.10, 0.025, 0.025, 0.025, 0.025],
+        ];
+        let (ops, wait_pending, rescued) =
+            sched.plan_verify_layer_dispatch(PhysicalLayerId(20), &rows_ids, &rows_ws);
+        assert!(!wait_pending);
+        // For m >= 4, at most 2 rescues per layer: must pick expert 10 (sum 1.0) and expert 11 (sum 0.35).
+        assert_eq!(ops.len(), 2);
+        assert_eq!(rescued, vec![eid(20, 10), eid(20, 11)]);
+        // Protected residents 0, 1, 2 must remain in VRAM!
+        assert!(sched.cache.is_vram_hit(eid(20, 0)));
+        assert!(sched.cache.is_vram_hit(eid(20, 1)));
+        assert!(sched.cache.is_vram_hit(eid(20, 2)));
     }
 }

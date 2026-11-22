@@ -69,7 +69,24 @@ enum StreamEvent {
         decode_secs: f64,
         vram_hit_rate: f64,
     },
+    /// Periodic liveness probe sent while output is buffered (e.g. inside an unterminated tool call)
+    /// so disconnected clients abort generation immediately instead of running to `max_tokens`.
+    Heartbeat,
     Error(String),
+}
+
+/// Non-blocking check for whether the HTTP peer has closed the TCP connection.
+fn peer_disconnected(stream: &TcpStream) -> bool {
+    let mut b = [0u8; 1];
+    let _ = stream.set_nonblocking(true);
+    let closed = match stream.peek(&mut b) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(_) => true,
+    };
+    let _ = stream.set_nonblocking(false);
+    closed
 }
 
 /// Logs an engine error for a request; a lost GPU context (HIP launch failure / illegal address:
@@ -397,6 +414,10 @@ impl ActiveReq {
             if s.is_empty() { Vec::new() } else { vec![AnswerEvent::Text(s)] }
         };
         if !self.emit(evs) {
+            return false;
+        }
+        if self.generated.len() % 64 == 0 && self.event_tx.send(StreamEvent::Heartbeat).is_err() {
+            self.finish_reason = "stop";
             return false;
         }
         self.generated.len() < self.max_tokens && self.pos < lane_max_seq
@@ -1425,6 +1446,11 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             let _ = stream.flush();
                             break;
                         }
+                        StreamEvent::Heartbeat => {
+                            if write!(stream, ": keepalive\n\n").is_err() || stream.flush().is_err() {
+                                return;
+                            }
+                        }
                         StreamEvent::Error(msg) => {
                             let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", json!({"error": msg}));
                             let _ = stream.flush();
@@ -1441,6 +1467,11 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 let mut cached = 0usize;
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
+                        StreamEvent::Heartbeat => {
+                            if peer_disconnected(&stream) {
+                                return;
+                            }
+                        }
                         StreamEvent::Delta { channel, text } => match channel {
                             OutputChannel::Thinking => reasoning.push_str(&text),
                             OutputChannel::Text => content.push_str(&text),
@@ -1614,6 +1645,11 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                             let _ = stream.flush();
                             break;
                         }
+                        StreamEvent::Heartbeat => {
+                            if write!(stream, ": keepalive\n\n").is_err() || stream.flush().is_err() {
+                                return;
+                            }
+                        }
                         StreamEvent::Error(msg) => {
                             let _ = write!(stream, "data: {}\n\ndata: [DONE]\n\n", json!({"error": msg}));
                             let _ = stream.flush();
@@ -1628,6 +1664,11 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 let mut cached = 0usize;
                 while let Ok(ev) = ev_rx.recv() {
                     match ev {
+                        StreamEvent::Heartbeat => {
+                            if peer_disconnected(&stream) {
+                                return;
+                            }
+                        }
                         StreamEvent::Delta { text: piece, .. } => text.push_str(&piece),
                         StreamEvent::ToolCall { .. } => {}
                         StreamEvent::Done {

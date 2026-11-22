@@ -369,6 +369,12 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             if self.cfg.final_logit_softcapping > 0.0 && !skip_softcap {
                 self.backend.final_logit_softcap(logits, m * vocab, self.cfg.final_logit_softcapping, s)?;
             }
+            if !self.pending_checks.is_empty() {
+                self.service_verify_rescue_checks(m, pos0)?;
+                self.run_deferred_tide_step()?;
+            } else if self.verify_rescue_active {
+                self.run_deferred_tide_step()?;
+            }
             if let (Some(dh), Some(dr)) = (dump_hidden, dump_routes) {
                 for r in 0..m {
                     self.write_dump_final(pos0 + r, moe_norm.slice(r * h * 4, h * 4))?;
@@ -1002,25 +1008,28 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             return Ok(Vec::new());
         }
         let ids = if verify {
+            // Inline GPU-side rescue check (zero-sync when layer is 100% resident or rescue disabled).
+            self.queue_verify_rescue_check(il, ip, route, m)?;
             // Device-side multi-row MoE (as in batched decode), weighted sum per row into moe_out;
             // the MLP short conv below then runs over the rows with history.
             let pf = self.pf.as_ref().unwrap();
-            let is_mx = cfg.is_mxfp8_layer(ip);
+            let is_mx = self.cfg.is_mxfp8_layer(ip);
             let (pool, stride, dtype) = if is_mx {
                 (self.tide.vram_pool_mxfp8, self.tide.mxfp8_layout.aligned_slab_bytes, smalltide_core::DType::MXFP8)
             } else {
                 (self.tide.vram_pool_nvfp4, self.tide.nvfp4_layout.aligned_slab_bytes, smalltide_core::DType::NVFP4)
             };
-            let n_exp = cfg.n_routed_experts;
+            let n_exp = self.cfg.n_routed_experts;
             let slot_table = self.tide.gpu_slot_table.slice(ip * n_exp * 4, n_exp * 4);
             let params = smalltide_core::backend::MoeDispatchParams {
                 batch_size: m,
                 hidden_size: h,
-                intermediate_size: cfg.intermediate_size,
-                top_k: cfg.num_experts_per_tok,
+                intermediate_size: self.cfg.intermediate_size,
+                top_k: self.cfg.num_experts_per_tok,
                 weight_dtype: dtype,
                 expert_stride_bytes: stride,
             };
+            let b = self.backend.clone();
             b.moe_rows_grouped(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pf.moe_out, route, slot_table, pool, pf.desc, m, params, s)?;
             if std::env::var_os("SMALLTIDE_VERIFY_UNFUSED").is_none() {
                 // Fused epilogue: weighted sum + MLP conv (+history) + residual; done here.

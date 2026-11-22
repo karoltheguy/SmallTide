@@ -167,8 +167,9 @@ pub(crate) struct ActivationScratch {
 }
 
 const ROUTE_WORDS: usize = 16;
-/// Coherent host-mapped routing mirror stride: 16 route words + 1 ticket sentinel, padded to 128 B.
-const ROUTE_MIRROR_STRIDE_WORDS: usize = 32;
+/// Coherent host-mapped routing mirror stride: up to 8 verify rows x 16 words + 1 ticket sentinel,
+/// padded to 576 B (cache-line aligned).
+const ROUTE_MIRROR_STRIDE_WORDS: usize = 144;
 /// Cache-line stride (64 B = 16 u32s) per layer for `hipStreamWaitValue32` flags.
 const WAIT_FLAG_STRIDE_WORDS: usize = 16;
 /// Per-layer rescue table patch buffer stride: 1 count header + up to 255 `(idx, slot)` pairs (2 KiB).
@@ -216,7 +217,11 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// Mapped `[8]` u32 GPU breadcrumb buffer (`[0] = (ticket<<12)|(layer<<4)|stage`, `[1] = n_patches`).
     rescue_probe: Option<(DeviceBuf, PinnedBuf)>,
     wait_ticket: u32,
-    pending_checks: Vec<usize>,
+    pub(crate) pending_checks: Vec<usize>,
+    /// True during a `verify` forward when inline GPU-side TideLM rescue is active.
+    pub(crate) verify_rescue_active: bool,
+    /// Experts rescued inline during the current `verify` pass (credited in `post_batch_tide_step`).
+    verify_rescued: Vec<smalltide_core::ExpertId>,
     /// Expert map: the decoded tokens' routing (host copies of what the engine already read back),
     /// the last single-token decode's (lane, pos, token) and the last batched round's rows.
     pub routes: smalltide_tide::expert_map::RouteLog,
@@ -508,6 +513,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             rescue_probe: None,
             wait_ticket: 0,
             pending_checks: Vec::new(),
+            verify_rescue_active: false,
+            verify_rescued: Vec::new(),
             routes: smalltide_tide::expert_map::RouteLog::default(),
             kv_pool,
             map_last_tok: None,
@@ -1390,6 +1397,247 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         res
     }
 
+    /// Queues a GPU-side rescue check (route mirror + spin-wait/patch) for verify layer `il`
+    /// (`m <= 8` rows) when inline verify rescue is active and physical layer `ip` is not 100%
+    /// VRAM-resident.
+    pub(crate) fn queue_verify_rescue_check(
+        &mut self,
+        il: usize,
+        ip: usize,
+        route: DeviceBuf,
+        m: usize,
+    ) -> Result<()> {
+        if !self.verify_rescue_active {
+            return Ok(());
+        }
+        if self.tide.scheduler.is_layer_fully_resident_vram(PhysicalLayerId(ip as u16)) {
+            return Ok(());
+        }
+        let s = self.tide.compute_stream;
+        if self.route_pinned.is_none() {
+            let n_log = self.layer_planned.len();
+            let (view, host) = self.backend.alloc_host_signal(n_log * ROUTE_MIRROR_STRIDE_WORDS * 4)?;
+            unsafe {
+                let p = self.backend.pinned_as_mut_slice(host)?.as_mut_ptr() as *mut u32;
+                for i in 0..n_log * ROUTE_MIRROR_STRIDE_WORDS {
+                    std::ptr::write_volatile(p.add(i), 0);
+                }
+            }
+            self.route_pinned = Some((view, host, self.backend.create_event()?));
+        }
+        let (view, _, _) = self.route_pinned.unwrap();
+        let row_off = il * ROUTE_MIRROR_STRIDE_WORDS * 4;
+        self.backend.rescue_write_route(
+            view.slice(row_off, ROUTE_MIRROR_STRIDE_WORDS * 4),
+            route,
+            m * ROUTE_WORDS,
+            self.wait_ticket,
+            s,
+        )?;
+        let (fview, _) = self.wait_flags.unwrap();
+        let (pview, _) = self.rescue_patches.unwrap();
+        let (ftview, _) = self.rescue_full_table.unwrap();
+        let prview = self.rescue_probe.map(|(v, _)| v);
+        let total_experts = self.cfg.num_physical_layers * self.cfg.n_routed_experts;
+        let flag_slice = fview.slice(il * WAIT_FLAG_STRIDE_WORDS * 4, 4);
+        let patch_slice = pview.slice(il * PATCH_STRIDE_WORDS * 4, PATCH_STRIDE_WORDS * 4);
+        match self.rescue_wait_mode()? {
+            RescueWaitMode::Spin => {
+                self.backend.rescue_wait_and_patch(
+                    self.tide.gpu_slot_table,
+                    flag_slice,
+                    self.wait_ticket,
+                    patch_slice,
+                    ftview,
+                    total_experts,
+                    prview,
+                    il,
+                    s,
+                )?;
+            }
+            RescueWaitMode::WaitValue => {
+                self.backend.stream_wait_value_ge(s, flag_slice, self.wait_ticket)?;
+                self.backend.rescue_apply_patch(
+                    self.tide.gpu_slot_table,
+                    patch_slice,
+                    ftview,
+                    total_experts,
+                    prview,
+                    il,
+                    self.wait_ticket,
+                    s,
+                )?;
+            }
+            RescueWaitMode::Off => return Ok(()),
+        }
+        self.pending_checks.push(il);
+        Ok(())
+    }
+
+    /// Services the queued GPU-side inline rescue checks for a multi-row `verify` pass (`m <= 8`),
+    /// copying high-weight missing experts once across all `m` rows before releasing each layer's wait.
+    pub(crate) fn service_verify_rescue_checks(&mut self, m: usize, pos0: usize) -> Result<()> {
+        let s = self.tide.compute_stream;
+        let (_, host, ev) = self.route_pinned.expect("route mirror");
+        let (_, fhost) = self.wait_flags.expect("wait flags");
+        let (_, phost) = self.rescue_patches.expect("rescue patches");
+        let (_, fthost) = self.rescue_full_table.expect("rescue full table");
+        let prhost = self.rescue_probe.map(|(_, h)| h);
+        let ticket = self.wait_ticket;
+        let sentinel_off = m * ROUTE_WORDS;
+        self.backend.record_event(ev, s)?;
+        let _ = self.backend.query_event(ev)?;
+        let checks = std::mem::take(&mut self.pending_checks);
+        let release_flag = |backend: &B, il: usize| {
+            if let Ok(slice) = unsafe { backend.pinned_as_mut_slice(fhost) } {
+                let f = slice.as_mut_ptr() as *mut u32;
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                unsafe { std::ptr::write_volatile(f.add(il * WAIT_FLAG_STRIDE_WORDS), ticket); }
+            }
+        };
+        let mut res: Result<()> = Ok(());
+        for (pos_idx, &il) in checks.iter().enumerate() {
+            if self.tide.scheduler.rescue_budget_spent() {
+                for &rem_il in &checks[pos_idx..] {
+                    release_flag(&*self.backend, rem_il);
+                }
+                break;
+            }
+            let tw = Instant::now();
+            let row = match unsafe { self.backend.pinned_as_mut_slice(host) } {
+                Ok(sl) => sl[il * ROUTE_MIRROR_STRIDE_WORDS * 4..].as_ptr() as *const u32,
+                Err(e) => {
+                    res = Err(e);
+                    for &rem_il in &checks[pos_idx..] {
+                        release_flag(&*self.backend, rem_il);
+                    }
+                    break;
+                }
+            };
+            let mut spins = 0u64;
+            let mut wait_err: Option<smalltide_core::SmallTideError> = None;
+            loop {
+                if unsafe { std::ptr::read_volatile(row.add(sentinel_off)) } == ticket {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+                    break;
+                }
+                spins += 1;
+                if spins % 8192 == 0 {
+                    if let Err(e) = self.backend.query_event(ev) {
+                        wait_err = Some(e);
+                        break;
+                    }
+                    if tw.elapsed().as_secs() > 10 {
+                        let pr0 = prhost
+                            .and_then(|h| unsafe { self.backend.pinned_as_mut_slice(h).ok() })
+                            .map(|sl| unsafe { std::ptr::read_volatile(sl.as_ptr() as *const u32) })
+                            .unwrap_or(0);
+                        wait_err = Some(smalltide_core::SmallTideError::Backend {
+                            backend: "engine",
+                            message: format!(
+                                "verify rescue check: layer {il} (pos0={pos0}, m={m}, ticket={ticket}) timed out (gpu_probe=0x{pr0:08x})"
+                            ),
+                        });
+                        break;
+                    }
+                }
+                std::hint::spin_loop();
+            }
+            if let Some(e) = wait_err {
+                res = Err(e);
+                for &rem_il in &checks[pos_idx..] {
+                    release_flag(&*self.backend, rem_il);
+                }
+                break;
+            }
+            let mut rows_ids = [[0u16; 8]; MAX_BATCH_ROWS];
+            let mut rows_ws = [[0.0f32; 8]; MAX_BATCH_ROWS];
+            for r in 0..m {
+                let base = r * ROUTE_WORDS;
+                for k in 0..8 {
+                    rows_ids[r][k] = unsafe { std::ptr::read_volatile(row.add(base + k)) } as u16;
+                    rows_ws[r][k] = f32::from_bits(unsafe { std::ptr::read_volatile(row.add(base + 8 + k)) });
+                }
+            }
+            let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
+            let (sync_transfers, wait_pending, rescued) =
+                self.tide.scheduler.plan_verify_layer_dispatch(phys, &rows_ids[..m], &rows_ws[..m]);
+            if !sync_transfers.is_empty() || wait_pending {
+                match self.tide.execute_rescue_now(&sync_transfers) {
+                    Ok(dirty) => {
+                        self.verify_rescued.extend_from_slice(&rescued);
+                        let (n4, m8) = self.tide.pool_slots();
+                        let scratch_n = smalltide_tide::runtime::DEFAULT_SCRATCH_RING_SLOTS;
+                        let n_exp = self.cfg.n_routed_experts;
+                        let mut bounds_err: Option<smalltide_core::SmallTideError> = None;
+                        for &(idx, val) in &dirty {
+                            if val != u32::MAX {
+                                let pl = idx / n_exp;
+                                let max_s = if self.cfg.is_mxfp8_layer(pl) { m8 + scratch_n } else { n4 + scratch_n };
+                                if (val as usize) >= max_s {
+                                    bounds_err = Some(smalltide_core::SmallTideError::Backend {
+                                        backend: "engine",
+                                        message: format!("verify rescue slot OOB: flat_idx={idx} phys={pl} slot={val} >= max={max_s}"),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(e) = bounds_err {
+                            res = Err(e);
+                            for &rem_il in &checks[pos_idx..] {
+                                release_flag(&*self.backend, rem_il);
+                            }
+                            break;
+                        }
+                        let patch_res: Result<()> = (|| {
+                            unsafe {
+                                let p = self.backend.pinned_as_mut_slice(phost)?.as_mut_ptr() as *mut u32;
+                                let dst = p.add(il * PATCH_STRIDE_WORDS);
+                                if dirty.is_empty() {
+                                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                                    std::ptr::write_volatile(dst, 0xFFFF_FFFEu32);
+                                } else if dirty.len() <= PATCH_MAX_PAIRS {
+                                    for (k, &(idx, val)) in dirty.iter().enumerate() {
+                                        std::ptr::write_volatile(dst.add(1 + 2 * k), idx as u32);
+                                        std::ptr::write_volatile(dst.add(2 + 2 * k), val);
+                                    }
+                                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                                    std::ptr::write_volatile(dst, dirty.len() as u32);
+                                } else {
+                                    let tbl = self.tide.scheduler.cache.gpu_slot_table();
+                                    let ft = self.backend.pinned_as_mut_slice(fthost)?.as_mut_ptr() as *mut u32;
+                                    for (k, &v) in tbl.iter().enumerate() {
+                                        std::ptr::write_volatile(ft.add(k), v);
+                                    }
+                                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                                    std::ptr::write_volatile(dst, 0xFFFF_FFFFu32);
+                                }
+                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = patch_res {
+                            res = Err(e);
+                            for &rem_il in &checks[pos_idx..] {
+                                release_flag(&*self.backend, rem_il);
+                            }
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        res = Err(e);
+                        for &rem_il in &checks[pos_idx..] {
+                            release_flag(&*self.backend, rem_il);
+                        }
+                        break;
+                    }
+                }
+            }
+            release_flag(&*self.backend, il);
+        }
+        res
+    }
+
     /// One token's picks over the logical layers from routing-log words (`off` its first word in
     /// layer 0, `stride` words a layer): (expert, share of the layer's routing weight, missed =
     /// not resident in VRAM now).
@@ -1611,11 +1859,41 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         self.ensure_rows_buffers()?;
         self.consume_route_log()?;
-        self.run_deferred_tide_step()?;
-        let published = self.tide.poll_pending()?;
-        self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+        let use_verify_rescue = self.dump.is_none()
+            && matches!(self.tide.scheduler.tide_cfg.rescue_policy, smalltide_core::RescuePolicy::Threshold(_))
+            && std::env::var_os("SMALLTIDE_VERIFY_NO_RESCUE").is_none()
+            && self.rescue_wait_mode()? != RescueWaitMode::Off;
+        if use_verify_rescue {
+            // Drain & publish any pending async promotions BEFORE queueing spin-waits, and defer
+            // `run_deferred_tide_step` until after `service_verify_rescue_checks` (same invariant as `forward_token`).
+            if self.tide.pending_batch_count() > 0 {
+                let pub2 = self.tide.wait_and_publish_all_pending()?;
+                self.tide.scheduler.telemetry.stage1_async_published += pub2 as u64;
+            }
+            self.tide.scheduler.begin_token();
+            self.wait_ticket = self.wait_ticket.wrapping_add(1).max(1);
+            if let Some((_, phost)) = self.rescue_patches {
+                let n_log = self.layer_planned.len();
+                unsafe {
+                    let p = self.backend.pinned_as_mut_slice(phost)?.as_mut_ptr() as *mut u32;
+                    for il in 0..n_log {
+                        std::ptr::write_volatile(p.add(il * PATCH_STRIDE_WORDS), 0);
+                    }
+                }
+            }
+            self.pending_checks.clear();
+            self.verify_rescued.clear();
+        } else {
+            self.run_deferred_tide_step()?;
+            let published = self.tide.poll_pending()?;
+            self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+            self.verify_rescued.clear();
+        }
+        self.verify_rescue_active = use_verify_rescue;
         self.map_batch_rows = tokens.iter().enumerate().map(|(i, &t)| (self.active_lane, pos0 + i, t)).collect();
-        self.rows_forward(tokens, crate::prefill::RowsMode::Verify { pos0, greedy }, true)?;
+        let fwd_res = self.rows_forward(tokens, crate::prefill::RowsMode::Verify { pos0, greedy }, true);
+        self.verify_rescue_active = false;
+        fwd_res?;
         // Defer drafter context KV ingest until `verify_rewind`, so `rows_argmax` / `verify_sample`
         // doesn't wait behind it and rejected rows are never ingested.
         self.verify_ingest_pos0 = self.capture_taps.then_some(pos0);
@@ -1838,6 +2116,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             self.dev_unique_resident += seen.len() as u64;
         }
+        let rescued = std::mem::take(&mut self.verify_rescued);
         for il in 0..n_log {
             let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
             for r in 0..m {
@@ -1850,7 +2129,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     ids[k] = word(base + k) as u16;
                     ws[k] = f32::from_bits(word(base + 8 + k));
                 }
-                self.tide.scheduler.record_batch_dispatch(phys, &ids, &ws);
+                self.tide.scheduler.record_batch_dispatch_with_rescued(phys, &ids, &ws, &rescued);
             }
         }
         self.tide.scheduler.cache.set_current_lane(self.active_lane);

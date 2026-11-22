@@ -183,6 +183,8 @@ pub struct CoreKernels {
     pub gemm_fp8_rows_wmma: HipFunction,
     pub gemm_fp8_rows_wmma_small: HipFunction,
     pub gemv_fp8_rows: HipFunction,
+    pub sconv_rewind: HipFunction,
+    pub argmax_rows: HipFunction,
     pub moe_w2_rows: HipFunction,
 }
 
@@ -399,6 +401,8 @@ impl HipRuntime {
             gemm_fp8_rows_wmma: get_fn("smalltide_gemm_fp8_rows_wmma")?,
             gemm_fp8_rows_wmma_small: get_fn("smalltide_gemm_fp8_rows_wmma_small")?,
             gemv_fp8_rows: get_fn("smalltide_gemv_fp8_rows")?,
+            sconv_rewind: get_fn("smalltide_sconv_rewind")?,
+            argmax_rows: get_fn("smalltide_argmax_rows")?,
             moe_w2_rows: get_fn("smalltide_moe_w2_rows")?,
         })
     }

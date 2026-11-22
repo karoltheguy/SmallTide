@@ -205,6 +205,16 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     pub(crate) rows_decode: bool,
     /// Lanes of the rows of the last batched round (Tide demand bookkeeping per lane).
     batch_lanes: Vec<usize>,
+    /// Speculative verify: short-conv histories `[logical][k, v, attn, mlp][3 + MAX_BATCH_ROWS][dim]`.
+    pub(crate) verify_hist: Option<DeviceBuf>,
+    /// Per lane: device rewind table (hist, state, dim, 0) x 4 per logical layer.
+    rewind_tables: Vec<Option<DeviceBuf>>,
+    /// Drafter taps of the last rows forward: `[4][PREFILL_CHUNK][H]` (layer 4 / 22 / 40 outputs,
+    /// final normed hidden), filled when `capture_taps`.
+    pub(crate) taps_buf: Option<DeviceBuf>,
+    pub capture_taps: bool,
+    /// `[MAX_BATCH_ROWS]` u32 argmax output.
+    argmax_rows_buf: Option<DeviceBuf>,
     /// Prompt-aware loading: max async swaps between prefill chunks / before a request.
     pub prefill_chunk_swaps: usize,
     pub anticipate_swaps: usize,
@@ -377,6 +387,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             batch_pending_rows: 0,
             rows_decode: false,
             batch_lanes: Vec::new(),
+            verify_hist: None,
+            rewind_tables: Vec::new(),
+            taps_buf: None,
+            capture_taps: false,
+            argmax_rows_buf: None,
             prefill_chunk_swaps: 96,
             anticipate_swaps: 256,
             anticipate_wait: true,
@@ -796,6 +811,122 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.batch_pending_rows = m;
         self.batch_lanes = rows.iter().map(|r| r.0).collect();
         Ok(())
+    }
+
+    /// History slice of logical layer `il`, short conv `kind` (0 k, 1 v, 2 attn-out, 3 mlp).
+    pub(crate) fn verify_hist_slice(&self, il: usize, kind: usize) -> DeviceBuf {
+        let kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        let h = self.cfg.hidden_size;
+        let rows = 3 + MAX_BATCH_ROWS;
+        let per_layer = rows * (2 * kv + 2 * h);
+        let (off, dim) = match kind {
+            0 => (0, kv),
+            1 => (rows * kv, kv),
+            2 => (rows * 2 * kv, h),
+            _ => (rows * (2 * kv + h), h),
+        };
+        self.verify_hist.expect("verify hist").slice((il * per_layer + off) * 4, rows * dim * 4)
+    }
+
+    fn ensure_rows_buffers(&mut self) -> Result<()> {
+        if self.pf.is_none() {
+            self.pf = Some(crate::prefill::PrefillScratch::new(&*self.backend, &self.cfg)?);
+        }
+        if self.batch_logits.is_none() {
+            self.batch_logits = Some(self.backend.alloc_device(MAX_BATCH_ROWS * self.cfg.unpadded_vocab_size * 4)?);
+            self.batch_route_log = Some(self.backend.alloc_device(self.layer_states.len() * MAX_BATCH_ROWS * 64)?);
+        }
+        Ok(())
+    }
+
+    /// Allocates the speculative-decoding buffers (verify histories, drafter taps). Call before
+    /// the expert pools are allocated (VRAM placement order).
+    pub fn enable_speculative_buffers(&mut self) -> Result<()> {
+        let kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        let h = self.cfg.hidden_size;
+        let n_log = self.layer_states.len();
+        if self.verify_hist.is_none() {
+            self.verify_hist = Some(self.backend.alloc_device(n_log * (3 + MAX_BATCH_ROWS) * (2 * kv + 2 * h) * 4)?);
+            self.taps_buf = Some(self.backend.alloc_device(4 * PREFILL_CHUNK * h * 4)?);
+            self.argmax_rows_buf = Some(self.backend.alloc_device(MAX_BATCH_ROWS * 4)?);
+        }
+        self.ensure_rows_buffers()
+    }
+
+    /// Speculative verify: runs `tokens` (<= 8, the anchor then the drafts) of the active lane at
+    /// positions `pos0..` in one pass; logits of every row land in the batch logits buffer and the
+    /// drafter taps in `taps_buf` (if `capture_taps`). Then `verify_argmax`, `verify_rewind`.
+    pub fn verify(&mut self, tokens: &[u32], pos0: usize) -> Result<()> {
+        let m = tokens.len();
+        if m == 0 || m > MAX_BATCH_ROWS {
+            return Err(smalltide_core::SmallTideError::Backend { backend: "engine", message: format!("verify: {m} rows") });
+        }
+        if self.verify_hist.is_none() {
+            self.enable_speculative_buffers()?;
+        }
+        self.ensure_rows_buffers()?;
+        self.consume_route_log()?;
+        self.run_deferred_tide_step()?;
+        let published = self.tide.poll_pending()?;
+        self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+        self.rows_forward(tokens, crate::prefill::RowsMode::Verify { pos0 }, true)?;
+        self.batch_pending_rows = m;
+        self.batch_lanes = vec![self.active_lane; m];
+        Ok(())
+    }
+
+    /// Greedy next token of each of the last `m` verify / batch rows (one readback).
+    pub fn rows_argmax(&mut self, m: usize) -> Result<Vec<u32>> {
+        if self.argmax_rows_buf.is_none() {
+            self.argmax_rows_buf = Some(self.backend.alloc_device(MAX_BATCH_ROWS * 4)?);
+        }
+        let out = self.argmax_rows_buf.unwrap();
+        let s = self.tide.compute_stream;
+        self.backend.argmax_rows(out, self.batch_logits.expect("batch logits"), m, self.cfg.unpadded_vocab_size, s)?;
+        let mut b = vec![0u8; m * 4];
+        self.backend.memcpy_d2h_sync(&mut b, out.slice(0, m * 4), 0, s)?;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
+    /// After a verify of `m` rows of which `keep` are committed: rewinds every short conv of the
+    /// active lane to its state after `keep` rows (the KV of later positions is simply overwritten
+    /// by the next tokens).
+    pub fn verify_rewind(&mut self, m: usize, keep: usize) -> Result<()> {
+        if keep >= m {
+            return Ok(());
+        }
+        let lane = self.active_lane;
+        while self.rewind_tables.len() <= lane {
+            self.rewind_tables.push(None);
+        }
+        let n_log = self.layer_states.len();
+        if self.rewind_tables[lane].is_none() {
+            let kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
+            let h = self.cfg.hidden_size;
+            let mut words: Vec<u64> = Vec::with_capacity(n_log * 16);
+            for il in 0..n_log {
+                let st = &self.layer_states[il];
+                for (kind, state, dim) in [(0, st.sconv_k, kv), (1, st.sconv_v, kv), (2, st.sconv_attn, h), (3, st.sconv_mlp, h)] {
+                    words.push(self.backend.device_address(self.verify_hist_slice(il, kind))?);
+                    words.push(self.backend.device_address(state)?);
+                    words.push(dim as u64);
+                    words.push(0);
+                }
+            }
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let dev = self.backend.alloc_device(bytes.len())?;
+            let host = self.backend.alloc_pinned(bytes.len())?;
+            unsafe {
+                self.backend.pinned_as_mut_slice(host)?[..bytes.len()].copy_from_slice(&bytes);
+            }
+            let s = self.tide.compute_stream;
+            self.backend.memcpy_h2d_async(dev, 0, host, 0, bytes.len(), s)?;
+            self.backend.sync_stream(s)?;
+            self.backend.free_pinned(host)?;
+            self.rewind_tables[lane] = Some(dev);
+        }
+        let h = self.cfg.hidden_size;
+        self.backend.sconv_rewind(self.rewind_tables[lane].unwrap(), n_log * 4, h, keep, self.tide.compute_stream)
     }
 
     /// Samples row `i` of the last `forward_batch` with `lane`'s RNG.

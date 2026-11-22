@@ -583,6 +583,22 @@ pub trait ComputeBackend: Send + Sync {
         head_dim: usize, heads_per_row: usize, threshold: f32, tau: Option<(usize, f32, f32)>,
         stream: Stream) -> Result<()>;
 
+    /// `sconv_k4_rows` that also writes `hist` = `[3 + rows][dim]` (old state, then the inputs).
+    #[allow(clippy::too_many_arguments)]
+    fn sconv_k4_rows_hist(&self, out: DeviceBuf, state: DeviceBuf, x: DeviceBuf, weight: DeviceBuf,
+        dyn_taps: Option<DeviceBuf>, dim: usize, head_dim: usize, rows: usize, dyn_stride: usize,
+        hist: Option<DeviceBuf>, stream: Stream) -> Result<()>;
+
+    /// Rewinds short-conv states from their histories: `entries` = device `[n][4]` u64 (hist, state,
+    /// dim, 0); every state becomes the history rows `keep..keep+3`.
+    fn sconv_rewind(&self, entries: DeviceBuf, n: usize, max_dim: usize, keep: usize, stream: Stream) -> Result<()>;
+
+    /// Device address of `buf` (for pointer tables consumed by kernels).
+    fn device_address(&self, buf: DeviceBuf) -> Result<u64>;
+
+    /// Greedy argmax of `rows` rows of `n` f32: `out[r]` u32.
+    fn argmax_rows(&self, out: DeviceBuf, x: DeviceBuf, rows: usize, n: usize, stream: Stream) -> Result<()>;
+
     /// Causal k=4 short conv over `rows` consecutive tokens (continues and updates `state`).
     #[allow(clippy::too_many_arguments)]
     fn sconv_k4_rows(&self, out: DeviceBuf, state: DeviceBuf, x: DeviceBuf, weight: DeviceBuf,

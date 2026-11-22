@@ -148,11 +148,16 @@ extern "C" __global__ void smalltide_head_l2_clip_rows_f32(
 extern "C" __global__ void smalltide_sconv_k4_rows_f32(
     float* __restrict__ out, float* __restrict__ state, const float* __restrict__ x,
     const float* __restrict__ weight, const float* __restrict__ dyn, uint32_t dim, uint32_t head_dim,
-    uint32_t m_rows, uint32_t dyn_stride
+    uint32_t m_rows, uint32_t dyn_stride, float* __restrict__ hist
 ) {
     uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= dim) return;
     float s0 = state[c], s1 = state[dim + c], s2 = state[2u * dim + c];
+    if (hist != nullptr) {
+        // [3 + m_rows][dim]: the old state, then every input (speculative-verify rewind).
+        hist[c] = s0; hist[dim + c] = s1; hist[2u * dim + c] = s2;
+        for (uint32_t t = 0u; t < m_rows; ++t) hist[static_cast<size_t>(3u + t) * dim + c] = x[static_cast<size_t>(t) * dim + c];
+    }
     const float4 w = reinterpret_cast<const float4*>(weight)[c];
     uint32_t h = (head_dim > 0u) ? (c / head_dim) : 0u;
     for (uint32_t t = 0u; t < m_rows; ++t) {
@@ -1178,5 +1183,52 @@ extern "C" __global__ void smalltide_gemv_fp8_rows(
             float sum = wave32_sum(acc[m]);
             if (lane == 0u) y[static_cast<size_t>(m) * n_rows + row] = sum * sc;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Speculative-verify rewind: every short-conv state takes the 3 history rows that follow the
+// first `keep` inputs (state after `keep` of the verified rows).
+//   entries: [n][4] u64 = (hist ptr, state ptr, dim, unused).  Grid: (n, ceil(maxdim / 256)), Block: 256
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_sconv_rewind(const uint64_t* __restrict__ entries, uint32_t keep) {
+    const uint64_t* e = entries + static_cast<size_t>(blockIdx.x) * 4u;
+    const float* hist = reinterpret_cast<const float*>(e[0]);
+    float* state = reinterpret_cast<float*>(e[1]);
+    uint32_t dim = static_cast<uint32_t>(e[2]);
+    uint32_t c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c >= dim) return;
+    #pragma unroll
+    for (uint32_t i = 0u; i < 3u; ++i) state[static_cast<size_t>(i) * dim + c] = hist[static_cast<size_t>(keep + i) * dim + c];
+}
+
+// Greedy argmax of `rows` rows of `n` f32 each: out[r] = index (lowest on ties).  Grid: (rows), Block: 1024
+extern "C" __global__ void smalltide_argmax_rows(uint32_t* __restrict__ out, const float* __restrict__ x, uint32_t n) {
+    const float* row = x + static_cast<size_t>(blockIdx.x) * n;
+    float bv = -INFINITY;
+    uint32_t bi = 0xFFFFFFFFu;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = row[i];
+        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+    }
+    __shared__ float sv[32];
+    __shared__ uint32_t si[32];
+    for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_xor(bv, o, 32);
+        uint32_t oi = __shfl_xor(bi, o, 32);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    uint32_t w = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    if (l == 0u) { sv[w] = bv; si[w] = bi; }
+    __syncthreads();
+    if (w == 0u) {
+        bv = (l < (blockDim.x >> 5)) ? sv[l] : -INFINITY;
+        bi = (l < (blockDim.x >> 5)) ? si[l] : 0xFFFFFFFFu;
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor(bv, o, 32);
+            uint32_t oi = __shfl_xor(bi, o, 32);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (l == 0u) out[blockIdx.x] = bi;
     }
 }

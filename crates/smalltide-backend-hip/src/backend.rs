@@ -267,7 +267,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, moe_w2_rows)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_w2_rows)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -1733,10 +1733,36 @@ impl ComputeBackend for HipBackend {
     fn sconv_k4_rows(&self, out: DeviceBuf, state: DeviceBuf, x: DeviceBuf, weight: DeviceBuf,
         dyn_taps: Option<DeviceBuf>, dim: usize, head_dim: usize, rows: usize, dyn_stride: usize,
         stream: Stream) -> Result<()> {
+        self.sconv_k4_rows_hist(out, state, x, weight, dyn_taps, dim, head_dim, rows, dyn_stride, None, stream)
+    }
+
+    fn sconv_rewind(&self, entries: DeviceBuf, n: usize, max_dim: usize, keep: usize, stream: Stream) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let (mut a, mut k) = (self.dev_ptr(entries)?, keep as u32);
+        let mut args = [p(&mut a), p(&mut k)];
+        self.launch(self.kernels.sconv_rewind, (n as u32, (max_dim as u32).div_ceil(256), 1), 256, &mut args, stream, "launch(sconv_rewind)")
+    }
+
+    fn device_address(&self, buf: DeviceBuf) -> Result<u64> {
+        Ok(self.dev_ptr(buf)? as u64)
+    }
+
+    fn argmax_rows(&self, out: DeviceBuf, x: DeviceBuf, rows: usize, n: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut nn) = (self.dev_ptr(out)?, self.dev_ptr(x)?, n as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut nn)];
+        self.launch(self.kernels.argmax_rows, (rows as u32, 1, 1), 1024, &mut args, stream, "launch(argmax_rows)")
+    }
+
+    fn sconv_k4_rows_hist(&self, out: DeviceBuf, state: DeviceBuf, x: DeviceBuf, weight: DeviceBuf,
+        dyn_taps: Option<DeviceBuf>, dim: usize, head_dim: usize, rows: usize, dyn_stride: usize,
+        hist: Option<DeviceBuf>, stream: Stream) -> Result<()> {
         let (mut a, mut b, mut c, mut d, mut e) =
             (self.dev_ptr(out)?, self.dev_ptr(state)?, self.dev_ptr(x)?, self.dev_ptr(weight)?, self.opt_dev_ptr(dyn_taps)?);
         let (mut di, mut hd, mut m, mut ds) = (dim as u32, head_dim as u32, rows as u32, dyn_stride as u32);
-        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut di), p(&mut hd), p(&mut m), p(&mut ds)];
+        let mut hi = self.opt_dev_ptr(hist)?;
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut di), p(&mut hd), p(&mut m), p(&mut ds), p(&mut hi)];
         self.launch(self.kernels.sconv_k4_rows_f32, (di.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(sconv_k4_rows)")
     }
 

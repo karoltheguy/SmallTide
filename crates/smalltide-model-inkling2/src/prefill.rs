@@ -152,6 +152,10 @@ pub(crate) enum RowsMode<'a> {
     /// One decode token per row: `(lane, pos)`. Lane-specific state (KV caches, short-conv
     /// histories) is per row; everything weight-heavy runs once over all rows.
     Decode { rows: &'a [(usize, usize)] },
+    /// Speculative verify: up to 8 consecutive tokens of the active lane at `pos0..` (prefill
+    /// semantics: causal attention, sequential short convs) with decode-style device-side MoE
+    /// (no host sync), logits for every row, and short-conv histories for the rewind.
+    Verify { pos0: usize },
 }
 
 /// Row `r` of a `[m][n]` f32 buffer.
@@ -210,11 +214,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// logits buffer (`need_logits` ignored).
     pub(crate) fn rows_forward(&mut self, tokens: &[u32], mode: RowsMode, need_logits: bool) -> Result<()> {
         let pos0 = match mode {
-            RowsMode::Prefill { pos0 } => pos0,
+            RowsMode::Prefill { pos0 } | RowsMode::Verify { pos0 } => pos0,
             RowsMode::Decode { .. } => 0,
         };
-        let decode = matches!(mode, RowsMode::Decode { .. });
+        let verify = matches!(mode, RowsMode::Verify { .. });
+        let decode = matches!(mode, RowsMode::Decode { .. }) || verify;
         self.rows_decode = decode;
+        let capture = self.capture_taps && !matches!(mode, RowsMode::Decode { .. });
         let s = self.tide.compute_stream;
         let h = self.cfg.hidden_size;
         let eps = self.cfg.rms_norm_eps;
@@ -251,6 +257,15 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let mut nb = 0usize;
         let mut run = |eng: &mut Self, il: usize, ip: usize, nb: &mut usize, msgs: Option<DeviceBuf>| -> Result<()> {
             let routes = eng.prefill_layer(il, ip, mode, m, nb, msgs)?;
+            if capture {
+                // Drafter taps: entries of logical layers 5, 23, 41 = outputs of 4, 22, 40.
+                let slot = match il { 4 => Some(0usize), 22 => Some(1), 40 => Some(2), _ => None };
+                if let Some(t) = slot {
+                    let taps = eng.taps_buf.expect("taps buffer");
+                    let cur = eng.pf.as_ref().unwrap().cur;
+                    eng.backend.vec_copy(taps.slice(t * PREFILL_CHUNK * h * 4, m * h * 4), cur.slice(0, m * h * 4), m * h, s)?;
+                }
+            }
             if let (Some(dh), Some(dr)) = (dump_hidden.as_mut(), dump_routes.as_mut()) {
                 let mut hb = vec![0u8; m * h * 4];
                 let cur = eng.pf.as_ref().unwrap().cur;
@@ -317,6 +332,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let bv = Some(blocks.slice(0, nb * m * h * 4));
             self.backend.attn_res_mix_rows(moe_in, bv, cur, self.dense.output_res_query, nb, 1, h, eps, m, s)?;
             self.backend.rms_norm(moe_norm, moe_in, self.dense.final_norm, m, h, eps, s)?;
+            if capture {
+                let taps = self.taps_buf.expect("taps buffer");
+                self.backend.vec_copy(taps.slice(3 * PREFILL_CHUNK * h * 4, m * h * 4), moe_norm.slice(0, m * h * 4), m * h, s)?;
+            }
             let vocab = self.cfg.unpadded_vocab_size;
             let logits = self.batch_logits.expect("batch logits");
             self.backend.gemm_fp8_rows_decode(logits, moe_norm, self.dense.unembed_fp8.data, self.dense.unembed_fp8.row_scales, m, vocab, h, s)?;
@@ -325,7 +344,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             return Ok(());
         }
-        let logits_needed = need_logits || self.dump.is_some();
+        let logits_needed = need_logits || self.dump.is_some() || capture;
         if logits_needed {
             // Final mix + norm for all rows (cheap), lm_head for the last row only.
             let pf = self.pf.as_ref().unwrap();
@@ -333,6 +352,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let bv = Some(blocks.slice(0, nb * m * h * 4));
             self.backend.attn_res_mix_rows(moe_in, bv, cur, self.dense.output_res_query, nb, 1, h, eps, m, s)?;
             self.backend.rms_norm(moe_norm, moe_in, self.dense.final_norm, m, h, eps, s)?;
+            if capture {
+                let taps = self.taps_buf.expect("taps buffer");
+                self.backend.vec_copy(taps.slice(3 * PREFILL_CHUNK * h * 4, m * h * 4), moe_norm.slice(0, m * h * 4), m * h, s)?;
+            }
             if self.dump.is_some() {
                 for r in 0..m {
                     self.write_dump_final(pos0 + r, moe_norm.slice(r * h * 4, h * 4))?;
@@ -408,10 +431,18 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         nb: &mut usize,
         messages: Option<DeviceBuf>,
     ) -> Result<Vec<u32>> {
-        let (pos0, lanes) = match mode {
-            RowsMode::Prefill { pos0 } => (pos0, None),
-            RowsMode::Decode { rows } => (0, Some(rows)),
+        let (pos0, lanes, verify) = match mode {
+            RowsMode::Prefill { pos0 } => (pos0, None, false),
+            RowsMode::Verify { pos0 } => (pos0, None, true),
+            RowsMode::Decode { rows } => (0, Some(rows), false),
         };
+        // Verify: every short conv of this layer records its history (rewind after acceptance).
+        let hist_s: [Option<DeviceBuf>; 4] = if verify {
+            [0, 1, 2, 3].map(|k| Some(self.verify_hist_slice(il, k)))
+        } else {
+            [None; 4]
+        };
+        let hist = move |kind: usize| -> Option<DeviceBuf> { hist_s[kind] };
         let s = self.tide.compute_stream;
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -495,7 +526,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             None => None,
         };
         match lanes {
-            None => b.sconv_k4_rows(pf.k, st.sconv_k, pf.k_raw, layer.k_sconv_static, k_dyn, kv_dim, hd, m, taps, s)?,
+            None => b.sconv_k4_rows_hist(pf.k, st.sconv_k, pf.k_raw, layer.k_sconv_static, k_dyn, kv_dim, hd, m, taps, hist(0), s)?,
             Some(rows) => {
                 for (r, &(lane, _)) in rows.iter().enumerate() {
                     let ls = self.lane_layer_state(lane, il);
@@ -512,7 +543,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             None => None,
         };
         match lanes {
-            None => b.sconv_k4_rows(pf.v, st.sconv_v, pf.v_raw, layer.v_sconv_static, v_dyn, kv_dim, hd, m, taps, s)?,
+            None => b.sconv_k4_rows_hist(pf.v, st.sconv_v, pf.v_raw, layer.v_sconv_static, v_dyn, kv_dim, hd, m, taps, hist(1), s)?,
             Some(rows) => {
                 for (r, &(lane, _)) in rows.iter().enumerate() {
                     let ls = self.lane_layer_state(lane, il);
@@ -604,7 +635,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         b.gate_attn_sigmoid_mul(pf.attn_out, pf.attn_out, pf.gate_out, m * q_dim, s)?;
         self.mm_rows(pf.o_raw, pf.attn_out, &layer.wo, m, s)?;
         match lanes {
-            None => b.sconv_k4_rows(pf.sconv_tmp, st.sconv_attn, pf.o_raw, layer.attn_sconv, None, h, 0, m, 0, s)?,
+            None => b.sconv_k4_rows_hist(pf.sconv_tmp, st.sconv_attn, pf.o_raw, layer.attn_sconv, None, h, 0, m, 0, hist(2), s)?,
             Some(rows) => {
                 for (r, &(lane, _)) in rows.iter().enumerate() {
                     let ls = self.lane_layer_state(lane, il);
@@ -679,13 +710,52 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             return Ok(Vec::new());
         }
-        let ids = self.prefill_moe(ip, m)?;
+        let ids = if verify {
+            // Device-side multi-row MoE (as in batched decode), weighted sum per row into moe_out;
+            // the MLP short conv below then runs over the rows with history.
+            let pf = self.pf.as_ref().unwrap();
+            let is_mx = cfg.is_mxfp8_layer(ip);
+            let (pool, stride, dtype) = if is_mx {
+                (self.tide.vram_pool_mxfp8, self.tide.mxfp8_layout.aligned_slab_bytes, smalltide_core::DType::MXFP8)
+            } else {
+                (self.tide.vram_pool_nvfp4, self.tide.nvfp4_layout.aligned_slab_bytes, smalltide_core::DType::NVFP4)
+            };
+            let n_exp = cfg.n_routed_experts;
+            let slot_table = self.tide.gpu_slot_table.slice(ip * n_exp * 4, n_exp * 4);
+            let params = smalltide_core::backend::MoeDispatchParams {
+                batch_size: m,
+                hidden_size: h,
+                intermediate_size: cfg.intermediate_size,
+                top_k: cfg.num_experts_per_tok,
+                weight_dtype: dtype,
+                expert_stride_bytes: stride,
+            };
+            b.moe_decode_rows(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pool, slot_table, pf.route, m, params, s)?;
+            let log = self.batch_route_log.expect("batch route log");
+            b.vec_copy(log.slice(il * crate::engine::MAX_BATCH_ROWS * 64, m * 64), pf.route.slice(0, m * 64), m * 16, s)?;
+            for r in 0..m {
+                b.moe_decode_post(
+                    row(pf.moe_out, r, h),
+                    pf.moe_tmp.slice(r * 8 * h * 4, 8 * h * 4),
+                    slot_table,
+                    pf.route.slice(r * 64, 32),
+                    pf.route.slice(r * 64 + 32, 32),
+                    cfg.num_experts_per_tok,
+                    None,
+                    h,
+                    s,
+                )?;
+            }
+            Vec::new()
+        } else {
+            self.prefill_moe(ip, m)?
+        };
         b.seg_mark("pf: moe post", s);
 
         let pf = self.pf.as_ref().unwrap();
         let st = &self.layer_states[il];
         let layer = &self.dense.layers[ip];
-        b.sconv_k4_rows(pf.sconv_tmp, st.sconv_mlp, pf.moe_out, layer.mlp_sconv, None, h, 0, m, 0, s)?;
+        b.sconv_k4_rows_hist(pf.sconv_tmp, st.sconv_mlp, pf.moe_out, layer.mlp_sconv, None, h, 0, m, 0, hist(3), s)?;
         b.vec_add(pf.cur, pf.ffn_inp, pf.sconv_tmp, m * h, s)?;
         Ok(ids)
     }

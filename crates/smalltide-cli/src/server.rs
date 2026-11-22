@@ -72,8 +72,14 @@ enum StreamEvent {
     Error(String),
 }
 
-/// `max_tokens` when a request gives none (48K; the lane's context still bounds it).
-const UNLIMITED_TOKENS: usize = 48 * 1024;
+/// `max_tokens` when a request gives none: `SMALLTIDE_MAX_TOKENS` (default 48K); the lane's
+/// context still bounds it.
+fn default_max_tokens() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SMALLTIDE_MAX_TOKENS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(48 * 1024)
+    })
+}
 
 enum EngineCommand {
     Generate {
@@ -1096,7 +1102,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
             };
             // No limit given: like OpenAI, generate until the answer ends or the lane's context is
             // full (a thinking model can spend hundreds of tokens before its answer starts).
-            let max_tokens = req.max_completion_tokens.or(req.max_tokens).unwrap_or(UNLIMITED_TOKENS);
+            let max_tokens = req.max_completion_tokens.or(req.max_tokens).unwrap_or(default_max_tokens());
             let sampling = SamplingParams {
                 temperature: req.temperature.unwrap_or(0.6),
                 top_p: req.top_p.unwrap_or(0.95),
@@ -1323,7 +1329,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     .to_string(),
                 _ => String::new(),
             };
-            let max_tokens = req.max_tokens.unwrap_or(UNLIMITED_TOKENS);
+            let max_tokens = req.max_tokens.unwrap_or(default_max_tokens());
             let sampling = SamplingParams {
                 temperature: req.temperature.unwrap_or(0.6),
                 top_p: req.top_p.unwrap_or(0.95),

@@ -1365,6 +1365,17 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         Ok(())
     }
 
+    /// Writes `tok{pos}.final.bin`: the final normed hidden (`[H]` f32, the lm_head input) of
+    /// position `pos` - the drafter's last tap.
+    pub(crate) fn write_dump_final(&self, pos: usize, row: DeviceBuf) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        let mut hb = vec![0u8; h * 4];
+        self.backend.memcpy_d2h_sync(&mut hb, row.slice(0, h * 4), 0, self.tide.compute_stream)?;
+        let d = self.dump.as_ref().unwrap();
+        std::fs::write(d.dir.join(format!("tok{pos}.final.bin")), hb)
+            .map_err(|e| smalltide_core::SmallTideError::Backend { backend: "dump", message: e.to_string() })
+    }
+
     /// Writes `tok{pos}.bin`: magic, pos, token, num_logical, hidden, has_logits, then
     /// `[num_logical][hidden]` f32 layer outputs, `[num_logical][8]` u32 routed ids and
     /// optionally `[unpadded_vocab]` f32 logits.
@@ -1565,6 +1576,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             eps,
             s,
         )?;
+        if self.dump.is_some() {
+            self.write_dump_final(pos, self.scratch.moe_norm)?;
+        }
         // Compute only the unpadded 200,058 vocab rows (skipping 966 padded rows!)
         self.backend.gemv_fp8(
             self.scratch.logits,

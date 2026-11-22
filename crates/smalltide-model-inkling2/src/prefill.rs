@@ -333,6 +333,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let bv = Some(blocks.slice(0, nb * m * h * 4));
             self.backend.attn_res_mix_rows(moe_in, bv, cur, self.dense.output_res_query, nb, 1, h, eps, m, s)?;
             self.backend.rms_norm(moe_norm, moe_in, self.dense.final_norm, m, h, eps, s)?;
+            if self.dump.is_some() {
+                for r in 0..m {
+                    self.write_dump_final(pos0 + r, moe_norm.slice(r * h * 4, h * 4))?;
+                }
+            }
             let last = moe_norm.slice((m - 1) * h * 4, h * 4);
             self.backend.gemv_fp8(
                 self.scratch.logits,

@@ -89,6 +89,12 @@ enum EngineCommand {
     GetStats {
         reply_tx: Sender<Value>,
     },
+    /// Expert map snapshot as JSON (`with_text`: include the routed tokens' text).
+    ExpertMap {
+        ask: crate::expert_map::Ask,
+        with_text: bool,
+        reply_tx: Sender<Value>,
+    },
     UpdateConfig {
         rescue_policy: RescuePolicy,
         reply_tx: Sender<Value>,
@@ -492,6 +498,13 @@ fn engine_worker_loop(
         }
         for cmd in cmds {
             match cmd {
+                EngineCommand::ExpertMap { ask, with_text, reply_tx } => {
+                    let busy = !queue.is_empty() || active.iter().any(|a| a.is_some());
+                    let m = engine.expert_map(busy, ask.since);
+                    let text = |id: u32| tok.decode(&[id]);
+                    let v = crate::expert_map::json(&m, SERVED_MODEL_NAME, "inkling2", &ask, with_text.then_some(&text as &dyn Fn(u32) -> String));
+                    let _ = reply_tx.send(v);
+                }
                 EngineCommand::GetStats { reply_tx } => {
                     let tel = engine.telemetry();
                     let (pre, core, coda) = engine.tide.scheduler.cache.count_vram_resident();
@@ -912,6 +925,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
     }
     let method = parts[0];
     let path = parts[1].split('?').next().unwrap_or("/");
+    let query = parts[1].split_once('?').map(|(_, q)| q).unwrap_or("");
 
     let mut content_length = 0usize;
     let mut line = String::new();
@@ -958,6 +972,53 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 }]
             });
             write_json_response(&mut stream, "200 OK", &resp);
+        }
+        ("GET", "/expert-map") => {
+            let page = crate::expert_map::PAGE;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                page.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(page.as_bytes());
+            let _ = stream.flush();
+        }
+        ("GET", "/v1/expert-map") => {
+            // Token text only to this machine: the server has no API keys and may listen on the LAN.
+            let local = stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false);
+            let ask = crate::expert_map::Ask::parse(query);
+            let (tx, rx) = mpsc::channel();
+            static LAST: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+            if cmd_tx.send(EngineCommand::ExpertMap { ask, with_text: local, reply_tx: tx }).is_err() {
+                write_json_response(&mut stream, "503 Service Unavailable", &json!({"error": "the engine is not running"}));
+                return;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+                Ok(v) => {
+                    let mut kept = v.clone();
+                    if let Some(rs) = kept["routes"].as_array_mut() {
+                        for r in rs {
+                            r["token"] = Value::Null;
+                        }
+                    }
+                    kept["tokens_shown"] = false.into();
+                    *LAST.lock().unwrap() = Some(kept);
+                    write_json_response(&mut stream, "200 OK", &v);
+                }
+                Err(_) => match LAST.lock().unwrap().clone() {
+                    // The engine is inside a long step (a prefill): the last snapshot, marked old.
+                    Some(mut v) => {
+                        v["stale"] = true.into();
+                        v["busy"] = true.into();
+                        v["routes"] = json!([]);
+                        v["events"] = json!([]);
+                        v["route_seq"] = ask.since.into();
+                        v["event_seq"] = ask.events_since.into();
+                        write_json_response(&mut stream, "200 OK", &v);
+                    }
+                    None => write_json_response(&mut stream, "503 Service Unavailable", &json!({"error": "the engine is busy: no snapshot yet"})),
+                },
+            }
         }
         ("GET", "/v1/tide/stats") => {
             let (tx, rx) = mpsc::channel();

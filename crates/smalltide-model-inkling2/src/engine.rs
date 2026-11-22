@@ -186,6 +186,11 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     wait_flags: Option<(DeviceBuf, PinnedBuf)>,
     wait_ticket: u32,
     pending_checks: Vec<usize>,
+    /// Expert map: the decoded tokens' routing (host copies of what the engine already read back),
+    /// the last single-token decode's (lane, pos, token) and the last batched round's rows.
+    pub routes: smalltide_tide::expert_map::RouteLog,
+    map_last_tok: Option<(usize, usize, u32)>,
+    map_batch_rows: Vec<(usize, usize, u32)>,
     pub(crate) route_log_inflight: bool,
     /// A post-decode Tide step deferred into the next forward (see `post_decode_tide_step`).
     pub(crate) tide_step_pending: bool,
@@ -422,6 +427,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             wait_flags: None,
             wait_ticket: 0,
             pending_checks: Vec::new(),
+            routes: smalltide_tide::expert_map::RouteLog::default(),
+            map_last_tok: None,
+            map_batch_rows: Vec::new(),
             last_tap_rows: 0,
             batch_rows_run: 0,
             dev_rounds: 0,
@@ -713,6 +721,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        if let Some((lane, pos, token)) = self.map_last_tok.take().filter(|_| !self.route_log_is_prefill) {
+            let picks = self.route_picks(&words, num_logical, 0, ROUTE_WORDS);
+            self.routes.push(lane, pos, token, 8, picks);
+        }
         for il in 0..num_logical {
             if self.layer_planned[il] {
                 continue;
@@ -821,6 +833,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// Missing experts are skipped (no rescue in batched rounds). Then sample each row with
     /// `sample_batch_row` and call `post_batch_tide_step`.
     pub fn forward_batch(&mut self, rows: &[(usize, u32, usize)]) -> Result<()> {
+        self.map_batch_rows = rows.iter().map(|&(lane, tok, pos)| (lane, pos, tok)).collect();
         let m = rows.len();
         if m == 0 || m > MAX_BATCH_ROWS {
             return Err(smalltide_core::SmallTideError::Backend {
@@ -1008,6 +1021,78 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         Ok(())
     }
 
+    /// One token's picks over the logical layers from routing-log words (`off` its first word in
+    /// layer 0, `stride` words a layer): (expert, share of the layer's routing weight, missed =
+    /// not resident in VRAM now).
+    fn route_picks(&self, words: &[u32], n_log: usize, off: usize, stride: usize) -> Vec<(u16, f32, bool)> {
+        let mut picks = Vec::with_capacity(n_log * 8);
+        for il in 0..n_log {
+            let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
+            let w = &words[il * stride + off..il * stride + off + 16];
+            let tot: f32 = (0..8).map(|k| f32::from_bits(w[8 + k])).sum();
+            let inv = if tot > 1e-8 { 1.0 / tot } else { 0.0 };
+            for k in 0..8 {
+                let e = w[k] as u16;
+                let missed = !self.tide.scheduler.cache.is_vram_hit(smalltide_core::ExpertId { layer: phys, expert: e });
+                picks.push((e, f32::from_bits(w[8 + k]) * inv, missed));
+            }
+        }
+        picks
+    }
+
+    /// The residency as the expert map shows it: one row per logical layer (the loop core's
+    /// physical layers appear once per pass), host bookkeeping only. `since`: only routes newer
+    /// than this sequence number are copied.
+    pub fn expert_map(&self, busy: bool, since: u64) -> smalltide_tide::expert_map::ExpertMap {
+        use smalltide_tide::expert_map::{ExpertMap, HOT, LOADING, RESIDENT};
+        let cache = &self.tide.scheduler.cache;
+        let e = self.cfg.n_routed_experts;
+        let n_log = self.layer_planned.len();
+        let layers: Vec<usize> = (0..n_log).collect();
+        let mut state = Vec::with_capacity(n_log * e);
+        let mut demand = Vec::with_capacity(n_log * e);
+        for il in 0..n_log {
+            let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
+            for x in 0..e {
+                let id = smalltide_core::ExpertId { layer: phys, expert: x as u16 };
+                let en = cache.entry(id);
+                state.push(if cache.is_vram_pending(id) {
+                    LOADING
+                } else if !en.vram_slot.is_missing() && en.is_scratch_slot {
+                    HOT
+                } else if cache.is_vram_hit(id) {
+                    RESIDENT
+                } else {
+                    0
+                });
+                demand.push(cache.value(id).max(0.0));
+            }
+        }
+        let t = &self.tide.scheduler.telemetry;
+        let counters = vec![
+            ("experts moved", t.stage1_async_promotions as f64),
+            ("inline rescues", t.stage1_sync_rescues as f64),
+            ("skipped experts", t.stage1_skipped_tail_misses as f64),
+            ("prompt-aware swaps", t.prompt_aware_swaps as f64),
+            ("disk reads", t.stage2_disk_reads as f64),
+        ];
+        let (n4, m8) = self.tide.pool_slots();
+        let routes = self.routes.recent(6.0, 400).into_iter().filter(|r| r.seq > since).collect();
+        ExpertMap {
+            layers,
+            experts: e,
+            state,
+            demand: Some(demand),
+            slots: n4 + m8,
+            spare: smalltide_tide::runtime::DEFAULT_SCRATCH_RING_SLOTS * 2,
+            world: 1,
+            busy,
+            counters,
+            events: self.tide.scheduler.events.recent(6.0, 4000),
+            routes,
+        }
+    }
+
     /// Dev: redirect the per-token dump (`SMALLTIDE_DUMP_DIR`) to `dir`.
     pub fn set_dump_dir(&mut self, dir: std::path::PathBuf) {
         if let Some(d) = self.dump.as_mut() {
@@ -1056,6 +1141,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.run_deferred_tide_step()?;
         let published = self.tide.poll_pending()?;
         self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+        self.map_batch_rows = tokens.iter().enumerate().map(|(i, &t)| (self.active_lane, pos0 + i, t)).collect();
         self.rows_forward(tokens, crate::prefill::RowsMode::Verify { pos0 }, true)?;
         if self.capture_taps {
             self.drafter_ingest(pos0, m)?;
@@ -1145,6 +1231,14 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let word = |i: usize| u32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]);
         let run = std::mem::take(&mut self.batch_rows_run).max(m);
         self.dev_rounds += 1;
+        {
+            let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let rows = std::mem::take(&mut self.map_batch_rows);
+            for (r, &(lane, pos, tok)) in rows.iter().enumerate().take(m) {
+                let picks = self.route_picks(&words, n_log, r * 16, MAX_BATCH_ROWS * 16);
+                self.routes.push(lane, pos, tok, 8, picks);
+            }
+        }
         for il in 0..n_log {
             let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
             let mut seen: Vec<u16> = Vec::with_capacity(64);
@@ -1850,6 +1944,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.layer_planned.iter_mut().for_each(|p| *p = false);
         self.layer_deferred.iter_mut().for_each(|p| *p = false);
         self.dump_token = (token_id, pos);
+        self.map_last_tok = (!is_prefill).then_some((self.active_lane, pos, token_id));
 
         self.backend.seg_mark("token_start(embed,tables)", s);
         // 0. Host RAM BF16 Embedding Lookup -> Pinned -> GPU -> Embed RMSNorm

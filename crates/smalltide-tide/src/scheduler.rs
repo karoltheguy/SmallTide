@@ -71,6 +71,11 @@ pub struct TideScheduler {
     /// from the policy's gate.
     pub loop_core_gate: Option<f32>,
     rescues_this_token: usize,
+    /// Residency events for the expert map (host bookkeeping; decides nothing).
+    pub events: crate::expert_map::EventLog,
+    /// Kind / routing share the next logged transfers get (set by each planner; 0 = not logged).
+    event_kind: u8,
+    event_share: f32,
 }
 
 impl TideScheduler {
@@ -100,6 +105,9 @@ impl TideScheduler {
             rescue_budget: 4,
             loop_core_gate: None,
             rescues_this_token: 0,
+            events: crate::expert_map::EventLog::default(),
+            event_kind: 0,
+            event_share: 0.0,
         }
     }
 
@@ -140,6 +148,7 @@ impl TideScheduler {
     /// 2) Fill remaining VRAM with outer-layer experts (sorted by optional frequency priors).
     /// 3) Warm Tier 1 RAM with remaining unpinned outer-layer experts up to `ram_budget_bytes`.
     pub fn plan_pre_prefill(&mut self, priors: Option<&[f32]>) -> Vec<TransferOp> {
+        self.event_kind = 0; // the boot placement is not an event
         if !self.tide_cfg.preload_before_prefill {
             return Vec::new();
         }
@@ -276,6 +285,8 @@ impl TideScheduler {
     /// Promotes the hottest prompt-activated non-resident experts into VRAM (and RAM if on disk)
     /// in one high-throughput burst before token 1 decodes.
     pub fn plan_prefill_decode_rebalance(&mut self, max_swaps: usize) -> Vec<TransferOp> {
+        self.event_kind = crate::expert_map::EV_ADAPT;
+        self.event_share = 0.0;
         if !self.tide_cfg.preload_prefill_decode_boundary {
             self.prefill_scores.fill(0.0);
             return Vec::new();
@@ -342,6 +353,8 @@ impl TideScheduler {
     /// Between prefill chunks: async swaps for the missing experts this prompt has routed to so
     /// far (its heat already holds the prompt's demand).
     pub fn plan_prefill_progress_swaps(&mut self, max_swaps: usize) -> Vec<TransferOp> {
+        self.event_kind = crate::expert_map::EV_ADAPT;
+        self.event_share = 0.0;
         let cands: Vec<ExpertId> = self
             .prefill_scores
             .iter()
@@ -356,6 +369,8 @@ impl TideScheduler {
     /// previous turn, sum of routing shares per expert): adds it as heat, then plans async swaps for
     /// the missing experts it covers.
     pub fn plan_anticipated_swaps(&mut self, demand: &[f32], max_swaps: usize) -> Vec<TransferOp> {
+        self.event_kind = crate::expert_map::EV_PRELOAD;
+        self.event_share = 0.0;
         let mut cands = Vec::new();
         for (i, &d) in demand.iter().enumerate() {
             if d > 0.0 {
@@ -482,6 +497,7 @@ impl TideScheduler {
             };
 
             if should_sync_rescue {
+                self.event_share = norm_w;
                 // If hot enough (or free space exists), promote into a resident VRAM slot;
                 // otherwise use the transient Scratch Rescue Ring so cold 1-off misses
                 // never thrash warm resident experts!
@@ -571,6 +587,8 @@ impl TideScheduler {
     /// Emits up to `max_async_ram_promotions_per_token` Stage 2 (Disk->RAM) ops and
     /// `max_async_vram_promotions_per_token` Stage 1 (RAM->VRAM) ops.
     pub fn plan_async_step(&mut self) -> Vec<TransferOp> {
+        self.event_kind = crate::expert_map::EV_HOT;
+        self.event_share = 0.0;
         self.cache.advance_step();
         let mut ops = Vec::new();
 
@@ -662,6 +680,7 @@ impl TideScheduler {
     /// Every `interval_tokens` during long generations (or when `force = true` at request end),
     /// swaps any non-VRAM experts whose live EWMA heat beats the coldest non-pinned VRAM slot
     /// by >= 25% hysteresis.
+    #[allow(clippy::too_many_arguments)]
     pub fn maybe_periodic_rebalance(
         &mut self,
         decoded_tokens: u64,
@@ -669,6 +688,8 @@ impl TideScheduler {
         max_swaps: usize,
         force: bool,
     ) -> Vec<TransferOp> {
+        self.event_kind = crate::expert_map::EV_ADAPT;
+        self.event_share = 0.0;
         if !force && (interval_tokens == 0 || decoded_tokens == 0 || decoded_tokens % interval_tokens != 0) {
             return Vec::new();
         }
@@ -791,6 +812,22 @@ impl TideScheduler {
                 }
                 self.telemetry.stage1_sync_rescues += 1;
                 self.telemetry.stage1_bytes_transferred += b;
+            }
+        }
+        // Expert map: what came into VRAM, why, and whose slot it took.
+        let kind = if is_sync_rescue { crate::expert_map::EV_RESCUE } else { self.event_kind };
+        let ev = match *op {
+            TransferOp::RamToVram { expert, evicted_from_vram, .. } | TransferOp::DiskToVramDirect { expert, evicted_from_vram, .. } => {
+                Some((expert, kind, evicted_from_vram))
+            }
+            // a transient scratch slot: used for its pass, not kept
+            TransferOp::ScratchRescue { expert, .. } => Some((expert, crate::expert_map::EV_DROPPED, None)),
+            TransferOp::DiskToRam { .. } => None,
+        };
+        if let Some((e, k, victim)) = ev {
+            if k != 0 {
+                self.events.push(e.layer.0 as usize, e.expert as usize, k, self.event_share,
+                    victim.map(|v| (v.layer.0 as usize, v.expert as usize)));
             }
         }
     }

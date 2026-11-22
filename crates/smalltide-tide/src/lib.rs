@@ -6,6 +6,7 @@
 
 pub mod batch;
 pub mod cache;
+pub mod expert_map;
 pub mod io_worker;
 pub mod paged_kv;
 pub mod priors;

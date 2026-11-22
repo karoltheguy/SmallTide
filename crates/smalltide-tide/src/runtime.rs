@@ -431,6 +431,36 @@ impl<B: ComputeBackend> TideExecutor<B> {
                 .stream_wait_event(self.copy_stream, self.compute_fence)?;
         }
 
+        let batch = self.issue_ops(ops, async_disk_io)?;
+
+        if !writes_vram {
+            return Ok(());
+        }
+        if sync_compute_after {
+            // Copy stream is in-order: waiting on its latest event covers every earlier async batch
+            // too, so everything pending can be published.
+            self.backend.record_event(self.dma_event, self.copy_stream)?;
+            self.backend
+                .stream_wait_event(self.compute_stream, self.dma_event)?;
+            while let Some((ev, _)) = self.pending_batches.pop_front() {
+                self.free_events.push(ev);
+            }
+            self.scheduler.cache.publish_all_pending();
+            self.upload_table_on_compute()?;
+        } else if !batch.is_empty() {
+            let ev = match self.free_events.pop() {
+                Some(e) => e,
+                None => self.backend.create_event()?,
+            };
+            self.backend.record_event(ev, self.copy_stream)?;
+            self.pending_batches.push_back((ev, batch));
+        }
+        Ok(())
+    }
+
+    /// Issues the copies of `ops` (Stage 2 reads, slab uploads on the copy stream); returns the
+    /// (expert, slot) pairs written into VRAM.
+    fn issue_ops(&mut self, ops: &[TransferOp], async_disk_io: bool) -> Result<Vec<(ExpertId, SlotIndex)>> {
         let mut batch: Vec<(ExpertId, SlotIndex)> = Vec::new();
         for op in ops {
             match *op {
@@ -509,30 +539,25 @@ impl<B: ComputeBackend> TideExecutor<B> {
                 }
             }
         }
+        Ok(batch)
+    }
 
-        if !writes_vram {
-            return Ok(());
+    /// Synchronous rescue while the compute stream is parked at a GPU-side wait right before the
+    /// layer that needs it (every earlier kernel finished, no later one started): the slab copies
+    /// and the table upload go on the copy stream and the host waits for them, so no compute-side
+    /// fence is needed (it would deadlock behind the parked stream). With no ops: publishes what
+    /// is pending (an in-flight async promotion of a picked expert).
+    pub fn execute_rescue_now(&mut self, ops: &[TransferOp]) -> Result<()> {
+        self.allocate_pools()?;
+        let _ = self.issue_ops(ops, false)?;
+        // The copy stream is in order: once it is idle, every earlier async batch landed too.
+        self.backend.sync_stream(self.copy_stream)?;
+        while let Some((ev, _)) = self.pending_batches.pop_front() {
+            self.free_events.push(ev);
         }
-        if sync_compute_after {
-            // Copy stream is in-order: waiting on its latest event covers every earlier async batch
-            // too, so everything pending can be published.
-            self.backend.record_event(self.dma_event, self.copy_stream)?;
-            self.backend
-                .stream_wait_event(self.compute_stream, self.dma_event)?;
-            while let Some((ev, _)) = self.pending_batches.pop_front() {
-                self.free_events.push(ev);
-            }
-            self.scheduler.cache.publish_all_pending();
-            self.upload_table_on_compute()?;
-        } else if !batch.is_empty() {
-            let ev = match self.free_events.pop() {
-                Some(e) => e,
-                None => self.backend.create_event()?,
-            };
-            self.backend.record_event(ev, self.copy_stream)?;
-            self.pending_batches.push_back((ev, batch));
-        }
-        Ok(())
+        self.scheduler.cache.publish_all_pending();
+        self.upload_table_on(self.copy_stream)?;
+        self.backend.sync_stream(self.copy_stream)
     }
 
     /// Frees the Scratch Rescue Ring for direct use (unmaps occupants on the compute stream).
@@ -665,6 +690,11 @@ impl<B: ComputeBackend> TideExecutor<B> {
     /// Uploads the published 12 KB GPU indirection table on the **compute stream** from a
     /// dedicated pinned buffer (Invariant 1). Clears the cache's dirty set.
     pub fn upload_table_on_compute(&mut self) -> Result<()> {
+        self.upload_table_on(self.compute_stream)
+    }
+
+    /// `upload_table_on_compute` on `stream`.
+    pub fn upload_table_on(&mut self, stream: Stream) -> Result<()> {
         let _ = self.scheduler.cache.take_dirty_gpu_updates();
         let byte_len = self.scheduler.cache.gpu_slot_table().len() * 4;
         let i = self.table_ring_cursor;
@@ -686,10 +716,9 @@ impl<B: ComputeBackend> TideExecutor<B> {
             self.table_ring[i].pinned,
             0,
             byte_len,
-            self.compute_stream,
+            stream,
         )?;
-        self.backend
-            .record_event(self.table_ring[i].done, self.compute_stream)?;
+        self.backend.record_event(self.table_ring[i].done, stream)?;
         self.table_ring[i].used = true;
         Ok(())
     }

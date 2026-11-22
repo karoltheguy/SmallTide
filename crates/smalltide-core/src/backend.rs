@@ -227,6 +227,12 @@ pub trait ComputeBackend: Send + Sync {
     /// Pinned host memory that kernels can read/write directly over PCIe (zero-copy): returns a
     /// `DeviceBuf` view for kernels and the owning `PinnedBuf` for host access. Free the
     /// `PinnedBuf` (the `DeviceBuf` view is released with `free_device`).
+    /// GPU-side wait: `stream` stalls until the u32 at `flag` (device view of mapped host memory)
+    /// is >= `value`. Unsupported backends return an error.
+    fn stream_wait_value_ge(&self, _stream: Stream, _flag: DeviceBuf, _value: u32) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("stream wait value".into()))
+    }
+
     fn alloc_host_mapped(&self, _size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {
         Err(crate::SmallTideError::Unsupported("host-mapped memory".into()))
     }

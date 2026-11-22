@@ -47,6 +47,7 @@ type FnHipEventDestroy = unsafe extern "C" fn(HipEvent) -> HipError;
 type FnHipEventRecord = unsafe extern "C" fn(HipEvent, HipStream) -> HipError;
 type FnHipEventSynchronize = unsafe extern "C" fn(HipEvent) -> HipError;
 type FnHipEventQuery = unsafe extern "C" fn(HipEvent) -> HipError;
+type FnHipStreamWaitValue32 = unsafe extern "C" fn(HipStream, *mut c_void, u32, u32, u32) -> HipError;
 type FnHipEventElapsedTime = unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> HipError;
 type FnHipMemcpy = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> HipError;
 type FnHipMemcpyAsync =
@@ -231,6 +232,8 @@ pub struct HipRuntime {
     pub hip_event_record: FnHipEventRecord,
     pub hip_event_synchronize: FnHipEventSynchronize,
     pub hip_event_query: FnHipEventQuery,
+    /// Optional (older runtimes may lack it): GPU-side wait on a 32-bit value in memory.
+    pub hip_stream_wait_value32: Option<FnHipStreamWaitValue32>,
     pub hip_event_elapsed_time: FnHipEventElapsedTime,
     pub hip_memcpy: FnHipMemcpy,
     pub hip_memcpy_async: FnHipMemcpyAsync,
@@ -315,6 +318,7 @@ impl HipRuntime {
             hip_event_record: load_sym!(b"hipEventRecord\0", FnHipEventRecord),
             hip_event_synchronize: load_sym!(b"hipEventSynchronize\0", FnHipEventSynchronize),
             hip_event_query: load_sym!(b"hipEventQuery\0", FnHipEventQuery),
+            hip_stream_wait_value32: unsafe { lib.get::<FnHipStreamWaitValue32>(b"hipStreamWaitValue32\0").ok().map(|f| *f) },
             hip_event_elapsed_time: load_sym!(b"hipEventElapsedTime\0", FnHipEventElapsedTime),
             hip_memcpy: load_sym!(b"hipMemcpy\0", FnHipMemcpy),
             hip_memcpy_async: load_sym!(b"hipMemcpyAsync\0", FnHipMemcpyAsync),

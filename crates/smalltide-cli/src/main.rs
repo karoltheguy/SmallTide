@@ -839,6 +839,56 @@ fn run_generate(args: &[String]) {
         .sample_next_token(&sampling, &generated)
         .expect("sample first token");
 
+    if std::env::var_os("SMALLTIDE_WAITVALUE_TEST").is_some() {
+        // Dev: does a GPU-side wait on a host-written flag work, and what does a release cost?
+        let s = engine.tide.compute_stream;
+        let (view, host) = backend.alloc_host_mapped(64).expect("mapped");
+        let scratch = backend.alloc_device(1 << 20).expect("scratch");
+        let flag = |v: u32| unsafe {
+            let p = backend.pinned_as_mut_slice(host).unwrap().as_mut_ptr() as *mut u32;
+            std::ptr::write_volatile(p, v);
+        };
+        flag(0);
+        let ev = backend.create_event().expect("event");
+        backend.zero_f32(scratch, 1 << 18, s).expect("k1");
+        match backend.stream_wait_value_ge(s, view.slice(0, 4), 1) {
+            Ok(()) => println!("[waitvalue] hipStreamWaitValue32 accepted"),
+            Err(e) => { println!("[waitvalue] not available: {e}"); return; }
+        }
+        backend.zero_f32(scratch, 1 << 18, s).expect("k2");
+        backend.record_event(ev, s).expect("rec");
+        let _ = backend.query_event(ev); // submit
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let blocked = !backend.query_event(ev).expect("q");
+        let t0 = Instant::now();
+        flag(1);
+        while !backend.query_event(ev).expect("q") { std::hint::spin_loop(); }
+        println!("[waitvalue] GPU waited for the flag: {blocked}; release -> done {:.1} us", t0.elapsed().as_secs_f64() * 1e6);
+        // Throughput: N waits queued up front, released one by one as the host sees progress.
+        let n = 200u32;
+        flag(0);
+        let t0 = Instant::now();
+        for i in 1..=n {
+            backend.zero_f32(scratch, 1 << 12, s).expect("k");
+            backend.stream_wait_value_ge(s, view.slice(0, 4), i).expect("wait");
+        }
+        backend.zero_f32(scratch, 1 << 12, s).expect("k");
+        backend.record_event(ev, s).expect("rec");
+        let _ = backend.query_event(ev);
+        let t_enq = t0.elapsed().as_secs_f64() * 1e3;
+        let t1 = Instant::now();
+        for i in 1..=n { flag(i); }
+        while !backend.query_event(ev).expect("q") { std::hint::spin_loop(); }
+        println!("[waitvalue] {n} waits: enqueue {t_enq:.2} ms, drain after releases {:.3} ms ({:.1} us per wait)",
+            t1.elapsed().as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e6 / n as f64);
+        // Same chain without waits (reference).
+        let t2 = Instant::now();
+        for _ in 0..=n { backend.zero_f32(scratch, 1 << 12, s).expect("k"); }
+        backend.sync_stream(s).expect("sync");
+        println!("[waitvalue] {} kernels without waits: {:.3} ms", n + 1, t2.elapsed().as_secs_f64() * 1e3);
+        return;
+    }
+
     if let Some(iters) = std::env::var("SMALLTIDE_DRAFT_BENCH").ok().and_then(|v| v.parse::<usize>().ok()) {
         // Dev: the drafter alone (anchor = first sampled token at the prompt end), wall time per
         // draft for 1..7 drafts, then a per-kernel table for 7 drafts.

@@ -623,6 +623,14 @@ impl ComputeBackend for HipBackend {
         Ok(())
     }
 
+    fn stream_wait_value_ge(&self, stream: Stream, flag: DeviceBuf, value: u32) -> Result<()> {
+        const HIP_STREAM_WAIT_VALUE_GTE: u32 = 0x0;
+        let f = self.rt.hip_stream_wait_value32.ok_or_else(|| SmallTideError::Unsupported("hipStreamWaitValue32".into()))?;
+        let s = self.raw_stream(stream)?;
+        let ptr = self.dev_ptr(flag)?;
+        unsafe { check_hip(f(s, ptr, value, HIP_STREAM_WAIT_VALUE_GTE, 0xFFFF_FFFF), "hipStreamWaitValue32") }
+    }
+
     fn alloc_host_mapped(&self, size_bytes: usize) -> Result<(DeviceBuf, PinnedBuf)> {
         self.bind();
         const HIP_HOST_MALLOC_PORTABLE: u32 = 0x1;

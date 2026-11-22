@@ -636,7 +636,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             0
         };
         let total = target_total + drafter_total;
-        if snap.as_ref().map_or(true, |x| x.host.size_bytes < total) {
+        let oversized = |sz: usize| sz > total.saturating_mul(2).saturating_add(64 << 20);
+        if snap.as_ref().map_or(true, |x| x.host.size_bytes < total || oversized(x.host.size_bytes)) {
             if let Some(old) = snap.take() {
                 self.backend.sync_stream(s)?;
                 self.backend.free_pinned(old.host)?;
@@ -675,6 +676,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 }
             }
         }
+        // Complete the batched D2H transfers before subsequent prefill kernels launch so WDDM does
+        // not accumulate hundreds of megabytes of DMA packets behind compute work.
+        self.backend.sync_stream(s)?;
         Ok(())
     }
 
@@ -718,6 +722,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 }
             }
         }
+        self.backend.sync_stream(s)?;
         Ok(())
     }
 
@@ -725,6 +730,19 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     pub fn free_snapshot(&mut self, snap: SeqSnapshot) -> Result<()> {
         self.backend.sync_stream(self.tide.compute_stream)?;
         self.backend.free_pinned(snap.host)
+    }
+
+    /// Frees a batch of snapshot pinned buffers, syncing the compute stream once if non-empty.
+    pub fn free_snapshots(&mut self, snaps: impl IntoIterator<Item = SeqSnapshot>) -> Result<()> {
+        let mut iter = snaps.into_iter().peekable();
+        if iter.peek().is_none() {
+            return Ok(());
+        }
+        self.backend.sync_stream(self.tide.compute_stream)?;
+        for snap in iter {
+            self.backend.free_pinned(snap.host)?;
+        }
+        Ok(())
     }
 
     /// Resets all 48 logical layers' short-conv history for a fresh sequence (pos = 0).

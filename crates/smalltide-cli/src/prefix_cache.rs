@@ -218,6 +218,7 @@ impl<S> PrefixCache<S> {
 
     /// Returns a payload to fill for a new snapshot of `pos` tokens (recycled, or `None` if the
     /// caller must allocate), evicting least-recently-used snapshots to stay within the budgets.
+    /// Call `drain_pool()` afterwards to free any additional evicted payloads.
     pub fn take_payload(&mut self, pos: usize) -> Option<S> {
         while !self.snaps.is_empty()
             && (self.snaps.len() >= self.max_snaps || self.snapshot_tokens() + pos > self.max_tokens)
@@ -228,6 +229,12 @@ impl<S> PrefixCache<S> {
             self.pool.push(s.payload);
         }
         self.pool.pop()
+    }
+
+    /// Drains any excess evicted or replaced payloads sitting in the recycle pool so the caller
+    /// can release their backing host/GPU resources (e.g. pinned `hipHostMalloc` buffers).
+    pub fn drain_pool(&mut self) -> Vec<S> {
+        std::mem::take(&mut self.pool)
     }
 
     /// Stores a filled snapshot describing `lane`'s state after `live[lane][..pos]`.
@@ -396,5 +403,8 @@ mod tests {
         // 20 + 30 + 40 > 60: the oldest goes, then 30 + 40 > 60: the next one too.
         assert_eq!(pc.take_payload(40), Some(2));
         assert_eq!(pc.snapshot_positions(), Vec::<usize>::new());
+        // The first evicted payload (1) stayed in the pool and must be drained so callers free it.
+        assert_eq!(pc.drain_pool(), vec![1]);
+        assert!(pc.drain_pool().is_empty());
     }
 }

@@ -832,7 +832,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     inv_sqrt_d: 1.0 / (hd as f32).sqrt(),
                     v_q4: st.v_q4,
                 };
-                if verify && m <= crate::engine::MAX_BATCH_ROWS {
+                if m <= crate::engine::MAX_BATCH_ROWS {
                     b.attn_prefill_fp8_split(
                         pf.attn_out, pf.attn_part_o, pf.attn_part_m, pf.attn_part_l,
                         pf.q, st.k_cache, st.k_scales, st.v_cache, st.v_scales,

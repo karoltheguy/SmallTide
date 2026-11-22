@@ -1060,9 +1060,18 @@ fn admit(
         }
         if cache_prompt && points.contains(&a) && !pc.has_snapshot_of(&prompt_ids[..a]) {
             let mut slot = pc.take_payload(a);
+            let _ = engine.free_snapshots(pc.drain_pool());
             match engine.snapshot_state_opt(a, &mut slot, drafter_coherent) {
-                Ok(()) => pc.insert_kind(lane, a, slot.unwrap(), Some(a) == shared_point),
-                Err(e) => eprintln!("[prefix-cache] snapshot at {a} failed: {e}"),
+                Ok(()) => {
+                    pc.insert_kind(lane, a, slot.unwrap(), Some(a) == shared_point);
+                    let _ = engine.free_snapshots(pc.drain_pool());
+                }
+                Err(e) => {
+                    if let Some(sn) = slot {
+                        let _ = engine.free_snapshot(sn);
+                    }
+                    eprintln!("[prefix-cache] snapshot at {a} failed: {e}");
+                }
             }
         }
         if let Err(e) = engine.prefill(&prompt_ids[a..b], a, b == end) {

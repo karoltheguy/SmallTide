@@ -283,6 +283,12 @@ impl Parser<'_> {
             self.i += 1;
         }
     }
+    /// True when the rest of the input is at least one `}` / `]` and whitespace, nothing else.
+    fn only_closers_follow(&self) -> bool {
+        let rest = &self.b[self.i.min(self.b.len())..];
+        rest.iter().any(|c| matches!(c, b'}' | b']'))
+            && rest.iter().all(|c| matches!(c, b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r'))
+    }
     fn err<T>(&self, m: &str) -> Result<T, String> {
         Err(format!("invalid JSON at byte {}: {m}", self.i))
     }
@@ -454,6 +460,10 @@ impl Parser<'_> {
                     let Some(&e) = self.b.get(self.i) else { return self.err("bad escape") };
                     self.i += 1;
                     match e {
+                        // Lenient: `\"` followed only by closing brackets up to the end of the
+                        // input is the string's closing quote, escaped by mistake (otherwise the
+                        // string, and the whole call, would never terminate).
+                        b'"' if self.lenient && self.only_closers_follow() => return Ok(out),
                         b'"' => out.push('"'),
                         b'\\' => out.push('\\'),
                         b'/' => out.push('/'),
@@ -1064,6 +1074,19 @@ mod tests {
                 AnswerEvent::ToolCall { name: "get_weather".into(), arguments: r#"{"city":"Brasília"}"#.into() },
             ]
         );
+    }
+
+    #[test]
+    fn lenient_json_closes_a_string_whose_last_quote_was_escaped() {
+        let raw = r#"{"name":"run_python","args":{"code":"import os\p='C:/x.yml'\nprint(os.path.exists(p))\nif os.path.exists(p):\n print(open(p).read())\"}}"#;
+        assert!(parse_json(raw).is_err());
+        let v = parse_json_lenient(raw).expect("recovered");
+        let code = v.get("args").and_then(|a| a.get("code")).and_then(OJson::as_str).unwrap();
+        assert!(code.ends_with("print(open(p).read())"), "{code:?}");
+        assert!(code.contains("\nprint(os.path.exists(p))"));
+        // an escaped quote inside a string is still a quote
+        let v = parse_json_lenient(r#"{"a":"say \"hi\" now","b":1,}"#).unwrap();
+        assert_eq!(v.get("a").and_then(OJson::as_str), Some(r#"say "hi" now"#));
     }
 
     #[test]

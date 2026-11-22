@@ -274,15 +274,35 @@ struct ActiveReq {
     /// Sampled, already streamed to the client, not yet fed to the model.
     next_tok: u32,
     finish_reason: &'static str,
+    /// Request log: answer / thinking characters streamed, the last output characters, and the
+    /// routing-weight telemetry (total, skipped) at admission.
+    log_text: usize,
+    log_think: usize,
+    log_tail: String,
+    log_w0: (f64, f64),
 }
 
 impl ActiveReq {
+    fn log_out(&mut self, t: &str, thinking: bool) {
+        if thinking {
+            self.log_think += t.chars().count();
+        } else {
+            self.log_text += t.chars().count();
+        }
+        self.log_tail.push_str(t);
+        let n = self.log_tail.chars().count();
+        if n > 80 {
+            self.log_tail = self.log_tail.chars().skip(n - 80).collect();
+        }
+    }
+
     /// Routes parsed answer events to the client. Returns false to stop generating.
     fn emit(&mut self, evs: Vec<AnswerEvent>) -> bool {
         for ev in evs {
             let sent = match ev {
                 AnswerEvent::Text(t) => {
                     let (out, stopped) = self.stopper.push(&t);
+                    self.log_out(&out, false);
                     let ok = out.is_empty()
                         || self.event_tx.send(StreamEvent::Delta { channel: OutputChannel::Text, text: out }).is_ok();
                     if stopped {
@@ -292,6 +312,7 @@ impl ActiveReq {
                     ok
                 }
                 AnswerEvent::Thinking(t) => {
+                    self.log_out(&t, true);
                     self.event_tx.send(StreamEvent::Delta { channel: OutputChannel::Thinking, text: t }).is_ok()
                 }
                 AnswerEvent::ToolCall { name, arguments } => {
@@ -398,6 +419,20 @@ fn finish_req(
         lane_demand[lane] = Some(demand);
     }
     let hit = engine.telemetry().total_vram_hit_rate();
+    let tel = engine.telemetry();
+    let (dw, ds) = (tel.routed_weight_total - req.log_w0.0, tel.routed_weight_skipped - req.log_w0.1);
+    eprintln!(
+        "[req] lane {lane}: finish={} prompt {} (cached {}) -> {} tokens: answer {} chars, thinking {} chars, {} tool call(s) | skipped expert weight {:.1}% | ends with {:?}",
+        if req.n_tool_calls > 0 && req.finish_reason == "stop" { "tool_calls" } else { req.finish_reason },
+        req.prompt_len,
+        req.reuse_len,
+        req.generated.len(),
+        req.log_text,
+        req.log_think,
+        req.n_tool_calls,
+        if dw > 0.0 { 100.0 * ds / dw } else { 0.0 },
+        req.log_tail
+    );
     let tps = req.finish(hit);
     if let Some(line) = engine.tide.scheduler.finish_request() {
         println!("{line}");
@@ -810,6 +845,10 @@ fn admit(
         pos: end,
         next_tok,
         finish_reason: "length",
+        log_text: 0,
+        log_think: 0,
+        log_tail: String::new(),
+        log_w0: (engine.telemetry().routed_weight_total, engine.telemetry().routed_weight_skipped),
     })
 }
 

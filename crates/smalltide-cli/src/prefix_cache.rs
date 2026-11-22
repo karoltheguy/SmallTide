@@ -115,10 +115,16 @@ impl<S> PrefixCache<S> {
     /// Among `lanes`, the one serving `new` with the most reuse (ties: no global KV copy, then
     /// the first listed). Returns `(lane, plan)`.
     pub fn best_lane(&self, lanes: &[usize], new: &[u32]) -> Option<(usize, PrefixPlan)> {
-        let mut best: Option<(usize, PrefixPlan, (usize, bool))> = None;
+        // Ties: no global KV copy, then the lane with the shortest live sequence (an idle lane
+        // rather than one still holding another conversation), then the first listed.
+        let mut best: Option<(usize, PrefixPlan, (usize, bool, std::cmp::Reverse<usize>))> = None;
         for &l in lanes {
             let p = self.plan(l, new);
-            let key = (Self::plan_reuse(&p), !matches!(p, PrefixPlan::Restore { global: true, .. }));
+            let key = (
+                Self::plan_reuse(&p),
+                !matches!(p, PrefixPlan::Restore { global: true, .. }),
+                std::cmp::Reverse(self.live[l].len()),
+            );
             if best.as_ref().map_or(true, |b| key > b.2) {
                 best = Some((l, p, key));
             }

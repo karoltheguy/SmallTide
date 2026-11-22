@@ -128,6 +128,7 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 | `SMALLTIDE_RESCUE_THRESHOLD` / `..._CORE` | `0.12` / `0.05` | Routing-weight gate for inline rescues (Prelude & Coda / Loop Core). |
 | `SMALLTIDE_RESCUE_BUDGET_PRELUDE` / `_CORE` / `_CODA` | `12` / `9` / `15` | Per-token inline rescue caps per architectural zone. |
 | `SMALLTIDE_SPEC` | `1` | Enable (`1`) or disable (`0`) DSpark speculative decoding. |
+| `SMALLTIDE_PREFIX_DISK` / `SMALLTIDE_PREFIX_DISK_GB` | `1` / `16` | Save prompt prefixes to disk (`<model dir>/prefix_cache`) so a conversation is read back after a restart instead of prefilled; `0` never writes prompt state to the SSD. |
 | `SMALLTIDE_VISION` / `SMALLTIDE_VISION_MAX_TOKENS` | `1` / `1536` | Image input on (`1`) or off (`0`), and the most tokens one image takes (larger images are scaled down). |
 | `SMALLTIDE_RAM_GB` | `16` | Host RAM tier for non-VRAM experts (lower to `10` on 16 GB RAM PCs). |
 | `SMALLTIDE_HOST` / `SMALLTIDE_PORT` | `0.0.0.0` / `8000` | Server bind address (`127.0.0.1` for local-only) and port. |

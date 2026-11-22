@@ -2,6 +2,7 @@ mod chat_format;
 mod expert_map;
 mod image;
 mod prefix_cache;
+mod prefix_disk;
 mod server;
 mod settings;
 

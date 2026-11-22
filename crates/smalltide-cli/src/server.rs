@@ -566,14 +566,127 @@ impl ActiveReq {
 /// Finishes `req` and remembers its routing demand (prompt + answer) as its conversation's
 /// expected routing: on its lane (next turn extends it) and on its prompt's end snapshot (next
 /// turn restores it, possibly on another lane).
+/// The disk prefix store, when it is on (`SMALLTIDE_PREFIX_DISK=0` turns it off): under
+/// `SMALLTIDE_PREFIX_DIR` (default `<model dir>/prefix_cache`), at most `SMALLTIDE_PREFIX_DISK_GB`
+/// (default 16), segments of at least `SMALLTIDE_PREFIX_DISK_MIN` new positions (default 256).
+fn open_prefix_disk(engine: &Inkling2Engine<HipBackend>) -> Option<crate::prefix_disk::PrefixDisk> {
+    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    if var("SMALLTIDE_PREFIX_DISK").is_some_and(|v| v == "0") {
+        println!("[prefix] disk store off (SMALLTIDE_PREFIX_DISK=0)");
+        return None;
+    }
+    let dir = var("SMALLTIDE_PREFIX_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::path::PathBuf::from(var("SMALLTIDE_MODEL_DIR").unwrap_or_else(|| "models/Inkling-2-Mini".into())).join("prefix_cache")
+    });
+    let gb = var("SMALLTIDE_PREFIX_DISK_GB").and_then(|v| v.parse::<f64>().ok()).filter(|g| *g > 0.0).unwrap_or(16.0);
+    let min = var("SMALLTIDE_PREFIX_DISK_MIN").and_then(|v| v.parse::<usize>().ok()).unwrap_or(256).max(1);
+    match crate::prefix_disk::PrefixDisk::open(&dir, engine.snapshot_layout(), (gb * 1e9) as u64, min) {
+        Ok(st) => {
+            println!(
+                "[prefix] disk store on: {} ({} segments, {:.2} of {gb} GB); SMALLTIDE_PREFIX_DISK=0 turns it off",
+                st.dir().display(),
+                st.segments(),
+                st.total_bytes() as f64 / 1e9
+            );
+            Some(st)
+        }
+        Err(e) => {
+            println!("[prefix] disk store off: {}: {e}", dir.display());
+            None
+        }
+    }
+}
+
+/// Saves the snapshots of a finished request's prompt to the disk store: the shared prefix (up
+/// to the first user message) and the prompt's end, each as the positions past the deepest
+/// prefix already saved.
+fn disk_save(engine: &Inkling2Engine<HipBackend>, pc: &PrefixCache<SeqSnapshot>, store: &mut crate::prefix_disk::PrefixDisk, key: &[u32]) {
+    let mut points: Vec<usize> = Vec::new();
+    if let Some(bd) = key.iter().position(|&t| t == TOK_MESSAGE_USER).filter(|&bd| bd >= 16) {
+        points.push(bd);
+    }
+    points.push(key.len());
+    points.dedup();
+    for a in points {
+        let Some(snap) = pc.snapshot_of(&key[..a]) else { continue };
+        let d = snap.drafter_valid;
+        // chains are uniform: with a drafter attached only snapshots holding its state are kept
+        if engine.drafter.is_some() && !d {
+            continue;
+        }
+        let Some((seg, evict)) = store.plan_save(&key[..a], d) else { continue };
+        if seg.parent.is_some_and(|p| store.segment_has_drafter(p) != Some(d)) {
+            continue;
+        }
+        let t0 = Instant::now();
+        let (s0, e0, bytes) = (seg.start, seg.end, seg.bytes);
+        let r = engine.snapshot_host(snap).map_err(|e| e.to_string()).and_then(|host| store.save(seg, &evict, host, d).map_err(|e| e.to_string()));
+        match r {
+            Ok(()) => eprintln!(
+                "[prefix] disk: saved positions [{s0}, {e0}) ({:.0} MB) in {:.2} s; the store holds {:.2} GB",
+                bytes as f64 / 1e6,
+                t0.elapsed().as_secs_f64(),
+                store.total_bytes() as f64 / 1e9
+            ),
+            Err(e) => eprintln!("[prefix] disk: save of [{s0}, {e0}) failed: {e}"),
+        }
+    }
+}
+
+/// Reads the deepest saved prefix of `prompt` from the disk store into the prefix cache, when it
+/// gains at least the store's minimum over the `have` positions RAM already offers.
+fn disk_restore(
+    engine: &mut Inkling2Engine<HipBackend>,
+    pc: &mut PrefixCache<SeqSnapshot>,
+    store: &mut crate::prefix_disk::PrefixDisk,
+    prompt: &[u32],
+    have: usize,
+) {
+    let Some((chain, n)) = store.plan_restore(prompt, have) else { return };
+    let last = chain.last().unwrap().id;
+    let d = engine.drafter.is_some() && store.chain_has_drafter(&chain);
+    let t0 = Instant::now();
+    // room in the RAM cache first (its evicted payloads are freed, not reused: sizes differ)
+    let evicted: Vec<SeqSnapshot> = pc.take_payload(n).into_iter().chain(pc.drain_pool()).collect();
+    let _ = engine.free_snapshots(evicted);
+    let mut snap = match engine.snapshot_new(n, d) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[prefix] disk: no memory for a snapshot of {n} positions: {e}");
+            return;
+        }
+    };
+    let r = engine.snapshot_host_mut(&mut snap).map_err(|e| e.to_string()).and_then(|host| store.load(&chain, host, d).map_err(|e| e.to_string()));
+    match r {
+        Ok(()) => {
+            pc.insert_tokens(prompt[..n].to_vec(), snap);
+            let _ = engine.free_snapshots(pc.drain_pool());
+            eprintln!(
+                "[prefix] disk: read positions [0, {n}) from {} segment(s) in {:.2} s (RAM had {have})",
+                chain.len(),
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        Err(e) => {
+            let _ = engine.free_snapshot(snap);
+            store.forget(last);
+            eprintln!("[prefix] disk: restore of [0, {n}) failed ({e}); the segment was dropped");
+        }
+    }
+}
+
 fn finish_req(
     engine: &mut Inkling2Engine<HipBackend>,
     pc: &mut PrefixCache<SeqSnapshot>,
     lane_demand: &mut [Option<Vec<f32>>],
     req: ActiveReq,
+    disk: &mut Option<crate::prefix_disk::PrefixDisk>,
 ) -> f64 {
     let lane = req.lane;
     engine.set_lane_pinned(lane, false);
+    if let Some(store) = disk.as_mut() {
+        disk_save(engine, pc, store, &req.prompt_key);
+    }
     let demand = engine.tide.scheduler.cache.take_lane_demand(lane);
     if demand.iter().any(|&d| d > 0.0) {
         pc.set_demand(&req.prompt_key, &demand);
@@ -645,6 +758,7 @@ fn engine_worker_loop(
                 None
             }
         });
+    let mut disk = open_prefix_disk(&engine);
     let mut active: Vec<Option<ActiveReq>> = (0..n_lanes).map(|_| None).collect();
     let mut lane_demand: Vec<Option<Vec<f32>>> = vec![None; n_lanes];
     let mut queue: std::collections::VecDeque<EngineCommand> = std::collections::VecDeque::new();
@@ -821,6 +935,11 @@ fn engine_worker_loop(
                             event_tx,
                         });
                     } else {
+                        // A deeper prefix on disk than RAM offers: read it into the prefix cache.
+                        if let (true, Some(store)) = (cache_prompt, disk.as_mut()) {
+                            let have = pc.best_lane(&fits, &prompt_ids).map(|(_, p)| PrefixCache::<SeqSnapshot>::plan_reuse(&p)).unwrap_or(0);
+                            disk_restore(&mut engine, &mut pc, store, &prompt_ids, have);
+                        }
                         let (lane, plan) = if cache_prompt {
                             pc.best_lane(&fits, &prompt_ids).unwrap()
                         } else {
@@ -861,7 +980,7 @@ fn engine_worker_loop(
                             if req.accept(&tok, engine.lane_max_seq(lane)) {
                                 active[lane] = Some(req);
                             } else {
-                                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req, &mut disk);
                             }
                         } else {
                             drafter_state = None;
@@ -885,14 +1004,14 @@ fn engine_worker_loop(
                 Ok(false) => {
                     eprintln!("[kv] lane {l}: the KV pool cannot hold position {} - request ends (length)", req.pos + 1);
                     let req = active[l].take().unwrap();
-                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req, &mut disk);
                 }
                 Err(e) => {
                     let msg = engine_error("kv reserve", &e.to_string());
                     let req = active[l].take().unwrap();
                     let _ = req.event_tx.send(StreamEvent::Error(msg));
                     pc.invalidate(l);
-                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req, &mut disk);
                 }
             }
         }
@@ -937,7 +1056,7 @@ fn engine_worker_loop(
                 };
                 if done {
                     let req = active[l].take().unwrap();
-                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req, &mut disk);
                 }
             }
             continue;
@@ -1054,7 +1173,7 @@ fn engine_worker_loop(
                     }
                     if done {
                         let req = active[l].take().unwrap();
-                        last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                        last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req, &mut disk);
                     }
                     continue;
                 }
@@ -1089,7 +1208,7 @@ fn engine_worker_loop(
             }
             if done {
                 let req = active[l].take().unwrap();
-                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req, &mut disk);
             }
         }
     }

@@ -85,6 +85,61 @@ impl SeqSnapshot {
     }
 }
 
+/// How a `SeqSnapshot`'s host bytes are laid out for a prefix of `pos` positions: the fixed
+/// part (local KV rings, short-conv histories), each engine global-KV region's rows `[0, pos)`,
+/// then - with the drafter's state - the drafter's fixed part and its global regions' rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapLayout {
+    pub fixed: usize,
+    pub drafter_fixed: usize,
+    /// bytes a position of each global region: the engine's `n_engine`, then the drafter's
+    pub per_pos: Vec<usize>,
+    pub n_engine: usize,
+}
+
+impl SnapLayout {
+    fn engine_pp(&self) -> usize {
+        self.per_pos[..self.n_engine].iter().sum()
+    }
+    fn regions(&self, drafter: bool) -> usize {
+        if drafter { self.per_pos.len() } else { self.n_engine }
+    }
+    /// Bytes of a snapshot of `pos` positions.
+    pub fn total_bytes(&self, pos: usize, drafter: bool) -> usize {
+        self.tail_bytes(drafter) + self.rows_bytes(0, pos, drafter)
+    }
+    /// Bytes of the state that exists only at the snapshot's position.
+    pub fn tail_bytes(&self, drafter: bool) -> usize {
+        self.fixed + if drafter { self.drafter_fixed } else { 0 }
+    }
+    /// Bytes of the rows of positions `[start, end)`.
+    pub fn rows_bytes(&self, start: usize, end: usize, drafter: bool) -> usize {
+        (end - start) * self.per_pos[..self.regions(drafter)].iter().sum::<usize>()
+    }
+    /// (offset, bytes) of the tail's pieces in a snapshot of `pos` positions.
+    pub fn tail_ranges(&self, pos: usize, drafter: bool) -> Vec<(usize, usize)> {
+        let mut v = vec![(0, self.fixed)];
+        if drafter {
+            v.push((self.fixed + pos * self.engine_pp(), self.drafter_fixed));
+        }
+        v
+    }
+    /// (offset, bytes) of region `r`'s rows `[a, b)` in a snapshot of `pos` positions.
+    pub fn region_range(&self, pos: usize, r: usize, a: usize, b: usize, drafter: bool) -> Vec<(usize, usize)> {
+        let base = if r < self.n_engine {
+            self.fixed + pos * self.per_pos[..r].iter().sum::<usize>()
+        } else {
+            debug_assert!(drafter);
+            self.fixed + pos * self.engine_pp() + self.drafter_fixed + pos * self.per_pos[self.n_engine..r].iter().sum::<usize>()
+        };
+        vec![(base + a * self.per_pos[r], (b - a) * self.per_pos[r])]
+    }
+    /// (offset, bytes) of every region's rows `[start, end)`, in region order.
+    pub fn row_ranges(&self, pos: usize, start: usize, end: usize, drafter: bool) -> Vec<(usize, usize)> {
+        (0..self.regions(drafter)).flat_map(|r| self.region_range(pos, r, start, end, drafter)).collect()
+    }
+}
+
 /// Per-logical-layer FP8 KV cache + 4-channel causal short-convolution state (`k = 4`, history `3`).
 pub(crate) struct LogicalLayerState {
     pub(crate) _is_local: bool,
@@ -729,6 +784,36 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         self.backend.sync_stream(s)?;
         Ok(())
+    }
+
+    /// The layout of this engine's snapshots (see `SnapLayout`).
+    pub fn snapshot_layout(&self) -> SnapLayout {
+        let mut per_pos: Vec<usize> = self.global_kv_regions().iter().map(|r| r.1).collect();
+        let n_engine = per_pos.len();
+        let mut drafter_fixed = 0;
+        if let Some(d) = self.drafter.as_ref() {
+            drafter_fixed = d.local_kv_regions().iter().map(|b| b.size_bytes).sum();
+            per_pos.extend(d.global_kv_regions().iter().map(|r| r.1));
+        }
+        SnapLayout { fixed: self.snapshot_bytes(), drafter_fixed, per_pos, n_engine }
+    }
+
+    /// A snapshot's host bytes (complete: captures finish before they return).
+    pub fn snapshot_host(&self, snap: &SeqSnapshot) -> Result<&[u8]> {
+        unsafe { self.backend.pinned_as_mut_slice(snap.host).map(|s| &*s) }
+    }
+
+    /// A new snapshot of `pos` positions for the caller to fill through `snapshot_host_mut`
+    /// (`drafter_valid`: it will hold the drafter's state).
+    pub fn snapshot_new(&mut self, pos: usize, drafter_valid: bool) -> Result<SeqSnapshot> {
+        let drafter_valid = drafter_valid && self.drafter.is_some();
+        let total = self.snapshot_layout().total_bytes(pos, drafter_valid);
+        Ok(SeqSnapshot { pos, drafter_valid, host: self.backend.alloc_pinned(total)? })
+    }
+
+    /// A snapshot's host bytes, to fill.
+    pub fn snapshot_host_mut(&self, snap: &mut SeqSnapshot) -> Result<&mut [u8]> {
+        unsafe { self.backend.pinned_as_mut_slice(snap.host) }
     }
 
     /// Frees a snapshot's pinned buffer.

@@ -610,7 +610,13 @@ fn canonicalize_messages(messages: &[OJson]) -> Result<Vec<OJson>, String> {
 /// What the chat request renders to.
 pub struct RenderedChat {
     pub prompt: String,
+    /// The image parts in prompt order: each rendered as one `IMAGE_PLACEHOLDER`.
+    pub images: Vec<OJson>,
 }
+
+/// An image part's text in the prompt (the processor's image token): the server expands it into
+/// the image's tokens.
+pub const IMAGE_PLACEHOLDER: &str = "<|unused_200054|>";
 
 /// Renders `messages`/`tools`/`reasoning_effort` exactly as `chat_template.jinja` does.
 pub fn render_chat(
@@ -634,6 +640,7 @@ pub fn render_chat(
         }
     }
     let mut effort_emitted = false;
+    let mut images: Vec<OJson> = Vec::new();
     for m in &messages {
         let role_v = m.get("role").ok_or("message without role")?;
         let role = role_v.as_str().unwrap_or("");
@@ -705,7 +712,11 @@ pub fn render_chat(
                     } else {
                         match ty.and_then(OJson::as_str) {
                             Some("image" | "input_image" | "image_url") => {
-                                return Err("image input is not supported by this server (no vision tower loaded)".into())
+                                if role != "user" && role != "tool" {
+                                    return Err("Image content is only supported for user and tool messages".into());
+                                }
+                                let _ = write!(out, "{header}<|content_image|>{IMAGE_PLACEHOLDER}<|end_message|>");
+                                images.push(part.clone());
                             }
                             Some("audio" | "input_audio" | "audio_url") => {
                                 return Err("Inkling 2 does not accept audio input".into())
@@ -772,7 +783,7 @@ pub fn render_chat(
     if !effort_emitted {
         out.push_str(&effort_block(reasoning_effort)?);
     }
-    Ok(RenderedChat { prompt: out })
+    Ok(RenderedChat { prompt: out, images })
 }
 
 // ------------------------------------------------------------------------------------------

@@ -13,3 +13,5 @@ smalltide-backend-hip = { path = "../smalltide-backend-hip" }
 smalltide-backend-cpu = { path = "../smalltide-backend-cpu" }
 serde.workspace = true
 serde_json.workspace = true
+png = "0.18"
+zune-jpeg = "0.4"

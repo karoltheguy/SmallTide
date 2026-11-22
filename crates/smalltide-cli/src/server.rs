@@ -130,6 +130,8 @@ enum EngineCommand {
         sampling: SamplingParams,
         stop_strings: Vec<String>,
         cache_prompt: bool,
+        /// Chat only: the prompt's images, in the order of their placeholders.
+        images: Vec<crate::image::Prepared>,
         event_tx: Sender<StreamEvent>,
     },
     GetStats {
@@ -223,7 +225,7 @@ fn parse_stop_strings(v: &Option<Value>) -> Vec<String> {
 
 /// Renders a chat request (messages, tools, tool_choice, reasoning_effort) with the exact
 /// chat template. Returns the prompt and the forced tool name, if `tool_choice` names one.
-fn render_chat_request(body: &OJson) -> Result<(String, Option<String>, bool), String> {
+fn render_chat_request(body: &OJson) -> Result<(String, Option<String>, bool, Vec<OJson>), String> {
     let messages = match body.get("messages") {
         Some(OJson::Arr(m)) if !m.is_empty() => m.clone(),
         _ => return Err("`messages` must be a non-empty list".into()),
@@ -258,12 +260,108 @@ fn render_chat_request(body: &OJson) -> Result<(String, Option<String>, bool), S
         }
     }
     let r = chat_format::render_chat(&messages, use_tools, body.get("reasoning_effort"))?;
+    let images = r.images;
     let mut prompt = r.prompt;
     if let Some(n) = &forced {
         prompt.push_str(&format!("<|message_model|>{n}<|content_invoke_tool_json|>"));
     }
     let single = forced.is_some() || matches!(body.get("parallel_tool_calls"), Some(OJson::Bool(false)));
-    Ok((prompt, forced, single))
+    Ok((prompt, forced, single, images))
+}
+
+/// The image token a placeholder is (`chat_format::IMAGE_PLACEHOLDER`).
+const TOK_IMAGE: u32 = 200054;
+
+/// Whether image input is on (`SMALLTIDE_VISION=0` turns it off).
+fn vision_enabled() -> bool {
+    std::env::var("SMALLTIDE_VISION").map(|v| v.trim() != "0").unwrap_or(true)
+}
+
+/// The most tokens one image takes (`SMALLTIDE_VISION_MAX_TOKENS`, default 1536; a larger image
+/// is scaled down; one token is a 40 x 40 pixel cell).
+fn vision_max_tokens() -> usize {
+    std::env::var("SMALLTIDE_VISION_MAX_TOKENS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(1536)
+}
+
+/// An image part's bytes: OpenAI's `image_url` (an object with `url`, or the URL itself),
+/// `input_image`'s `image_url`, or Anthropic's `source` (base64 `data`, or a `url`).
+fn image_part_bytes(part: &OJson) -> Result<Vec<u8>, String> {
+    let url = match part.get("image_url") {
+        Some(OJson::Str(u)) => Some(u.as_str()),
+        Some(o) => o.get("url").and_then(OJson::as_str),
+        None => None,
+    };
+    if let Some(u) = url {
+        return crate::image::load_url(u);
+    }
+    if let Some(src) = part.get("source") {
+        if let Some(d) = src.get("data").and_then(OJson::as_str) {
+            return crate::image::b64(d);
+        }
+        if let Some(u) = src.get("url").and_then(OJson::as_str) {
+            return crate::image::load_url(u);
+        }
+    }
+    if let Some(u) = part.get("url").and_then(OJson::as_str) {
+        return crate::image::load_url(u);
+    }
+    if let Some(d) = part.get("data").and_then(OJson::as_str) {
+        return crate::image::b64(d);
+    }
+    Err("an image part needs `image_url` (a data: URL) or a base64 `source`".into())
+}
+
+/// Decodes and preprocesses a request's image parts (on the HTTP thread).
+fn prepare_images(parts: &[OJson]) -> Result<Vec<crate::image::Prepared>, String> {
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !vision_enabled() {
+        return Err("image input is off on this server (SMALLTIDE_VISION=0)".into());
+    }
+    let max = vision_max_tokens();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| image_part_bytes(p).and_then(|b| crate::image::prepare(&b, max)).map_err(|e| format!("image {}: {e}", i + 1)))
+        .collect()
+}
+
+/// The prompt's ids with every image placeholder expanded into its image's tokens, and each
+/// image's first position. An image position's id is a key no vocabulary reaches (bit 31 set, 31
+/// bits of the image's digest mixed with the row), so the prefix cache tells one image from
+/// another; the engine reads those rows from the vision tower, not the embedding table.
+fn expand_images(ids: Vec<u32>, images: &[crate::image::Prepared]) -> Result<(Vec<u32>, Vec<usize>), String> {
+    let found = ids.iter().filter(|&&t| t == TOK_IMAGE).count();
+    if found != images.len() {
+        return Err(format!(
+            "{found} image placeholders for {} images (is {} typed in the text?)",
+            images.len(),
+            chat_format::IMAGE_PLACEHOLDER
+        ));
+    }
+    if images.is_empty() {
+        return Ok((ids, Vec::new()));
+    }
+    let mut out = Vec::with_capacity(ids.len() + images.iter().map(|p| p.tokens()).sum::<usize>());
+    let mut starts = Vec::with_capacity(images.len());
+    let mut k = 0;
+    for &t in &ids {
+        if t != TOK_IMAGE {
+            out.push(t);
+            continue;
+        }
+        let p = &images[k];
+        k += 1;
+        starts.push(out.len());
+        let d = p.digest;
+        for j in 0..p.tokens() {
+            let h = (d as u64 ^ (d >> 64) as u64).wrapping_add((j as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let h = (h ^ (h >> 31)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            out.push(0x8000_0000 | (h >> 33) as u32);
+        }
+    }
+    Ok((out, starts))
 }
 
 pub fn run_serve(args: &[String]) {
@@ -530,6 +628,23 @@ fn engine_worker_loop(
         env_usize("SMALLTIDE_PREFIX_SNAPSHOTS", 12),
         env_usize("SMALLTIDE_PREFIX_TOKENS", 65_536),
     );
+    // Image input: the vision tower's tensors are located in the checkpoint now and read only
+    // while an image is encoded (nothing of it stays in RAM or VRAM).
+    let vision: Option<smalltide_model_inkling2::vision::VisionTower> = vision_enabled()
+        .then(|| {
+            let dir = std::path::PathBuf::from(std::env::var("SMALLTIDE_MODEL_DIR").unwrap_or_else(|_| "models/Inkling-2-Mini".into()));
+            smalltide_model_inkling2::vision::VisionTower::open(&dir.join("model-00001-of-00001.safetensors"), engine.cfg.hidden_size)
+        })
+        .and_then(|r| match r {
+            Ok(t) => {
+                println!("[vision] image input on: up to {} tokens an image (one a 40 x 40 px cell), the tower streamed from the checkpoint per image", vision_max_tokens());
+                Some(t)
+            }
+            Err(e) => {
+                println!("[vision] image input off: {e}");
+                None
+            }
+        });
     let mut active: Vec<Option<ActiveReq>> = (0..n_lanes).map(|_| None).collect();
     let mut lane_demand: Vec<Option<Vec<f32>>> = vec![None; n_lanes];
     let mut queue: std::collections::VecDeque<EngineCommand> = std::collections::VecDeque::new();
@@ -659,13 +774,22 @@ fn engine_worker_loop(
                     sampling,
                     stop_strings,
                     cache_prompt,
+                    images,
                     event_tx,
                 }) = queue.pop_front()
                 else {
                     unreachable!()
                 };
-                let prompt_ids = tok.encode(&prompt_text);
-                if prompt_ids.is_empty() {
+                let (prompt_ids, image_starts, image_err) = match expand_images(tok.encode(&prompt_text), &images) {
+                    Ok((ids, starts)) => (ids, starts, None),
+                    Err(e) => (Vec::new(), Vec::new(), Some(e)),
+                };
+                let image_err = image_err.or_else(|| {
+                    (!images.is_empty() && vision.is_none()).then(|| "image input is not available on this server (no vision tower in the checkpoint)".to_string())
+                });
+                if let Some(message) = image_err {
+                    let _ = event_tx.send(StreamEvent::BadRequest { code: "invalid_image", message });
+                } else if prompt_ids.is_empty() {
                     let _ = event_tx.send(StreamEvent::BadRequest {
                         code: "invalid_prompt",
                         message: "empty prompt".into(),
@@ -693,6 +817,7 @@ fn engine_worker_loop(
                             sampling,
                             stop_strings,
                             cache_prompt,
+                            images,
                             event_tx,
                         });
                     } else {
@@ -727,6 +852,7 @@ fn engine_worker_loop(
                             &mut engine, &tok, &mut pc, lane, plan, prompt_ids, is_chat, forced_tool,
                             single_tool_call, max_tokens, sampling, stop_strings, cache_prompt,
                             drafter_coherent_in, event_tx, &mut last_prefill_tok_s,
+                            vision.as_ref(), &images, &image_starts,
                         ) {
                             if engine.drafter.is_some() {
                                 drafter_state = drafter_coherent_in.then_some((lane, req.pos));
@@ -989,6 +1115,9 @@ fn admit(
     drafter_coherent: bool,
     event_tx: Sender<StreamEvent>,
     last_prefill_tok_s: &mut f64,
+    vision: Option<&smalltide_model_inkling2::vision::VisionTower>,
+    images: &[crate::image::Prepared],
+    image_starts: &[usize],
 ) -> Option<ActiveReq> {
     engine.select_lane(lane);
     let t_pf = Instant::now();
@@ -1033,6 +1162,37 @@ fn admit(
         prompt_ids.len()
     );
 
+    // Images the prefill reaches (not wholly inside the reused prefix): the vision tower's rows
+    // take their placeholders' places.
+    let mut image_rows: Vec<(usize, Vec<f32>)> = Vec::new();
+    for (i, (im, &start)) in images.iter().zip(image_starts).enumerate() {
+        if start + im.tokens() <= reuse_len {
+            continue;
+        }
+        let Some(tower) = vision else { continue };
+        match engine.vision_encode(tower, &im.patches, im.rows, im.cols) {
+            Ok((rows, st)) => {
+                eprintln!(
+                    "[vision] lane {lane}: image {} of {}: {} x {} = {} tokens at position {start}, encoded in {:.0} ms ({:.0} MB of VRAM for the encode)",
+                    i + 1,
+                    images.len(),
+                    im.rows,
+                    im.cols,
+                    st.tokens,
+                    st.ms,
+                    st.device_bytes as f64 / 1e6
+                );
+                image_rows.push((start, rows));
+            }
+            Err(e) => {
+                pc.invalidate(lane);
+                let _ = event_tx.send(StreamEvent::Error(engine_error("image encode", &e.to_string())));
+                return None;
+            }
+        }
+    }
+    engine.set_image_rows(image_rows);
+
     // Snapshot points: the first user-message boundary (shared system/tool prefix) and one
     // token before the prompt end (the last token is always re-processed, so this serves exact
     // repeats and follow-up turns alike). Prefill runs in segments so each snapshot lands
@@ -1075,12 +1235,14 @@ fn admit(
             }
         }
         if let Err(e) = engine.prefill(&prompt_ids[a..b], a, b == end) {
+            engine.set_image_rows(Vec::new());
             pc.invalidate(lane);
             let _ = event_tx.send(StreamEvent::Error(engine_error(&format!("prefill error at pos {a}..{b}"), &e.to_string())));
             return None;
         }
         pc.live[lane].extend_from_slice(&prompt_ids[a..b]);
     }
+    engine.set_image_rows(Vec::new());
     let pf_secs = t_pf.elapsed().as_secs_f64();
     let new_pf_toks = end - reuse_len;
     pc.stats.prefilled_tokens += new_pf_toks as u64;
@@ -1338,7 +1500,8 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 .map_err(|e| e.to_string())
                 .and_then(chat_format::parse_json)
                 .and_then(|b| render_chat_request(&b));
-            let (prompt_text, forced_tool, single_tool_call) = match rendered {
+            let rendered = rendered.and_then(|(p, f, s, parts)| prepare_images(&parts).map(|im| (p, f, s, im)));
+            let (prompt_text, forced_tool, single_tool_call, images) = match rendered {
                 Ok(r) => r,
                 Err(e) => {
                     write_json_response(
@@ -1375,6 +1538,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     sampling,
                     stop_strings,
                     cache_prompt: req.cache_prompt.unwrap_or(true),
+                    images,
                     event_tx: ev_tx,
                 })
                 .is_err()
@@ -1659,6 +1823,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     sampling,
                     stop_strings,
                     cache_prompt: req.cache_prompt.unwrap_or(true),
+                    images: Vec::new(),
                     event_tx: ev_tx,
                 })
                 .is_err()

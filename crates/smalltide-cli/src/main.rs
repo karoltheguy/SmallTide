@@ -1,5 +1,6 @@
 mod chat_format;
 mod expert_map;
+mod image;
 mod prefix_cache;
 mod server;
 mod settings;

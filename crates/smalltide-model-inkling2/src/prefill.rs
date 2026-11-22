@@ -68,6 +68,8 @@ pub(crate) struct PrefillScratch {
     attn_part_m: DeviceBuf, // [MAX_BATCH_ROWS][n_q_heads][16]
     attn_part_l: DeviceBuf, // [MAX_BATCH_ROWS][n_q_heads][16]
     embed_host: PinnedBuf,
+    /// image rows of a chunk on their way to `cur` (same layout as `embed_host`)
+    img_host: PinnedBuf,
     embed_done: Event,
     embed_used: bool,
     desc_host: Vec<(PinnedBuf, Event, bool)>,
@@ -131,6 +133,7 @@ impl PrefillScratch {
             attn_part_m: f(crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS)?,
             attn_part_l: f(crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS)?,
             embed_host: b.alloc_pinned(m * h * 4)?,
+            img_host: b.alloc_pinned(m * h * 4)?,
             embed_done: b.create_event()?,
             embed_used: false,
             desc_host,
@@ -151,6 +154,7 @@ impl PrefillScratch {
             let _ = b.free_device(d);
         }
         let _ = b.free_pinned(self.embed_host);
+        let _ = b.free_pinned(self.img_host);
         let _ = b.destroy_event(self.embed_done);
         for (p, e, _) in self.desc_host {
             let _ = b.free_pinned(p);
@@ -271,6 +275,30 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.backend.record_event(embed_done, s)?;
         self.pf.as_mut().unwrap().embed_used = true;
         self.backend.rms_norm(cur, embed, self.dense.embed_norm, m, h, eps, s)?;
+        // Image placeholders: the vision tower's rows replace the normed embeddings (runs of
+        // consecutive rows, one copy each, stream-ordered after the norm).
+        if matches!(mode, RowsMode::Prefill { .. }) && !self.image_rows.is_empty() {
+            let img_host = self.pf.as_ref().unwrap().img_host;
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            unsafe {
+                let dst = self.backend.pinned_as_mut_slice(img_host)?;
+                let dst = std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut f32, m * h);
+                for r in 0..m {
+                    if let Some(row) = self.image_row(pos0 + r) {
+                        dst[r * h..(r + 1) * h].copy_from_slice(row);
+                        match runs.last_mut() {
+                            Some((r0, n)) if *r0 + *n == r => *n += 1,
+                            _ => runs.push((r, 1)),
+                        }
+                    }
+                }
+            }
+            for (r0, n) in runs {
+                self.backend.memcpy_h2d_async(cur, r0 * h * 4, img_host, r0 * h * 4, n * h * 4, s)?;
+            }
+            // the next chunk waits for these copies too before it overwrites the staging rows
+            self.backend.record_event(embed_done, s)?;
+        }
 
         let n_log = self.layer_states.len();
         let dumping = self.dump.is_some() && !matches!(mode, RowsMode::Decode { .. });

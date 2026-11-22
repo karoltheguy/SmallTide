@@ -287,6 +287,10 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// DSpark drafter (speculative decoding); its context follows the active lane's prefill /
     /// verify rows.
     pub drafter: Option<crate::drafter::Drafter<B>>,
+    /// Image rows of the prompt being prefilled on the active lane: (first position, the vision
+    /// tower's feature rows f32 `[n][hidden]`). Prefill writes them in place of the placeholder
+    /// tokens' embeddings (after the embedding norm, as the reference's masked_scatter).
+    pub(crate) image_rows: Vec<(usize, Vec<f32>)>,
     /// Rows of the last tap-capturing rows forward (the last one is the newest position).
     pub last_tap_rows: usize,
     /// Dev stats: rows run by the last batched / verify forward, and the summed number of
@@ -518,6 +522,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             taps_buf: None,
             capture_taps: false,
             drafter: None,
+            image_rows: Vec::new(),
             route_pinned: None,
             rescue_wait: None,
             wait_flags: None,
@@ -1826,6 +1831,30 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             out.push((k, f32::from_le_bytes(sc), v));
         }
         Ok(out)
+    }
+
+    /// The image rows `prefill` puts in place of placeholder embeddings: (first position, feature
+    /// rows f32 `[n][hidden]`) per image of the active lane's prompt. Empty clears them.
+    pub fn set_image_rows(&mut self, rows: Vec<(usize, Vec<f32>)>) {
+        self.image_rows = rows;
+    }
+
+    /// The image row at `pos`, if a placeholder of the prompt being prefilled is there.
+    pub(crate) fn image_row(&self, pos: usize) -> Option<&[f32]> {
+        let h = self.cfg.hidden_size;
+        self.image_rows.iter().find_map(|(start, f)| {
+            (pos >= *start && pos < start + f.len() / h).then(|| &f[(pos - start) * h..(pos - start + 1) * h])
+        })
+    }
+
+    /// Runs the vision tower on one image (`patches` bf16 `[rows * cols * 4][1200]`): its feature
+    /// rows f32 `[rows * cols][hidden]`. The tower's weights are streamed from the checkpoint and
+    /// every buffer it takes is freed before this returns.
+    pub fn vision_encode(&mut self, tower: &crate::vision::VisionTower, patches: &[u16], rows: usize, cols: usize)
+        -> Result<(Vec<f32>, crate::vision::EncodeStats)> {
+        let s = self.tide.compute_stream;
+        self.backend.sync_stream(s)?;
+        tower.encode(&*self.backend, s, patches, rows, cols)
     }
 
     /// Dev: redirect the per-token dump (`SMALLTIDE_DUMP_DIR`) to `dir`.

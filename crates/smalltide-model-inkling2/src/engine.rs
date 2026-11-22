@@ -1177,14 +1177,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let mut history: Vec<LayerRec> = Vec::with_capacity(8);
         let mut res: Result<()> = Ok(());
         for (pos_idx, &il) in checks.iter().enumerate() {
-            // Once the rescue budget is spent, release all remaining layers immediately without
-            // stalling on them one by one; their bookkeeping runs from the routing log afterwards.
-            if self.tide.scheduler.rescue_budget_spent() {
-                for &rem_il in &checks[pos_idx..] {
-                    self.layer_deferred[rem_il] = true;
-                    release_flag(&*self.backend, rem_il);
-                }
-                break;
+            // Once this layer's zone (Prelude / Loop Core / Coda) has spent its rescue budget,
+            // release this layer immediately without blocking or starving later zones (e.g. Coda).
+            let (phys_chk, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
+            if self.tide.scheduler.rescue_budget_spent_for_layer(phys_chk, 1) {
+                self.layer_deferred[il] = true;
+                release_flag(&*self.backend, il);
+                continue;
             }
             let tw = Instant::now();
             if trace {
@@ -1497,11 +1496,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         };
         let mut res: Result<()> = Ok(());
         for (pos_idx, &il) in checks.iter().enumerate() {
-            if self.tide.scheduler.rescue_budget_spent() {
-                for &rem_il in &checks[pos_idx..] {
-                    release_flag(&*self.backend, rem_il);
-                }
-                break;
+            let (phys_chk, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
+            if self.tide.scheduler.rescue_budget_spent_for_layer(phys_chk, m) {
+                release_flag(&*self.backend, il);
+                continue;
             }
             let tw = Instant::now();
             let row = match unsafe { self.backend.pinned_as_mut_slice(host) } {
@@ -2527,7 +2525,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let defer = !fully_resident
             && !is_prefill
             && !need_dump_routes
-            && (matches!(policy, smalltide_core::RescuePolicy::Disabled) || self.tide.scheduler.rescue_budget_spent());
+            && (matches!(policy, smalltide_core::RescuePolicy::Disabled)
+                || self.tide.scheduler.rescue_budget_spent_for_layer(phys_id, 1));
         // Threshold rescue in decode: the routing row goes to the host asynchronously and the
         // expert kernels are queued right away (unpublished experts skipped); the host decides
         // while they run and only a rescue re-runs this layer's experts. No GPU drain per layer.

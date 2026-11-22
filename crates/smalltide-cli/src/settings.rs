@@ -369,6 +369,20 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     }
     engine.prefill_min_share = parse("SMALLTIDE_PREFILL_MIN_SHARE", 1.0f32, "tokens of routing share");
     engine.tide.scheduler.rescue_budget = parse("SMALLTIDE_RESCUE_BUDGET", 4usize, "rescues per token");
+    let opt_u = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let (bp, bc, bd) = (
+        opt_u("SMALLTIDE_RESCUE_BUDGET_PRELUDE"),
+        opt_u("SMALLTIDE_RESCUE_BUDGET_CORE"),
+        opt_u("SMALLTIDE_RESCUE_BUDGET_CODA"),
+    );
+    if bp.is_some() || bc.is_some() || bd.is_some() {
+        let def = engine.tide.scheduler.effective_zone_budgets(1);
+        engine.tide.scheduler.rescue_zone_budgets = Some([
+            bp.unwrap_or(def[0]),
+            bc.unwrap_or(def[1]),
+            bd.unwrap_or(def[2]),
+        ]);
+    }
     engine.tide.scheduler.loop_core_gate = std::env::var("SMALLTIDE_RESCUE_THRESHOLD_CORE").ok().and_then(|v| v.trim().parse::<f32>().ok());
     engine.prefill_chunk_swaps = parse("SMALLTIDE_PREFILL_CHUNK_SWAPS", 96usize, "a swap count");
     engine.anticipate_swaps = parse("SMALLTIDE_ANTICIPATE_SWAPS", 256usize, "a swap count");

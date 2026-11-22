@@ -65,12 +65,16 @@ pub struct TideScheduler {
     /// `cache::SWAP_HYSTERESIS`.
     pub async_hysteresis: f64,
     /// `RescuePolicy::Threshold`: most synchronous rescues per decode token (TideLM's
-    /// `RESCUE_STEP` is 2); once spent, the token's remaining layers need no routing readback.
+    /// `RESCUE_STEP` is 2); split across Prelude / Loop Core / Coda unless `rescue_zone_budgets`
+    /// is set explicitly.
     pub rescue_budget: usize,
+    /// Optional explicit per-zone rescue budgets `[prelude, loop_core, coda]` per token.
+    pub rescue_zone_budgets: Option<[usize; 3]>,
     /// Threshold gate for loop-core layers (their experts run once per loop pass), if it differs
     /// from the policy's gate.
     pub loop_core_gate: Option<f32>,
     rescues_this_token: usize,
+    rescues_by_zone: [usize; 3],
     /// Residency events for the expert map (host bookkeeping; decides nothing).
     pub events: crate::expert_map::EventLog,
     /// Kind / routing share the next logged transfers get (set by each planner; 0 = not logged).
@@ -103,8 +107,10 @@ impl TideScheduler {
             priors_store: None,
             async_hysteresis: 2.0,
             rescue_budget: 4,
+            rescue_zone_budgets: None,
             loop_core_gate: None,
             rescues_this_token: 0,
+            rescues_by_zone: [0; 3],
             events: crate::expert_map::EventLog::default(),
             event_kind: 0,
             event_share: 0.0,
@@ -408,15 +414,68 @@ impl TideScheduler {
     }
 
     /// Mode 4: Per-layer decode dispatch planner (Split-Batch Hit/Miss + Sync Rescue + Renorm).
-    /// Token boundary: the per-token rescue budget starts again.
+    /// Token boundary: the per-zone rescue budgets start again.
     pub fn begin_token(&mut self) {
         self.rescues_this_token = 0;
+        self.rescues_by_zone = [0; 3];
     }
 
-    /// `RescuePolicy::Threshold`: this token's rescue budget is used up (the remaining layers need
-    /// no routing readback - they run like `Disabled`).
+    #[inline]
+    fn zone_of(&self, layer: PhysicalLayerId) -> usize {
+        let l = layer.0 as usize;
+        if l < self.model_cfg.loop_start_layer {
+            0
+        } else if self.model_cfg.is_loop_core_layer(l) {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Effective per-zone rescue budgets `[prelude, loop_core, coda]` for `verify_rows` (1 for
+    /// single-token decode, 2..=8 for speculative verify).
+    pub fn effective_zone_budgets(&self, verify_rows: usize) -> [usize; 3] {
+        let base = match self.rescue_zone_budgets {
+            Some(z) => z,
+            None => {
+                let b = self.rescue_budget;
+                if b == 0 {
+                    [0, 0, 0]
+                } else {
+                    let pre = b / 3;
+                    let core = b / 4;
+                    let coda = b - pre - core;
+                    [pre, core, coda]
+                }
+            }
+        };
+        if verify_rows <= 1 {
+            return base;
+        }
+        [
+            if base[0] > 0 { base[0] + verify_rows / 4 } else { 0 },
+            if base[1] > 0 { base[1] + verify_rows / 4 } else { 0 },
+            if base[2] > 0 { base[2] + verify_rows / 2 } else { 0 },
+        ]
+    }
+
+    /// `RescuePolicy::Threshold`: this layer's zone has used up its rescue budget for the current
+    /// token / verify step. Other zones (e.g. Coda) keep their own independent budget.
+    pub fn rescue_budget_spent_for_layer(&self, layer: PhysicalLayerId, verify_rows: usize) -> bool {
+        if !matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_)) {
+            return false;
+        }
+        let z = self.zone_of(layer);
+        self.rescues_by_zone[z] >= self.effective_zone_budgets(verify_rows)[z]
+    }
+
+    /// True only once all 3 zones have exhausted their rescue budgets.
     pub fn rescue_budget_spent(&self) -> bool {
-        matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_)) && self.rescues_this_token >= self.rescue_budget
+        if !matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_)) {
+            return false;
+        }
+        let lim = self.effective_zone_budgets(1);
+        (0..3).all(|z| self.rescues_by_zone[z] >= lim[z])
     }
 
     pub fn plan_layer_dispatch(
@@ -442,9 +501,11 @@ impl TideScheduler {
         let mut executed_weight = 0.0f32;
         self.telemetry.routed_weight_total += 1.0;
         // Threshold (TideLM's inline rescue): only the heaviest missed pick at or above the gate,
-        // and at most `rescue_budget` rescues per token.
+        // subject to this layer's zone rescue budget (Prelude / Loop Core / Coda).
+        let zone = self.zone_of(layer);
+        let zone_cap = self.effective_zone_budgets(1)[zone];
         let threshold_pick: Option<usize> = match self.tide_cfg.rescue_policy {
-            RescuePolicy::Threshold(gate) if self.rescues_this_token < self.rescue_budget => {
+            RescuePolicy::Threshold(gate) if self.rescues_by_zone[zone] < zone_cap => {
                 let tau = match self.loop_core_gate {
                     Some(g) if self.model_cfg.is_loop_core_layer(layer.0 as usize) => g,
                     _ => gate,
@@ -464,6 +525,7 @@ impl TideScheduler {
         };
         if threshold_pick.is_some() {
             self.rescues_this_token += 1;
+            self.rescues_by_zone[zone] += 1;
         }
 
         for (k, (&exp, &w)) in topk_ids.iter().zip(topk_weights.iter()).enumerate() {
@@ -559,10 +621,8 @@ impl TideScheduler {
 
     /// Inline rescue planning for a multi-row speculative `verify` layer (`m <= 8` rows):
     /// protects every expert routed by any row in this layer, aggregates missing experts across all
-    /// rows, and under `Threshold` rescues up to 1 (for `m < 4`) or 2 (for `m >= 4`) highest-impact
-    /// missing experts whose max single-row normalized share meets the layer gate (capped by
-    /// `rescue_budget` per verify step). Does not update per-token hit/skip telemetry — that runs
-    /// in `record_batch_dispatch_with_rescued` on only the committed rows after `verify_rewind`.
+    /// rows, and under `Threshold` rescues highest-impact missing experts whose max single-row
+    /// normalized share meets the layer gate, using independent per-zone budgets `[prelude, core, coda]`.
     pub fn plan_verify_layer_dispatch(
         &mut self,
         layer: PhysicalLayerId,
@@ -594,7 +654,9 @@ impl TideScheduler {
         }
 
         if let RescuePolicy::Threshold(gate) = self.tide_cfg.rescue_policy {
-            if self.rescues_this_token < self.rescue_budget {
+            let zone = self.zone_of(layer);
+            let zone_cap = self.effective_zone_budgets(m)[zone];
+            if self.rescues_by_zone[zone] < zone_cap {
                 let tau = match self.loop_core_gate {
                     Some(g) if self.model_cfg.is_loop_core_layer(layer.0 as usize) => g,
                     _ => gate,
@@ -620,11 +682,13 @@ impl TideScheduler {
                 }
                 miss_stats.retain(|s| s.1 >= tau);
                 miss_stats.sort_by(|a, b| b.2.total_cmp(&a.2));
-                let max_per_layer = if m >= 4 { 2 } else { 1 };
-                let rem_budget = self.rescue_budget.saturating_sub(self.rescues_this_token);
+                // 1/layer in Prelude/Core so budget spreads across layers; up to 2/layer in Coda.
+                let max_per_layer = if zone == 2 && m >= 4 { 2 } else { 1 };
+                let rem_budget = zone_cap.saturating_sub(self.rescues_by_zone[zone]);
                 let take = max_per_layer.min(rem_budget);
                 for (id, max_share, _sum_share) in miss_stats.into_iter().take(take) {
                     self.rescues_this_token += 1;
+                    self.rescues_by_zone[zone] += 1;
                     self.event_share = max_share;
                     if self.cache.should_promote_instead_of_scratch(id) {
                         let pin = !self.cache.has_priors() && self.model_cfg.is_loop_core_layer(layer.0 as usize);

@@ -64,6 +64,10 @@ pub struct TideScheduler {
     /// this many times the coldest resident it would evict. Boundary / periodic passes use
     /// `cache::SWAP_HYSTERESIS`.
     pub async_hysteresis: f64,
+    /// `RescuePolicy::Threshold`: most synchronous rescues per decode token (TideLM's
+    /// `RESCUE_STEP` is 2); once spent, the token's remaining layers need no routing readback.
+    pub rescue_budget: usize,
+    rescues_this_token: usize,
 }
 
 impl TideScheduler {
@@ -90,6 +94,8 @@ impl TideScheduler {
             pending_async_ram: HashMap::new(),
             priors_store: None,
             async_hysteresis: 2.0,
+            rescue_budget: 4,
+            rescues_this_token: 0,
         }
     }
 
@@ -383,6 +389,17 @@ impl TideScheduler {
     }
 
     /// Mode 4: Per-layer decode dispatch planner (Split-Batch Hit/Miss + Sync Rescue + Renorm).
+    /// Token boundary: the per-token rescue budget starts again.
+    pub fn begin_token(&mut self) {
+        self.rescues_this_token = 0;
+    }
+
+    /// `RescuePolicy::Threshold`: this token's rescue budget is used up (the remaining layers need
+    /// no routing readback - they run like `Disabled`).
+    pub fn rescue_budget_spent(&self) -> bool {
+        matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_)) && self.rescues_this_token >= self.rescue_budget
+    }
+
     pub fn plan_layer_dispatch(
         &mut self,
         layer: PhysicalLayerId,
@@ -405,8 +422,26 @@ impl TideScheduler {
         let inv_total_w = if total_weight > 1e-8 { 1.0 / total_weight } else { 1.0 };
         let mut executed_weight = 0.0f32;
         self.telemetry.routed_weight_total += 1.0;
+        // Threshold (TideLM's inline rescue): only the heaviest missed pick at or above the gate,
+        // and at most `rescue_budget` rescues per token.
+        let threshold_pick: Option<usize> = match self.tide_cfg.rescue_policy {
+            RescuePolicy::Threshold(tau) if self.rescues_this_token < self.rescue_budget => topk_ids
+                .iter()
+                .zip(topk_weights.iter())
+                .enumerate()
+                .filter(|(_, (&e, &w))| {
+                    let id = ExpertId { layer, expert: e };
+                    w * inv_total_w >= tau && self.cache.entry(id).vram_slot.is_missing()
+                })
+                .max_by(|a, b| a.1 .1.total_cmp(b.1 .1))
+                .map(|(i, _)| i),
+            _ => None,
+        };
+        if threshold_pick.is_some() {
+            self.rescues_this_token += 1;
+        }
 
-        for (&exp, &w) in topk_ids.iter().zip(topk_weights.iter()) {
+        for (k, (&exp, &w)) in topk_ids.iter().zip(topk_weights.iter()).enumerate() {
             let id = ExpertId { layer, expert: exp };
             let norm_w = w * inv_total_w;
             self.cache.touch_expert(id, norm_w);
@@ -432,7 +467,7 @@ impl TideScheduler {
             self.record_miss(layer);
             let should_sync_rescue = match self.tide_cfg.rescue_policy {
                 RescuePolicy::Exact => true,
-                RescuePolicy::Threshold(tau) => norm_w >= tau,
+                RescuePolicy::Threshold(_) => threshold_pick == Some(k),
                 RescuePolicy::Disabled => false,
             };
 

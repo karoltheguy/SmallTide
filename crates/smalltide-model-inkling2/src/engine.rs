@@ -41,6 +41,10 @@ pub struct StepProfile {
     pub moe_ms: f64,
     pub lm_head_ms: f64,
     pub tide_post_ms: f64,
+    /// Overlapped rescue checks: host time waiting for the routing row, planning, and count.
+    pub rescue_wait_ms: f64,
+    pub rescue_plan_ms: f64,
+    pub rescue_checks: u64,
 }
 
 /// Sampling configuration for text generation.
@@ -171,6 +175,9 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// Rows-batched activation buffers for chunked prefill (allocated on first use).
     pub(crate) pf: Option<crate::prefill::PrefillScratch>,
     embed_pinned: PinnedBuf,
+    /// Overlapped rescue check: pinned `[logical][16]` mirror of the routing log rows and the
+    /// event marking a row's copy (allocated on first use).
+    route_pinned: Option<(DeviceBuf, PinnedBuf, smalltide_core::Event)>,
     pub(crate) route_log_inflight: bool,
     /// A post-decode Tide step deferred into the next forward (see `post_decode_tide_step`).
     pub(crate) tide_step_pending: bool,
@@ -402,6 +409,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             taps_buf: None,
             capture_taps: false,
             drafter: None,
+            route_pinned: None,
             last_tap_rows: 0,
             batch_rows_run: 0,
             dev_rounds: 0,
@@ -1428,11 +1436,31 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let need_dump_routes = self.dump.is_some();
         // Rescue disabled: nothing would be copied in, so a partial layer needs no host readback
         // either - the kernels skip unpublished experts and the bookkeeping is deferred.
+        let policy = self.tide.scheduler.tide_cfg.rescue_policy;
         let defer = !fully_resident
             && !is_prefill
             && !need_dump_routes
-            && matches!(self.tide.scheduler.tide_cfg.rescue_policy, smalltide_core::RescuePolicy::Disabled);
-        if defer {
+            && (matches!(policy, smalltide_core::RescuePolicy::Disabled) || self.tide.scheduler.rescue_budget_spent());
+        // Threshold rescue in decode: the routing row goes to the host asynchronously and the
+        // expert kernels are queued right away (unpublished experts skipped); the host decides
+        // while they run and only a rescue re-runs this layer's experts. No GPU drain per layer.
+        let overlap = !fully_resident
+            && !defer
+            && !is_prefill
+            && !need_dump_routes
+            && matches!(policy, smalltide_core::RescuePolicy::Threshold(_))
+            && std::env::var_os("SMALLTIDE_RESCUE_SERIAL").is_none();
+        if overlap {
+            if self.route_pinned.is_none() {
+                let n_log = self.layer_planned.len();
+                let (view, host) = self.backend.alloc_host_mapped(n_log * ROUTE_WORDS * 4)?;
+                self.route_pinned = Some((view, host, self.backend.create_event()?));
+            }
+            let (view, _, ev) = self.route_pinned.unwrap();
+            // A kernel store into mapped host memory (no copy-engine round trip in the stream).
+            self.backend.vec_copy(view.slice(il * ROUTE_WORDS * 4, ROUTE_WORDS * 4), route_row, ROUTE_WORDS, s)?;
+            self.backend.record_event(ev, s)?;
+        } else if defer {
             self.layer_deferred[il] = true;
         } else if fully_resident && !need_dump_routes {
             self.tide
@@ -1544,6 +1572,50 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             params,
             s,
         )?;
+        if overlap {
+            let (_, host, ev) = self.route_pinned.unwrap();
+            let tw = Instant::now();
+            // Blocking event wait: on Windows every host round trip costs a GPU submission, so
+            // polling (which forces extra submissions) is slower than one blocking wait.
+            self.backend.sync_event(ev)?;
+            self.profile.rescue_wait_ms += tw.elapsed().as_secs_f64() * 1000.0;
+            let tp = Instant::now();
+            let mut topk_ids_u16 = [0u16; 8];
+            let mut topk_w_f32 = [0.0f32; 8];
+            unsafe {
+                let rb = &self.backend.pinned_as_mut_slice(host)?[il * ROUTE_WORDS * 4..(il + 1) * ROUTE_WORDS * 4];
+                for k in 0..8 {
+                    topk_ids_u16[k] = u32::from_le_bytes(rb[k * 4..(k + 1) * 4].try_into().unwrap()) as u16;
+                    topk_w_f32[k] = f32::from_le_bytes(rb[32 + k * 4..32 + (k + 1) * 4].try_into().unwrap());
+                }
+            }
+            self.layer_planned[il] = true;
+            let plan = self.tide.scheduler.plan_layer_dispatch(phys_id, &topk_ids_u16, &topk_w_f32);
+            self.profile.rescue_plan_ms += tp.elapsed().as_secs_f64() * 1000.0;
+            self.profile.rescue_checks += 1;
+            let rerun = if !plan.sync_transfers.is_empty() {
+                // The rescue copy is ordered after the queued experts; compute waits for it.
+                self.tide.execute_transfers(&plan.sync_transfers, true, false)?;
+                true
+            } else if plan.wait_pending {
+                self.tide.wait_and_publish_all_pending()?;
+                true
+            } else {
+                false
+            };
+            if rerun {
+                self.backend.moe_decode_experts(
+                    self.scratch.moe_mid,
+                    self.scratch.moe_tmp,
+                    self.scratch.moe_norm,
+                    pool,
+                    layer_slot_table,
+                    topk_ids,
+                    params,
+                    s,
+                )?;
+            }
+        }
         // Weighted/renormalized expert sum + post-MLP short conv + residual in one kernel.
         let st = &self.layer_states[il];
         self.backend.moe_decode_post(
@@ -1630,6 +1702,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.consume_route_log()?;
         let published = self.tide.poll_pending()?;
         self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+        self.tide.scheduler.begin_token();
         self.layer_planned.iter_mut().for_each(|p| *p = false);
         self.layer_deferred.iter_mut().for_each(|p| *p = false);
         self.dump_token = (token_id, pos);

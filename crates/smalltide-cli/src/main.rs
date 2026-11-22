@@ -1273,6 +1273,12 @@ fn run_generate(args: &[String]) {
     }
     let dec_secs = t_dec.elapsed().as_secs_f64();
     let dec_toks = generated.len();
+    if engine.profile.rescue_checks > 0 {
+        let pr = &engine.profile;
+        println!("
+[rescue-check] {:.1} checks/token | wait {:.3} ms + plan {:.3} ms per check",
+            pr.rescue_checks as f64 / dec_toks.max(1) as f64, pr.rescue_wait_ms / pr.rescue_checks as f64, pr.rescue_plan_ms / pr.rescue_checks as f64);
+    }
     if spec && spec_steps > 0 {
         let hist: Vec<String> = spec_hist[..spec_width].iter().enumerate().map(|(i, c)| format!("{i}:{c}")).collect();
         if fixed_width.is_none() {

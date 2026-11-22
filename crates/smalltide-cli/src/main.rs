@@ -1233,9 +1233,11 @@ fn run_generate(args: &[String]) {
     const EOS_ID: u32 = 200_006;
     const EOT_ID: u32 = 199_999;
 
-    // Speculative decoding (greedy): the drafter proposes width - 1 tokens, one verify pass
-    // checks them; accepted drafts plus the target's next token are emitted per step.
-    let spec = engine.drafter.is_some() && temperature <= 0.0;
+    // Speculative decoding (greedy & stochastic rejection sampling): the drafter proposes
+    // width - 1 tokens, one verify pass checks them; accepted drafts plus the target's next token
+    // are emitted per step.
+    let spec = engine.drafter.is_some();
+    let spec_greedy = sampling.temperature <= 0.0 && (sampling.repetition_penalty - 1.0).abs() < 1e-6;
     // Width: fixed (SMALLTIDE_SPEC_WIDTH=n) or adaptive (default): per step the width maximizing
     // expected tokens per ms from the recent per-draft acceptance rate.
     let fixed_width = std::env::var("SMALLTIDE_SPEC_WIDTH").ok().and_then(|v| v.parse::<usize>().ok()).map(|w| w.clamp(2, 8));
@@ -1260,37 +1262,72 @@ fn run_generate(args: &[String]) {
         if !emit(next_tok, &mut generated) {
             done = true;
         }
-        while !done && pos + spec_width <= max_ctx {
-            let spec_width = fixed_width.unwrap_or_else(|| {
-                let a = ((acc_s + 1.0) / (acc_s + acc_f + 2.0)).min(0.98);
-                (2..=8usize)
-                    .max_by(|&x, &y| {
-                        let gain = |w: usize| (1.0 - a.powi(w as i32)) / (1.0 - a) / (17.0 + 2.5 * (w - 1) as f64);
-                        gain(x).total_cmp(&gain(y))
-                    })
-                    .unwrap()
+        // Live calibration: ratio of observed acceptance to predicted margin-based probability.
+        let mut pred_acc_ema = 3.0f64;
+        let mut obs_acc_ema = 2.0f64;
+        let mut draft_ema = 3.0f64;
+        let mut verify_base_ema = 16.0f64;
+        while !done && pos + 2 <= max_ctx {
+            let max_w = (max_ctx - pos).min(8);
+            let n_draft = match fixed_width {
+                Some(w) => w.min(max_w) - 1,
+                None => max_w - 1,
+            };
+            let td = Instant::now();
+            let draft_pairs = engine.draft_with_margins(next_tok, pos, tap_row, n_draft).expect("draft");
+            let dt_d = td.elapsed().as_secs_f64() * 1000.0;
+            draft_ms += dt_d;
+            draft_ema = 0.8 * draft_ema + 0.2 * dt_d;
+
+            let calib = (obs_acc_ema / pred_acc_ema.max(0.5)).clamp(0.25, 1.05);
+            let mut probs = [0.0f64; 7];
+            for (k, &(_, mg)) in draft_pairs.iter().enumerate() {
+                let raw_p = 1.0 / (1.0 + (-(mg as f64)).exp());
+                probs[k] = (raw_p * calib).clamp(0.05, 0.98);
+            }
+            let spec_width = fixed_width.map(|w| w.min(max_w)).unwrap_or_else(|| {
+                let mut best_w = 2usize;
+                let mut best_rate = 0.0f64;
+                let mut surv = 1.0f64;
+                let mut exp_toks = 1.0f64;
+                for w in 2..=max_w {
+                    surv *= probs[w - 2];
+                    exp_toks += surv;
+                    let cost = draft_ema + verify_base_ema + 2.3 * (w - 1) as f64;
+                    let rate = exp_toks / cost;
+                    if rate > best_rate {
+                        best_rate = rate;
+                        best_w = w;
+                    }
+                }
+                best_w
             });
             width_hist[spec_width] += 1;
             let n = spec_width - 1;
-            let td = Instant::now();
-            let drafts = engine.draft(next_tok, pos, tap_row, n).expect("draft");
-            draft_ms += td.elapsed().as_secs_f64() * 1000.0;
             let mut block = Vec::with_capacity(spec_width);
             block.push(next_tok);
-            block.extend_from_slice(&drafts);
-            let tv = Instant::now();
-            engine.verify(&block, pos).expect("verify");
-            let am = engine.rows_argmax(spec_width).expect("verify argmax");
-            let mut c = 0usize;
-            while c < n && block[c + 1] == am[c] {
-                c += 1;
+            for &(t, _) in &draft_pairs[..n] {
+                block.push(t);
             }
+            let tv = Instant::now();
+            engine.verify_for_sampling(&block, pos, spec_greedy).expect("verify");
+            let (c, sampled_next) = engine.verify_sample(&block, &sampling, &generated).expect("verify sample");
             engine.verify_rewind(spec_width, c + 1).expect("verify rewind");
             engine.post_batch_tide_step().expect("post verify");
-            verify_ms += tv.elapsed().as_secs_f64() * 1000.0;
+            let dt_v = tv.elapsed().as_secs_f64() * 1000.0;
+            verify_ms += dt_v;
+            verify_base_ema = 0.85 * verify_base_ema + 0.15 * (dt_v - 2.3 * n as f64).clamp(10.0, 30.0);
             spec_steps += 1;
             spec_accepted += c;
             spec_hist[c] += 1;
+            // Update margin calibration over the evaluated prefix (accepted drafts + first rejection).
+            let eval_n = (c + 1).min(n);
+            let mut pred_sum = 0.0f64;
+            for k in 0..eval_n {
+                pred_sum += 1.0 / (1.0 + (-(draft_pairs[k].1 as f64)).exp());
+            }
+            pred_acc_ema = 0.85 * pred_acc_ema + pred_sum;
+            obs_acc_ema = 0.85 * obs_acc_ema + c as f64;
             acc_s = 0.85 * acc_s + c as f64;
             acc_f = 0.85 * acc_f + if c < n { 1.0 } else { 0.0 };
             for &t in &block[1..=c] {
@@ -1301,7 +1338,7 @@ fn run_generate(args: &[String]) {
             }
             pos += c + 1;
             tap_row = c;
-            next_tok = am[c];
+            next_tok = sampled_next;
             if !done && !emit(next_tok, &mut generated) {
                 done = true;
             }

@@ -64,10 +64,17 @@ pub(crate) struct PrefillScratch {
     moe_tmp: DeviceBuf,       // [M*8][H]
     moe_out: DeviceBuf,
     desc: DeviceBuf,
+    attn_part_o: DeviceBuf, // [MAX_BATCH_ROWS][n_q_heads][16][head_dim] for Split-K verify attn
+    attn_part_m: DeviceBuf, // [MAX_BATCH_ROWS][n_q_heads][16]
+    attn_part_l: DeviceBuf, // [MAX_BATCH_ROWS][n_q_heads][16]
     embed_host: PinnedBuf,
+    embed_done: Event,
+    embed_used: bool,
     desc_host: Vec<(PinnedBuf, Event, bool)>,
     desc_cursor: usize,
 }
+
+const VERIFY_ATTN_SPLITS: usize = 16;
 
 impl PrefillScratch {
     pub(crate) fn new<B: ComputeBackend>(b: &B, cfg: &smalltide_core::Inkling2Config) -> Result<Self> {
@@ -120,7 +127,12 @@ impl PrefillScratch {
             moe_tmp: f(m * 8 * h)?,
             moe_out: f(m * h)?,
             desc: b.alloc_device(DESC_BYTES)?,
+            attn_part_o: f(crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS * cfg.head_dim)?,
+            attn_part_m: f(crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS)?,
+            attn_part_l: f(crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS)?,
             embed_host: b.alloc_pinned(m * h * 4)?,
+            embed_done: b.create_event()?,
+            embed_used: false,
             desc_host,
             desc_cursor: 0,
         })
@@ -134,10 +146,12 @@ impl PrefillScratch {
             self.v, self.k_dyn, self.v_dyn, self.r, self.sinks, self.rel_table, self.attn_out,
             self.gate_out, self.o_raw, self.sconv_tmp, self.moe_in, self.moe_ctrl, self.moe_norm,
             self.router_logits, self.route, self.moe_mid, self.moe_tmp, self.moe_out, self.desc,
+            self.attn_part_o, self.attn_part_m, self.attn_part_l,
         ] {
             let _ = b.free_device(d);
         }
         let _ = b.free_pinned(self.embed_host);
+        let _ = b.destroy_event(self.embed_done);
         for (p, e, _) in self.desc_host {
             let _ = b.free_pinned(p);
             let _ = b.destroy_event(e);
@@ -156,7 +170,7 @@ pub(crate) enum RowsMode<'a> {
     /// Speculative verify: up to 8 consecutive tokens of the active lane at `pos0..` (prefill
     /// semantics: causal attention, sequential short convs) with decode-style device-side MoE
     /// (no host sync), logits for every row, and short-conv histories for the rewind.
-    Verify { pos0: usize },
+    Verify { pos0: usize, greedy: bool },
 }
 
 /// Row `r` of a `[m][n]` f32 buffer.
@@ -219,7 +233,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// logits buffer (`need_logits` ignored).
     pub(crate) fn rows_forward(&mut self, tokens: &[u32], mode: RowsMode, need_logits: bool) -> Result<()> {
         let pos0 = match mode {
-            RowsMode::Prefill { pos0 } | RowsMode::Verify { pos0 } => pos0,
+            RowsMode::Prefill { pos0 } | RowsMode::Verify { pos0, .. } => pos0,
             RowsMode::Decode { .. } => 0,
         };
         let verify = matches!(mode, RowsMode::Verify { .. });
@@ -232,10 +246,15 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let h = self.cfg.hidden_size;
         let eps = self.cfg.rms_norm_eps;
         let m = tokens.len();
-        let (cur, embed, embed_host) = {
+        let (cur, embed, embed_host, embed_done, embed_used) = {
             let pf = self.pf.as_ref().unwrap();
-            (pf.cur, pf.embed, pf.embed_host)
+            (pf.cur, pf.embed, pf.embed_host, pf.embed_done, pf.embed_used)
         };
+        if embed_used {
+            // Wait only if the previous chunk's H2D copy from `embed_host` hasn't finished yet
+            // (already complete on verify/decode steps, avoiding a mid-step GPU pipeline bubble).
+            self.backend.sync_event(embed_done)?;
+        }
         // Embedding rows (host BF16) -> pinned -> GPU -> embed RMSNorm.
         unsafe {
             let dst = self.backend.pinned_as_mut_slice(embed_host)?;
@@ -249,8 +268,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
         }
         self.backend.memcpy_h2d_async(embed, 0, embed_host, 0, m * h * 4, s)?;
-        // The pinned embed buffer is reused by the next chunk: make sure this copy has landed.
-        self.backend.sync_stream(s)?;
+        self.backend.record_event(embed_done, s)?;
+        self.pf.as_mut().unwrap().embed_used = true;
         self.backend.rms_norm(cur, embed, self.dense.embed_norm, m, h, eps, s)?;
 
         let n_log = self.layer_states.len();
@@ -346,7 +365,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let vocab = self.cfg.unpadded_vocab_size;
             let logits = self.batch_logits.expect("batch logits");
             self.backend.gemm_fp8_rows_decode(logits, moe_norm, self.dense.unembed_fp8.data, self.dense.unembed_fp8.row_scales, m, vocab, h, s)?;
-            if self.cfg.final_logit_softcapping > 0.0 {
+            let skip_softcap = matches!(mode, RowsMode::Verify { greedy: true, .. }) && self.dump.is_none();
+            if self.cfg.final_logit_softcapping > 0.0 && !skip_softcap {
                 self.backend.final_logit_softcap(logits, m * vocab, self.cfg.final_logit_softcapping, s)?;
             }
             if let (Some(dh), Some(dr)) = (dump_hidden, dump_routes) {
@@ -496,7 +516,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     ) -> Result<Vec<u32>> {
         let (pos0, lanes, verify) = match mode {
             RowsMode::Prefill { pos0 } => (pos0, None, false),
-            RowsMode::Verify { pos0 } => (pos0, None, true),
+            RowsMode::Verify { pos0, .. } => (pos0, None, true),
             RowsMode::Decode { rows } => (0, Some(rows), false),
         };
         // Verify: every short conv of this layer records its history (rewind after acceptance).
@@ -639,25 +659,35 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let fused_proj = self.rows_decode;
         let taps = nkv * cfg.sconv_kernel_size;
         if fused_proj {
-            // One launch: Q, K, V, R, the output gate (FP8), sinks and dynamic conv taps (F32).
             let seg = |mm: &crate::weights::Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment {
                 w: mm.data, row_scales: Some(mm.row_scales), x, y, n_rows: mm.n_rows, k_cols: mm.k_cols,
             };
-            let mut segs = vec![
+            let fp8_segs = [
                 seg(&layer.wq, nq, pf.q),
                 seg(&layer.wk, nk, pf.k_raw),
                 seg(&layer.wv, nv, pf.v_raw),
                 seg(&layer.wr, nq, pf.r),
                 seg(&layer.gate_attn, nq, pf.gate_out),
+            ];
+            let mut f32_segs = vec![
                 GemvSegment { w: layer.attn_sink, row_scales: None, x: nq, y: pf.sinks, n_rows: nqh, k_cols: h },
             ];
             if let Some(w) = layer.k_sconv_dyn_proj {
-                segs.push(GemvSegment { w, row_scales: None, x: nk, y: pf.k_dyn, n_rows: taps, k_cols: h });
+                f32_segs.push(GemvSegment { w, row_scales: None, x: nk, y: pf.k_dyn, n_rows: taps, k_cols: h });
             }
             if let Some(w) = layer.v_sconv_dyn_proj {
-                segs.push(GemvSegment { w, row_scales: None, x: nv, y: pf.v_dyn, n_rows: taps, k_cols: h });
+                f32_segs.push(GemvSegment { w, row_scales: None, x: nv, y: pf.v_dyn, n_rows: taps, k_cols: h });
             }
-            b.gemv_multi_rows(&segs, m, s)?;
+            if m >= 4 {
+                // Separate FP8 segments so gemv_multi_wmma fires on all 5 large projections.
+                b.gemv_multi_rows(&fp8_segs, m, s)?;
+                b.gemv_multi_rows(&f32_segs, m, s)?;
+            } else {
+                let mut segs = Vec::with_capacity(fp8_segs.len() + f32_segs.len());
+                segs.extend_from_slice(&fp8_segs);
+                segs.extend_from_slice(&f32_segs);
+                b.gemv_multi_rows(&segs, m, s)?;
+            }
         } else {
             self.mm_rows(pf.q, nq, &layer.wq, m, s)?;
             self.mm_rows(pf.k_raw, nk, &layer.wk, m, s)?;
@@ -783,22 +813,29 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 if !prepped {
                     b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, st.page_table, s)?;
                 }
-                b.attn_prefill_fp8(
-                    pf.attn_out, pf.q, st.k_cache, st.k_scales, st.v_cache, st.v_scales,
-                    Some(pf.rel_table), Some(pf.sinks),
-                    PrefillAttnParams {
-                        page_table: st.page_table,
-                        n_q_heads: nqh,
-                        n_kv_heads: nkv,
-                        max_seq: st.max_seq,
-                        window: if is_local { st.window } else { 0 },
-                        pos0,
-                        rows: m,
-                        rel_extent: cfg.rel_extent,
-                        inv_sqrt_d: 1.0 / (hd as f32).sqrt(),
-                    },
-                    s,
-                )?;
+                let attn_params = PrefillAttnParams {
+                    page_table: st.page_table,
+                    n_q_heads: nqh,
+                    n_kv_heads: nkv,
+                    max_seq: st.max_seq,
+                    window: if is_local { st.window } else { 0 },
+                    pos0,
+                    rows: m,
+                    rel_extent: cfg.rel_extent,
+                    inv_sqrt_d: 1.0 / (hd as f32).sqrt(),
+                };
+                if verify && m <= crate::engine::MAX_BATCH_ROWS {
+                    b.attn_prefill_fp8_split(
+                        pf.attn_out, pf.attn_part_o, pf.attn_part_m, pf.attn_part_l,
+                        pf.q, st.k_cache, st.k_scales, st.v_cache, st.v_scales,
+                        Some(pf.rel_table), Some(pf.sinks), attn_params, s,
+                    )?;
+                } else {
+                    b.attn_prefill_fp8(
+                        pf.attn_out, pf.q, st.k_cache, st.k_scales, st.v_cache, st.v_scales,
+                        Some(pf.rel_table), Some(pf.sinks), attn_params, s,
+                    )?;
+                }
             }
             Some(rows) => {
                 // Each row attends over its own lane's cache (decode flash attention).

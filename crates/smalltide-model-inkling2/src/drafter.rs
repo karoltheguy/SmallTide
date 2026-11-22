@@ -13,8 +13,8 @@
 use crate::weights::{Fp8MatrixGpu, Inkling2DenseGpu, Uploader};
 use smalltide_core::backend::GemvSegment;
 use smalltide_core::{ComputeBackend, DeviceBuf, PinnedBuf, QueueKind, Result, SmallTideError, Stream};
-use smalltide_io::dense_loader::{read_f32_vec, read_fp8_matrix, read_raw_bytes};
-use smalltide_io::quant::bf16_to_f32;
+use smalltide_io::dense_loader::{read_f32_vec, read_fp8_matrix, read_raw_bytes, Fp8MatrixHost};
+use smalltide_io::quant::{bf16_to_f32, f32_to_fp8_e4m3fn, FP8_E4M3FN_MAX};
 use smalltide_io::safetensors::inspect_safetensors_header;
 use std::fs::File;
 use std::path::Path;
@@ -30,9 +30,9 @@ const R: usize = 256;
 const WINDOW: usize = 1024;
 /// Local layers' context ring: the window plus a block of not-yet-committed positions.
 const RING: usize = WINDOW + 16;
+const MAX_ATTN_SPLITS: usize = 16;
 const THETA: f32 = 1.0e6;
 const EPS: f32 = 1e-6;
-const SOFTCAP: f32 = 30.0;
 
 struct DrafterLayer {
     local: bool,
@@ -51,51 +51,68 @@ struct DrafterLayer {
     q_norm: DeviceBuf,
     k_norm: DeviceBuf,
     k_norm_ctx: DeviceBuf,
-    /// Context K / V, f16 `[slots][HK * HD]` (local: ring of `RING`, else `max_seq`).
+    /// Context K / V in FP8 E4M3FN `[slots][HK * HD]` + per-head-pos f32 scales `[slots][HK]`.
     kc: DeviceBuf,
+    ks: DeviceBuf,
     vc: DeviceBuf,
+    vs: DeviceBuf,
 }
 
 struct Scratch {
-    stage: DeviceBuf, // [8][D] uploaded block input
-    res: DeviceBuf,   // [8][D]
-    xn: DeviceBuf,    // [8][D]
-    tmp: DeviceBuf,   // [8][D]
-    q: DeviceBuf,     // [8][HQ*HD]
-    kb: DeviceBuf,    // [8][HK*HD]
-    vb: DeviceBuf,    // [8][HK*HD]
-    att: DeviceBuf,   // [8][HQ*HD]
-    g: DeviceBuf,     // [8][FF]
-    u: DeviceBuf,     // [8][FF]
-    ctx_c: DeviceBuf, // [CHUNK][D]
-    ctx_k: DeviceBuf, // [CHUNK][HK*HD]
-    ctx_v: DeviceBuf, // [CHUNK][HK*HD]
-    base: DeviceBuf,  // [7][V]
-    frnn: DeviceBuf,  // [D]
-    z: DeviceBuf,     // [2R + 2D]
-    raw: DeviceBuf,   // [3R]
-    state: DeviceBuf, // [R]
-    latent: DeviceBuf,
-    drafts: DeviceBuf, // [8] u32
-    pmax: DeviceBuf,
-    pidx: DeviceBuf,
-    pinned: PinnedBuf, // [8][D] f32
+    anchor_in: DeviceBuf, // [D] f32 uploaded anchor embedding
+    res: DeviceBuf,       // [8][D]
+    xn: DeviceBuf,        // [8][D]
+    tmp: DeviceBuf,       // [8][D]
+    q: DeviceBuf,         // [8][HQ*HD]
+    kb: DeviceBuf,        // [8][HK*HD]
+    vb: DeviceBuf,        // [8][HK*HD]
+    att: DeviceBuf,       // [8][HQ*HD]
+    part_o: DeviceBuf,    // [8][HQ][MAX_ATTN_SPLITS][HD]
+    part_m: DeviceBuf,    // [8][HQ][MAX_ATTN_SPLITS]
+    part_l: DeviceBuf,    // [8][HQ][MAX_ATTN_SPLITS]
+    g: DeviceBuf,         // [8][FF]
+    u: DeviceBuf,         // [8][FF]
+    ctx_c: DeviceBuf,     // [CHUNK][D]
+    ctx_k: DeviceBuf,     // [CHUNK][HK*HD]
+    ctx_v: DeviceBuf,     // [CHUNK][HK*HD]
+    base: DeviceBuf,      // [7][V]
+    frnn: DeviceBuf,      // [D]
+    frnn_proj: DeviceBuf, // [3R]
+    hb_proj: DeviceBuf,   // [7][3R]
+    state: DeviceBuf,     // [R]
+    latent: DeviceBuf,    // [R]
+    drafts: DeviceBuf,    // [8] u32 (followed by [8] f32 margins in `drafts_and_margins`)
+    margins: DeviceBuf,   // [8] f32
+    pmax: DeviceBuf,      // [ceil(V/1024)]
+    pidx: DeviceBuf,      // [ceil(V/1024)]
+    pmax2: DeviceBuf,     // [ceil(V/1024)]
+    pinned: PinnedBuf,    // [D] f32 (single anchor row)
 }
 
 pub struct Drafter<B: ComputeBackend> {
     backend: Arc<B>,
     layers: Vec<DrafterLayer>,
     norm_w: DeviceBuf,
-    mask_embed: Vec<f32>,
+    mask_embed_gpu: DeviceBuf, // [D] f32 on GPU
     /// softmax(fuse_weight): per drafter layer + the Markov head, over the 4 taps.
     alpha: [[f32; 4]; 4],
     mk_norm: DeviceBuf,
-    w1: DeviceBuf, // bf16 [V_pad][R]
-    rnn_w: DeviceBuf,
+    /// `markov_w1` (`[V_pad][R]` bf16, ~103 MiB) kept in host-mapped pinned memory: each draft
+    /// step reads only 1 row (512 bytes), saving ~103 MiB of resident VRAM for experts.
+    w1: DeviceBuf,
+    w1_host: PinnedBuf,
+    /// Split Markov RNN weights: `[3R][2R]` f16 for dynamic `[state | w1[prev]]` (786 KB in L2),
+    /// plus per-row FP8 `[3R][D]` for `hb[0..n]` and `f_rnn` (precomputed once before the loop).
+    rnn_w_dyn: DeviceBuf,
+    rnn_w_h: Fp8MatrixGpu,
+    rnn_w_frnn: Fp8MatrixGpu,
     rnn_b: DeviceBuf,
-    fold16: DeviceBuf, // f16 [R][V]
-    fold_b: DeviceBuf, // [V]
+    /// Folded output projection `U @ hidden_out` quantized per-r to FP8 E4M3FN `[R][V_pad]`.
+    fold_fp8: DeviceBuf,
+    fold_scales: DeviceBuf, // [R] f32
+    fold_b: DeviceBuf,      // [V] f32
     vocab: usize,
+    vocab_pad: usize,
     max_seq: usize,
     chunk: usize,
     sc: Scratch,
@@ -109,10 +126,26 @@ fn bf16r(x: f32) -> f32 {
     f32::from_bits(r & 0xFFFF_0000)
 }
 
+fn quantize_f32_rows_to_fp8(src: &[f32], n_rows: usize, k_cols: usize) -> Fp8MatrixHost {
+    let mut data = vec![0u8; n_rows * k_cols];
+    let mut row_scales = vec![1.0f32; n_rows];
+    for r in 0..n_rows {
+        let row = &src[r * k_cols..(r + 1) * k_cols];
+        let mx = row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let (sc, inv) = if mx > 1e-12 { (mx / FP8_E4M3FN_MAX, FP8_E4M3FN_MAX / mx) } else { (1.0, 0.0) };
+        row_scales[r] = sc;
+        let dst = &mut data[r * k_cols..(r + 1) * k_cols];
+        for (d, &v) in dst.iter_mut().zip(row) {
+            *d = f32_to_fp8_e4m3fn(v * inv);
+        }
+    }
+    Fp8MatrixHost { n_rows, k_cols, data, row_scales }
+}
+
 impl<B: ComputeBackend> Drafter<B> {
-    /// Loads `mtp.safetensors` (dense projections quantized to FP8 per row) and folds the Markov
-    /// head's output projection into the target's unembedding (`fold = U @ hidden_out`, f16).
-    /// `chunk`: most rows one `ingest` carries (the prefill chunk).
+    /// Loads `mtp.safetensors` (dense projections quantized to FP8 per row), keeps `w1` in
+    /// host-mapped pinned memory, splits `rnn_proj` into dynamic/static blocks, uses FP8 context
+    /// KV, and folds `U @ hidden_out` into padded FP8 E4M3FN.
     pub fn load(backend: Arc<B>, path: &Path, dense: &Inkling2DenseGpu<B>, vocab: usize, max_seq: usize, chunk: usize) -> Result<Self> {
         let hdr = inspect_safetensors_header(path)?;
         let base = 8u64 + hdr.header_len;
@@ -121,6 +154,7 @@ impl<B: ComputeBackend> Drafter<B> {
         let stream = backend.create_stream(QueueKind::Compute)?;
         let up = Uploader { backend: backend.as_ref(), staging, stream };
         let mut bytes = 0usize;
+        let vocab_pad = (vocab + 15) & !15;
         let res = (|| -> Result<Self> {
             let fp8 = |f: &mut File, name: &str, bytes: &mut usize| -> Result<Fp8MatrixGpu> {
                 let m = read_fp8_matrix(f, &hdr, base, name)?;
@@ -148,14 +182,20 @@ impl<B: ComputeBackend> Drafter<B> {
                 let k_norm_ctx = vec(&mut f, "self_attn.k_norm_ctx.weight")?;
                 let local = l != 1;
                 let slots = if local { RING } else { max_seq };
-                let kc = backend.alloc_device(slots * HK * HD * 2)?;
-                let vc = backend.alloc_device(slots * HK * HD * 2)?;
-                bytes += 2 * slots * HK * HD * 2;
-                layers.push(DrafterLayer { local, in_ln, post_ln, dflare, q, k, v, k_ctx, v_ctx, o, gate, up: upm, down, q_norm, k_norm, k_norm_ctx, kc, vc });
+                let kc = backend.alloc_device(slots * HK * HD)?;
+                let ks = backend.alloc_device(slots * HK * 4)?;
+                let vc = backend.alloc_device(slots * HK * HD)?;
+                let vs = backend.alloc_device(slots * HK * 4)?;
+                bytes += 2 * slots * HK * (HD + 4);
+                layers.push(DrafterLayer {
+                    local, in_ln, post_ln, dflare, q, k, v, k_ctx, v_ctx, o, gate, up: upm, down,
+                    q_norm, k_norm, k_norm_ctx, kc, ks, vc, vs,
+                });
             }
             let rdv = |f: &mut File, name: &str| read_f32_vec(f, &hdr, base, name);
             let norm_w = up.upload_f32(&rdv(&mut f, "norm.weight")?)?;
-            let mask_embed: Vec<f32> = rdv(&mut f, "mask_embed")?.into_iter().map(bf16r).collect();
+            let mask_embed_vec: Vec<f32> = rdv(&mut f, "mask_embed")?.into_iter().map(bf16r).collect();
+            let mask_embed_gpu = up.upload_f32(&mask_embed_vec)?;
             let fw = rdv(&mut f, "fuse_weight")?;
             let mut alpha = [[0f32; 4]; 4];
             for r in 0..4 {
@@ -168,11 +208,40 @@ impl<B: ComputeBackend> Drafter<B> {
                 }
             }
             let mk_norm = up.upload_f32(&rdv(&mut f, "markov_head.dflare_norm.weight")?)?;
-            let w1 = up.upload_bytes(&read_raw_bytes(&mut f, &hdr, base, "markov_head.markov_w1.weight")?)?;
-            let rnn_w = up.upload_f32(&rdv(&mut f, "markov_head.rnn_proj.weight")?)?;
+
+            // Keep markov_w1 (~103 MiB BF16) in host-mapped pinned memory: 0 VRAM!
+            let w1_raw = read_raw_bytes(&mut f, &hdr, base, "markov_head.markov_w1.weight")?;
+            let (w1, w1_host) = backend.alloc_host_mapped(w1_raw.len())?;
+            unsafe {
+                backend.pinned_as_mut_slice(w1_host)?[..w1_raw.len()].copy_from_slice(&w1_raw);
+            }
+
+            // Split rnn_proj.weight [3R][2R + 2D] into W_dyn [3R][2R] (f16), W_h [3R][D] (FP8), W_frnn [3R][D] (FP8).
+            let rnn_w_full = rdv(&mut f, "markov_head.rnn_proj.weight")?;
+            let rnn_cols = 2 * R + 2 * D;
+            let mut w_dyn_f32 = vec![0.0f32; 3 * R * 2 * R];
+            let mut w_h_f32 = vec![0.0f32; 3 * R * D];
+            let mut w_frnn_f32 = vec![0.0f32; 3 * R * D];
+            for row in 0..(3 * R) {
+                let src = &rnn_w_full[row * rnn_cols..(row + 1) * rnn_cols];
+                w_dyn_f32[row * 2 * R..(row + 1) * 2 * R].copy_from_slice(&src[0..2 * R]);
+                w_h_f32[row * D..(row + 1) * D].copy_from_slice(&src[2 * R..2 * R + D]);
+                w_frnn_f32[row * D..(row + 1) * D].copy_from_slice(&src[2 * R + D..2 * R + 2 * D]);
+            }
+            let w_dyn_tmp = up.upload_f32(&w_dyn_f32)?;
+            let rnn_w_dyn = backend.alloc_device(3 * R * 2 * R * 2)?;
+            backend.f32_to_f16(rnn_w_dyn, w_dyn_tmp, 3 * R * 2 * R, stream)?;
+            backend.sync_stream(stream)?;
+            backend.free_device(w_dyn_tmp)?;
+            let rnn_w_h_host = quantize_f32_rows_to_fp8(&w_h_f32, 3 * R, D);
+            let rnn_w_frnn_host = quantize_f32_rows_to_fp8(&w_frnn_f32, 3 * R, D);
+            let rnn_w_h = up.upload_fp8(&rnn_w_h_host)?;
+            let rnn_w_frnn = up.upload_fp8(&rnn_w_frnn_host)?;
             let rnn_b = up.upload_f32(&rdv(&mut f, "markov_head.rnn_proj.bias")?)?;
-            bytes += w1.size_bytes + rnn_w.size_bytes;
+            bytes += rnn_w_dyn.size_bytes + rnn_w_h_host.byte_size() + rnn_w_frnn_host.byte_size();
+
             // fold: x[r] = hidden_out[:, r] (r < R), x[R] = hidden_out bias; y = U x -> [R + 1][V].
+            // Quantize y[0..R] per-r to padded FP8 E4M3FN [R][V_pad] + [R] f32 scales (-51 MiB VRAM, 2x less BW).
             let ho_w = rdv(&mut f, "markov_head.hidden_out.weight")?; // [D][R]
             let ho_b = rdv(&mut f, "markov_head.hidden_out.bias")?;
             let mut x = vec![0f32; (R + 1) * D];
@@ -186,18 +255,20 @@ impl<B: ComputeBackend> Drafter<B> {
             let y = backend.alloc_device((R + 1) * vocab * 4)?;
             let u = &dense.unembed_fp8;
             backend.gemm_fp8_rows(y, xd, u.data, u.row_scales, R + 1, vocab, D, stream)?;
-            let fold16 = backend.alloc_device(R * vocab * 2)?;
-            backend.f32_to_f16(fold16, y, R * vocab, stream)?;
+            let fold_fp8 = backend.alloc_device(R * vocab_pad)?;
+            let fold_scales = backend.alloc_device(R * 4)?;
+            backend.dspark_quant_fold_fp8(fold_fp8, fold_scales, y, R, vocab, vocab_pad, stream)?;
             let fold_b = backend.alloc_device(vocab * 4)?;
             backend.vec_copy(fold_b, y.slice(R * vocab * 4, vocab * 4), vocab, stream)?;
             backend.sync_stream(stream)?;
             backend.free_device(y)?;
             backend.free_device(xd)?;
-            bytes += fold16.size_bytes + fold_b.size_bytes;
+            bytes += fold_fp8.size_bytes + fold_scales.size_bytes + fold_b.size_bytes;
 
             let a = |n: usize| backend.alloc_device(n * 4);
+            let dm = a(2 * BLOCK)?;
             let sc = Scratch {
-                stage: a(BLOCK * D)?,
+                anchor_in: a(D)?,
                 res: a(BLOCK * D)?,
                 xn: a(BLOCK * D)?,
                 tmp: a(BLOCK * D)?,
@@ -205,6 +276,9 @@ impl<B: ComputeBackend> Drafter<B> {
                 kb: a(BLOCK * HK * HD)?,
                 vb: a(BLOCK * HK * HD)?,
                 att: a(BLOCK * HQ * HD)?,
+                part_o: a(BLOCK * HQ * MAX_ATTN_SPLITS * HD)?,
+                part_m: a(BLOCK * HQ * MAX_ATTN_SPLITS)?,
+                part_l: a(BLOCK * HQ * MAX_ATTN_SPLITS)?,
                 g: a(BLOCK * FF)?,
                 u: a(BLOCK * FF)?,
                 ctx_c: a(chunk * D)?,
@@ -212,29 +286,36 @@ impl<B: ComputeBackend> Drafter<B> {
                 ctx_v: a(chunk * HK * HD)?,
                 base: a((BLOCK - 1) * vocab)?,
                 frnn: a(D)?,
-                z: a(2 * R + 2 * D)?,
-                raw: a(3 * R)?,
+                frnn_proj: a(3 * R)?,
+                hb_proj: a((BLOCK - 1) * 3 * R)?,
                 state: a(R)?,
                 latent: a(R)?,
-                drafts: a(BLOCK)?,
-                pmax: a(vocab.div_ceil(256))?,
-                pidx: a(vocab.div_ceil(256))?,
-                pinned: backend.alloc_pinned(BLOCK * D * 4)?,
+                drafts: dm.slice(0, BLOCK * 4),
+                margins: dm.slice(BLOCK * 4, BLOCK * 4),
+                pmax: a(vocab.div_ceil(1024))?,
+                pidx: a(vocab.div_ceil(1024))?,
+                pmax2: a(vocab.div_ceil(1024))?,
+                pinned: backend.alloc_pinned(D * 4)?,
             };
-            bytes += ((BLOCK - 1) * vocab + chunk * (D + 2 * HK * HD)) * 4;
+            bytes += ((BLOCK - 1) * vocab + chunk * (D + 2 * HK * HD) + BLOCK * HQ * MAX_ATTN_SPLITS * (HD + 2)) * 4;
             Ok(Self {
                 backend: backend.clone(),
                 layers,
                 norm_w,
-                mask_embed,
+                mask_embed_gpu,
                 alpha,
                 mk_norm,
                 w1,
-                rnn_w,
+                w1_host,
+                rnn_w_dyn,
+                rnn_w_h,
+                rnn_w_frnn,
                 rnn_b,
-                fold16,
+                fold_fp8,
+                fold_scales,
                 fold_b,
                 vocab,
+                vocab_pad,
                 max_seq,
                 chunk,
                 sc,
@@ -272,7 +353,7 @@ impl<B: ComputeBackend> Drafter<B> {
                 b.gemm_fp8_rows(sc.ctx_v, sc.ctx_c, ly.v_ctx.data, ly.v_ctx.row_scales, m, kvd, D, s)?;
             }
             b.dspark_head_norm_rope(sc.ctx_k, ly.k_norm_ctx, HK, m, pos0, THETA, EPS, s)?;
-            b.dspark_ctx_store(ly.kc, ly.vc, sc.ctx_k, sc.ctx_v, pos0, m, if ly.local { RING } else { 0 }, kvd, s)?;
+            b.dspark_ctx_store_fp8(ly.kc, ly.ks, ly.vc, ly.vs, sc.ctx_k, sc.ctx_v, pos0, m, if ly.local { RING } else { 0 }, HK, s)?;
         }
         Ok(())
     }
@@ -281,13 +362,20 @@ impl<B: ComputeBackend> Drafter<B> {
     /// `p - 1` in `taps`. Context of positions `< p` must have been ingested.
     #[allow(clippy::too_many_arguments)]
     pub fn draft(&mut self, dense: &Inkling2DenseGpu<B>, anchor: u32, p: usize, taps: DeviceBuf, tap_stride: usize, tap_row: usize, n: usize, s: Stream) -> Result<Vec<u32>> {
+        Ok(self.draft_with_margins(dense, anchor, p, taps, tap_stride, tap_row, n, s)?.into_iter().map(|(t, _)| t).collect())
+    }
+
+    /// Like `draft`, returning `(token_id, top1_minus_top2_logit_margin)` per drafted token in one
+    /// combined 64-byte readback so the speculative loop can trim low-confidence tail drafts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft_with_margins(&mut self, dense: &Inkling2DenseGpu<B>, anchor: u32, p: usize, taps: DeviceBuf, tap_stride: usize, tap_row: usize, n: usize, s: Stream) -> Result<Vec<(u32, f32)>> {
         let n = n.clamp(1, BLOCK - 1);
         if p + BLOCK > self.max_seq {
             return Err(SmallTideError::Backend { backend: "drafter", message: format!("draft at {p} past max_seq") });
         }
         let b = self.backend.as_ref();
         let sc = &self.sc;
-        // Block input: anchor embedding (normed below), then bf16 mask embeddings.
+        // Upload only the single anchor embedding row (9 KB); mask_embed lives on GPU.
         unsafe {
             let dst = b.pinned_as_mut_slice(sc.pinned)?;
             let row = &dense.embed_bf16_host[anchor as usize * D * 2..(anchor as usize + 1) * D * 2];
@@ -295,52 +383,118 @@ impl<B: ComputeBackend> Drafter<B> {
                 let v = bf16_to_f32(u16::from_le_bytes([row[2 * i], row[2 * i + 1]]));
                 dst[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
             }
-            for r in 1..BLOCK {
-                for i in 0..D {
-                    let o = (r * D + i) * 4;
-                    dst[o..o + 4].copy_from_slice(&self.mask_embed[i].to_le_bytes());
-                }
-            }
         }
-        b.memcpy_h2d_async(sc.stage, 0, sc.pinned, 0, BLOCK * D * 4, s)?;
-        b.rms_norm(sc.res, sc.stage, dense.embed_norm, 1, D, EPS, s)?;
-        b.vec_copy(sc.res.slice(D * 4, (BLOCK - 1) * D * 4), sc.stage.slice(D * 4, (BLOCK - 1) * D * 4), (BLOCK - 1) * D, s)?;
-        b.rms_norm(sc.xn, sc.res, self.layers[0].in_ln, BLOCK, D, EPS, s)?;
+        b.memcpy_h2d_async(sc.anchor_in, 0, sc.pinned, 0, D * 4, s)?;
+        b.dspark_embed_prep(sc.res, sc.xn, sc.anchor_in, dense.embed_norm, self.mask_embed_gpu, self.layers[0].in_ln, D, EPS, s)?;
+
         let seg = |m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment { w: m.data, row_scales: Some(m.row_scales), x, y, n_rows: m.n_rows, k_cols: m.k_cols };
         let scale = 1.0 / (HD as f32).sqrt();
         for (l, ly) in self.layers.iter().enumerate() {
             b.gemv_multi_rows(&[seg(&ly.q, sc.xn, sc.q), seg(&ly.k, sc.xn, sc.kb), seg(&ly.v, sc.xn, sc.vb)], BLOCK, s)?;
-            b.dspark_head_norm_rope(sc.q, ly.q_norm, HQ, BLOCK, p, THETA, EPS, s)?;
-            b.dspark_head_norm_rope(sc.kb, ly.k_norm, HK, BLOCK, p, THETA, EPS, s)?;
+            b.dspark_qk_norm_rope(sc.q, sc.kb, ly.q_norm, ly.k_norm, HQ, HK, BLOCK, p, THETA, EPS, s)?;
             let (lo, ring) = if ly.local { (p.saturating_sub(WINDOW), RING) } else { (0, 0) };
-            b.dspark_attn(sc.att, sc.q, sc.kb, sc.vb, ly.kc, ly.vc, BLOCK, p, lo, ring, HQ, HK, BLOCK, scale, s)?;
+            b.dspark_attn_fp8(
+                sc.att, sc.part_o, sc.part_m, sc.part_l,
+                sc.q, sc.kb, sc.vb, ly.kc, ly.ks, ly.vc, ly.vs,
+                BLOCK, p, lo, ring, HQ, HK, BLOCK, scale, s,
+            )?;
             b.gemv_multi_rows(&[seg(&ly.o, sc.att, sc.tmp)], BLOCK, s)?;
-            b.vec_add(sc.res, sc.res, sc.tmp, BLOCK * D, s)?;
-            b.rms_norm(sc.xn, sc.res, ly.post_ln, BLOCK, D, EPS, s)?;
+            b.add_rmsnorm_rows(sc.res, sc.xn, sc.tmp, ly.post_ln, BLOCK, D, EPS, s)?;
             b.gemv_multi_rows(&[seg(&ly.gate, sc.xn, sc.g), seg(&ly.up, sc.xn, sc.u)], BLOCK, s)?;
             b.silu_mul(sc.g, sc.g, sc.u, BLOCK * FF, s)?;
             b.gemv_multi_rows(&[seg(&ly.down, sc.g, sc.tmp)], BLOCK, s)?;
-            b.vec_add(sc.res, sc.res, sc.tmp, BLOCK * D, s)?;
             let next = if l + 1 < self.layers.len() { self.layers[l + 1].in_ln } else { self.norm_w };
-            b.rms_norm(sc.xn, sc.res, next, BLOCK, D, EPS, s)?;
+            b.add_rmsnorm_rows(sc.res, sc.xn, sc.tmp, next, BLOCK, D, EPS, s)?;
         }
-        // Markov head: base logits of block rows 1.., the context feature of position p - 1.
+
+        // Markov head: base logits of block rows 1..=n, plus precomputed loop-invariant RNN projections.
         let hb = sc.xn.slice(D * 4, (BLOCK - 1) * D * 4);
         let u = &dense.unembed_fp8;
         b.gemm_fp8_rows_decode(sc.base, hb, u.data, u.row_scales, n, self.vocab, D, s)?;
         let toff = tap_row * D * 4;
         b.dspark_mix_rms(sc.frnn, taps.slice(toff, taps.size_bytes - toff), tap_stride, self.alpha[3], self.mk_norm, 1, D, EPS, s)?;
+        b.gemv_fp8(sc.frnn_proj, sc.frnn, self.rnn_w_frnn.data, self.rnn_w_frnn.row_scales, 3 * R, D, s)?;
+        b.gemm_fp8_rows_decode(sc.hb_proj, hb, self.rnn_w_h.data, self.rnn_w_h.row_scales, n, 3 * R, D, s)?;
         b.zero_f32(sc.state, R, s)?;
         for i in 0..n {
-            b.dspark_markov_step(
-                sc.z, sc.raw, sc.state, sc.latent, self.w1, sc.drafts, i, anchor,
-                hb.slice(i * D * 4, D * 4), sc.frnn, self.rnn_w, self.rnn_b,
-                sc.base.slice(i * self.vocab * 4, self.vocab * 4), self.fold_b, self.fold16, sc.pmax, sc.pidx,
-                R, D, self.vocab, SOFTCAP, s,
+            b.dspark_markov_step_fast(
+                sc.state, sc.latent, self.w1, sc.drafts, sc.margins, i, anchor,
+                self.rnn_w_dyn, sc.frnn_proj, sc.hb_proj.slice(i * 3 * R * 4, 3 * R * 4), self.rnn_b,
+                sc.base.slice(i * self.vocab * 4, self.vocab * 4), self.fold_b,
+                self.fold_fp8, self.fold_scales, sc.pmax, sc.pidx, sc.pmax2,
+                R, self.vocab, self.vocab_pad, s,
             )?;
         }
-        let mut out = vec![0u8; n * 4];
-        b.memcpy_d2h_sync(&mut out, sc.drafts.slice(0, n * 4), 0, s)?;
-        Ok(out.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        // drafts[0..BLOCK] and margins[0..BLOCK] are contiguous in one 64-byte allocation.
+        let mut out = [0u8; 2 * BLOCK * 4];
+        let full = DeviceBuf { id: sc.drafts.id, offset_bytes: 0, size_bytes: 2 * BLOCK * 4 };
+        b.memcpy_d2h_sync(&mut out, full, 0, s)?;
+        Ok((0..n)
+            .map(|i| {
+                let id = u32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap());
+                let mg = f32::from_le_bytes(out[(BLOCK + i) * 4..(BLOCK + i) * 4 + 4].try_into().unwrap());
+                (id, mg)
+            })
+            .collect())
+    }
+
+    /// Fixed-size local context KV rings + scales (layers 0 & 2, ~4.2 MiB total) for prefix snapshots.
+    pub fn local_kv_regions(&self) -> Vec<DeviceBuf> {
+        let mut v = Vec::new();
+        for ly in &self.layers {
+            if ly.local {
+                v.extend_from_slice(&[ly.kc, ly.ks, ly.vc, ly.vs]);
+            }
+        }
+        v
+    }
+
+    /// Global context KV + scales (layer 1): `(buf, bytes_per_pos)` for prefix snapshots (~2.1 KB/pos).
+    pub fn global_kv_regions(&self) -> Vec<(DeviceBuf, usize)> {
+        let mut v = Vec::new();
+        for ly in &self.layers {
+            if !ly.local {
+                v.push((ly.kc, HK * HD));
+                v.push((ly.ks, HK * 4));
+                v.push((ly.vc, HK * HD));
+                v.push((ly.vs, HK * 4));
+            }
+        }
+        v
+    }
+}
+
+impl<B: ComputeBackend> Drop for Drafter<B> {
+    fn drop(&mut self) {
+        let b = self.backend.as_ref();
+        for ly in &self.layers {
+            for m in [&ly.q, &ly.k, &ly.v, &ly.k_ctx, &ly.v_ctx, &ly.o, &ly.gate, &ly.up, &ly.down] {
+                let _ = b.free_device(m.data);
+                let _ = b.free_device(m.row_scales);
+            }
+            for buf in [ly.in_ln, ly.post_ln, ly.dflare, ly.q_norm, ly.k_norm, ly.k_norm_ctx, ly.kc, ly.ks, ly.vc, ly.vs] {
+                let _ = b.free_device(buf);
+            }
+        }
+        for m in [&self.rnn_w_h, &self.rnn_w_frnn] {
+            let _ = b.free_device(m.data);
+            let _ = b.free_device(m.row_scales);
+        }
+        for buf in [
+            self.norm_w, self.mask_embed_gpu, self.mk_norm, self.w1, self.rnn_w_dyn, self.rnn_b,
+            self.fold_fp8, self.fold_scales, self.fold_b,
+        ] {
+            let _ = b.free_device(buf);
+        }
+        let _ = b.free_pinned(self.w1_host);
+        let sc = &self.sc;
+        for buf in [
+            sc.anchor_in, sc.res, sc.xn, sc.tmp, sc.q, sc.kb, sc.vb, sc.att,
+            sc.part_o, sc.part_m, sc.part_l, sc.g, sc.u, sc.ctx_c, sc.ctx_k, sc.ctx_v,
+            sc.base, sc.frnn, sc.frnn_proj, sc.hb_proj, sc.state, sc.latent, sc.drafts, sc.pmax, sc.pidx, sc.pmax2,
+        ] {
+            let _ = b.free_device(buf);
+        }
+        let _ = b.free_pinned(sc.pinned);
     }
 }

@@ -749,6 +749,61 @@ extern "C" __global__ void smalltide_gemv_multi_rows(GemvMultiArgs a, uint32_t m
     }
 }
 
+// Multi-segment WMMA FP8 GEMM for <= 16 rows (all segments FP8, n_rows % 16 == 0, k_cols % 32 == 0).
+// 2 warps/block (32 rows/block -> high CU occupancy on 2304-row down/o projections!) + 2x K-unroll.
+//   Grid: (ceil(total_rows / 32)), Block: 64
+extern "C" __global__ void smalltide_gemv_multi_wmma(GemvMultiArgs a, uint32_t m_rows) {
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t n0 = (blockIdx.x * 2u + warp) * 16u;
+    if (n0 >= a.total_rows) return;
+    uint32_t si = 0u;
+    #pragma unroll
+    for (uint32_t i = 1u; i < 8u; ++i) {
+        if (i < a.n_seg && n0 >= a.seg[i].row_start) si = i;
+    }
+    const GemvSeg sg = a.seg[si];
+    uint32_t row = (n0 - sg.row_start) + (l & 15u);
+    bool b_ok = row < sg.n_rows;
+    uint32_t am = l & 15u;
+    bool a_ok = am < m_rows;
+    const float* xr = sg.x + static_cast<size_t>(a_ok ? am : 0u) * sg.k_cols;
+    const uint8_t* wr = sg.w + static_cast<size_t>(b_ok ? row : 0u) * sg.k_cols;
+    st_float8 c = {};
+    uint32_t hoff = (l >> 4) * 16u;
+    auto step32 = [&](uint32_t base, uint4 wv) {
+        const float4* xp = reinterpret_cast<const float4*>(xr + base);
+        float4 x0 = a_ok ? xp[0] : make_float4(0, 0, 0, 0), x1 = a_ok ? xp[1] : make_float4(0, 0, 0, 0);
+        float4 x2 = a_ok ? xp[2] : make_float4(0, 0, 0, 0), x3 = a_ok ? xp[3] : make_float4(0, 0, 0, 0);
+        st_half8 a0, a1;
+        a0[0] = (_Float16)x0.x; a0[1] = (_Float16)x0.y; a0[2] = (_Float16)x0.z; a0[3] = (_Float16)x0.w;
+        a0[4] = (_Float16)x1.x; a0[5] = (_Float16)x1.y; a0[6] = (_Float16)x1.z; a0[7] = (_Float16)x1.w;
+        a1[0] = (_Float16)x2.x; a1[1] = (_Float16)x2.y; a1[2] = (_Float16)x2.z; a1[3] = (_Float16)x2.w;
+        a1[4] = (_Float16)x3.x; a1[5] = (_Float16)x3.y; a1[6] = (_Float16)x3.z; a1[7] = (_Float16)x3.w;
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, fp8x8_to_half8(make_uint2(wv.x, wv.y)), c);
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, fp8x8_to_half8(make_uint2(wv.z, wv.w)), c);
+    };
+    uint32_t k = 0u;
+    for (; k + 64u <= sg.k_cols; k += 64u) {
+        uint32_t b0 = k + hoff, b1 = k + 32u + hoff;
+        uint4 w0 = b_ok ? *reinterpret_cast<const uint4*>(wr + b0) : make_uint4(0u, 0u, 0u, 0u);
+        uint4 w1 = b_ok ? *reinterpret_cast<const uint4*>(wr + b1) : make_uint4(0u, 0u, 0u, 0u);
+        step32(b0, w0);
+        step32(b1, w1);
+    }
+    if (k < sg.k_cols) {
+        uint32_t b0 = k + hoff;
+        uint4 w0 = b_ok ? *reinterpret_cast<const uint4*>(wr + b0) : make_uint4(0u, 0u, 0u, 0u);
+        step32(b0, w0);
+    }
+    if (!b_ok) return;
+    float sc = (sg.scale != nullptr) ? sg.scale[row] : 1.0f;
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        uint32_t mm = (l >> 4) * 8u + i;
+        if (mm < m_rows) sg.y[static_cast<size_t>(mm) * sg.n_rows + row] = c[i] * sc;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Attention prep for `rows` consecutive positions of one sequence (speculative verify): the
 // decode fusion with the K/V short convs run row by row (+ verify histories), FP8 KV store at

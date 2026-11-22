@@ -299,6 +299,8 @@ struct ActiveReq {
     generated: Vec<u32>,
     /// Position the pending `next_tok` will be fed at.
     pos: usize,
+    /// Tap row index of `pos - 1` in `engine.taps_buf` (for DSpark speculative drafting).
+    tap_row: usize,
     /// Sampled, already streamed to the client, not yet fed to the model.
     next_tok: u32,
     finish_reason: &'static str,
@@ -505,6 +507,16 @@ fn engine_worker_loop(
     let mut last_prefill_tok_s: f64 = 0.0;
     let max_lane_ctx = (0..n_lanes).map(|l| engine.lane_max_seq(l)).max().unwrap_or(0);
     let batch_decode = std::env::var("SMALLTIDE_BATCH_DECODE").map(|v| v != "0").unwrap_or(true);
+    let fixed_spec_width = std::env::var("SMALLTIDE_SPEC_WIDTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|w| w.clamp(2, 8));
+    // Tracks which `(lane, committed_pos)` currently matches the single DSpark drafter's KV cache.
+    let mut drafter_state: Option<(usize, usize)> = None;
+    let mut spec_pred_ema = 3.0f64;
+    let mut spec_obs_ema = 2.0f64;
+    let mut spec_draft_ema = 3.0f64;
+    let mut spec_vbase_ema = 16.0f64;
 
     loop {
         // 1. Commands: block only when there is nothing to do.
@@ -665,11 +677,22 @@ fn engine_worker_loop(
                         if let Some(d) = &memory {
                             let _ = engine.anticipate(d);
                         }
+                        let drafter_coherent_in = engine.drafter.is_some()
+                            && match &plan {
+                                PrefixPlan::Reset => true,
+                                PrefixPlan::Extend { from } => drafter_state.is_some_and(|(dl, dp)| {
+                                    dl == lane && (*from == dp || (dp <= 1024 && *from <= dp))
+                                }),
+                                PrefixPlan::Restore { snap_idx, .. } => pc.snapshot(*snap_idx).drafter_valid,
+                            };
                         if let Some(req) = admit(
                             &mut engine, &tok, &mut pc, lane, plan, prompt_ids, is_chat, forced_tool,
-                            single_tool_call, max_tokens, sampling, stop_strings, cache_prompt, event_tx,
-                            &mut last_prefill_tok_s,
+                            single_tool_call, max_tokens, sampling, stop_strings, cache_prompt,
+                            drafter_coherent_in, event_tx, &mut last_prefill_tok_s,
                         ) {
+                            if engine.drafter.is_some() {
+                                drafter_state = drafter_coherent_in.then_some((lane, req.pos));
+                            }
                             let mut req = req;
                             if req.accept(&tok, engine.lane_max_seq(lane)) {
                                 active[lane] = Some(req);
@@ -677,6 +700,7 @@ fn engine_worker_loop(
                                 last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
                             }
                         } else {
+                            drafter_state = None;
                             engine.set_lane_pinned(lane, false);
                         }
                         for l in engine.take_lost_lanes() {
@@ -713,6 +737,7 @@ fn engine_worker_loop(
         }
         let act: Vec<usize> = (0..n_lanes).filter(|&l| active[l].is_some()).collect();
         if act.len() >= 2 && batch_decode {
+            drafter_state = None;
             let rows: Vec<(usize, u32, usize)> = act
                 .iter()
                 .map(|&l| {
@@ -753,8 +778,128 @@ fn engine_worker_loop(
             }
             continue;
         }
+        // Single-lane speculative decoding (greedy & stochastic rejection sampling) when DSpark is coherent.
+        if act.len() == 1 && engine.drafter.is_some() {
+            let l = act[0];
+            let can_spec = active[l].as_ref().is_some_and(|req| {
+                drafter_state == Some((l, req.pos))
+                    && req.pos + 2 <= engine.lane_max_seq(l)
+            });
+            if can_spec {
+                let req_pos = active[l].as_ref().unwrap().pos;
+                let mut max_w = (engine.lane_max_seq(l) - req_pos).min(8);
+                while max_w >= 2 && !matches!(engine.kv_reserve(l, req_pos + max_w), Ok(true)) {
+                    max_w -= 1;
+                }
+                for lost in engine.take_lost_lanes() {
+                    pc.invalidate(lost);
+                }
+                if max_w >= 2 {
+                    engine.select_lane(l);
+                    let req = active[l].as_mut().unwrap();
+                    let n_draft = fixed_spec_width.map(|w| w.min(max_w) - 1).unwrap_or(max_w - 1);
+                    let td = Instant::now();
+                    let step_res = engine.draft_with_margins(req.next_tok, req.pos, req.tap_row, n_draft);
+                    let dt_d = td.elapsed().as_secs_f64() * 1000.0;
+                    let mut done = false;
+                    match step_res {
+                        Err(e) => {
+                            let _ = req.event_tx.send(StreamEvent::Error(engine_error("draft error", &e.to_string())));
+                            pc.invalidate(l);
+                            drafter_state = None;
+                            done = true;
+                        }
+                        Ok(draft_pairs) => {
+                            spec_draft_ema = 0.8 * spec_draft_ema + 0.2 * dt_d;
+                            let calib = (spec_obs_ema / spec_pred_ema.max(0.5)).clamp(0.25, 1.05);
+                            let mut probs = [0.0f64; 7];
+                            for (k, &(_, mg)) in draft_pairs.iter().enumerate() {
+                                probs[k] = (1.0 / (1.0 + (-(mg as f64)).exp()) * calib).clamp(0.05, 0.98);
+                            }
+                            let spec_width = fixed_spec_width.map(|w| w.min(max_w)).unwrap_or_else(|| {
+                                let (mut best_w, mut best_rate, mut surv, mut exp_toks) = (2usize, 0.0f64, 1.0f64, 1.0f64);
+                                for w in 2..=max_w {
+                                    surv *= probs[w - 2];
+                                    exp_toks += surv;
+                                    let cost = spec_draft_ema + spec_vbase_ema + 2.3 * (w - 1) as f64;
+                                    let rate = exp_toks / cost;
+                                    if rate > best_rate {
+                                        best_rate = rate;
+                                        best_w = w;
+                                    }
+                                }
+                                best_w
+                            });
+                            let n = spec_width - 1;
+                            let mut block = Vec::with_capacity(spec_width);
+                            block.push(req.next_tok);
+                            for &(t, _) in &draft_pairs[..n] {
+                                block.push(t);
+                            }
+                            let greedy = req.sampling.temperature <= 0.0
+                                && (req.sampling.repetition_penalty - 1.0).abs() < 1e-6;
+                            let tv = Instant::now();
+                            let vres = engine
+                                .verify_for_sampling(&block, req.pos, greedy)
+                                .and_then(|_| engine.verify_sample(&block, &req.sampling, &req.generated));
+                            match vres {
+                                Err(e) => {
+                                    let _ = req.event_tx.send(StreamEvent::Error(engine_error("verify error", &e.to_string())));
+                                    pc.invalidate(l);
+                                    drafter_state = None;
+                                    done = true;
+                                }
+                                Ok((c, next_tok)) => {
+                                    if let Err(e) = engine.verify_rewind(spec_width, c + 1) {
+                                        let _ = req.event_tx.send(StreamEvent::Error(engine_error("verify rewind error", &e.to_string())));
+                                        pc.invalidate(l);
+                                        drafter_state = None;
+                                        done = true;
+                                    } else {
+                                        let _ = engine.post_batch_tide_step();
+                                        let dt_v = tv.elapsed().as_secs_f64() * 1000.0;
+                                        spec_vbase_ema = 0.85 * spec_vbase_ema + 0.15 * (dt_v - 2.3 * n as f64).clamp(10.0, 30.0);
+                                        let eval_n = (c + 1).min(n);
+                                        let pred_sum: f64 = (0..eval_n)
+                                            .map(|k| 1.0 / (1.0 + (-(draft_pairs[k].1 as f64)).exp()))
+                                            .sum();
+                                        spec_pred_ema = 0.85 * spec_pred_ema + pred_sum;
+                                        spec_obs_ema = 0.85 * spec_obs_ema + c as f64;
+                                        pc.live[l].extend_from_slice(&block[..=c]);
+                                        req.pos += c + 1;
+                                        req.tap_row = c;
+                                        drafter_state = Some((l, req.pos));
+                                        let lane_max = engine.lane_max_seq(l);
+                                        for &t in &block[1..=c] {
+                                            req.next_tok = t;
+                                            if !req.accept(&tok, lane_max) {
+                                                done = true;
+                                                break;
+                                            }
+                                        }
+                                        if !done {
+                                            req.next_tok = next_tok;
+                                            if !req.accept(&tok, lane_max) {
+                                                done = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if done {
+                        let req = active[l].take().unwrap();
+                        last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    }
+                    continue;
+                }
+            }
+        }
+
         for l in 0..n_lanes {
             let Some(req) = active[l].as_mut() else { continue };
+            drafter_state = None;
             engine.select_lane(l);
             let mut done = false;
             if let Err(e) = engine.forward_token(req.next_tok, req.pos, false, true) {
@@ -803,6 +948,7 @@ fn admit(
     sampling: SamplingParams,
     stop_strings: Vec<String>,
     cache_prompt: bool,
+    drafter_coherent: bool,
     event_tx: Sender<StreamEvent>,
     last_prefill_tok_s: &mut f64,
 ) -> Option<ActiveReq> {
@@ -876,7 +1022,7 @@ fn admit(
         }
         if cache_prompt && points.contains(&a) && !pc.has_snapshot_of(&prompt_ids[..a]) {
             let mut slot = pc.take_payload(a);
-            match engine.snapshot_state(a, &mut slot) {
+            match engine.snapshot_state_opt(a, &mut slot, drafter_coherent) {
                 Ok(()) => pc.insert_kind(lane, a, slot.unwrap(), Some(a) == shared_point),
                 Err(e) => eprintln!("[prefix-cache] snapshot at {a} failed: {e}"),
             }
@@ -925,6 +1071,7 @@ fn admit(
         t_dec: Instant::now(),
         generated: Vec::with_capacity(max_tokens.min(4096)),
         pos: end,
+        tap_row: engine.last_tap_rows.max(1) - 1,
         next_tok,
         finish_reason: "length",
         log_text: 0,

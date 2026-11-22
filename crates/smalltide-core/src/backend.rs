@@ -761,6 +761,81 @@ pub trait ComputeBackend: Send + Sync {
         base: DeviceBuf, fold_b: DeviceBuf, fold16: DeviceBuf, pmax: DeviceBuf, pidx: DeviceBuf, r: usize, d: usize,
         v: usize, cap: f32, stream: Stream) -> Result<()>;
 
+    /// Quantizes `[r][v]` f32 fold matrix -> `[r][v_pad]` FP8 E4M3FN + `[r]` f32 row scales.
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_quant_fold_fp8(&self, _dst: DeviceBuf, _scales: DeviceBuf, _src: DeviceBuf,
+        _r: usize, _v: usize, _v_pad: usize, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("dspark_quant_fold_fp8".into()))
+    }
+
+    /// Optimized Markov step: fused RNN step (f16 W_dyn + precomputed frnn_proj & hb_proj) +
+    /// vectorized FP8 fold matvec + top-2 argmax into `drafts[step]` and `margins[step]`.
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_markov_step_fast(&self, _state: DeviceBuf, _latent: DeviceBuf, _w1: DeviceBuf,
+        _drafts: DeviceBuf, _margins: DeviceBuf, _step: usize, _anchor: u32, _w_dyn: DeviceBuf,
+        _frnn_proj: DeviceBuf, _hb_proj: DeviceBuf, _rnn_b: DeviceBuf, _base: DeviceBuf,
+        _fold_b: DeviceBuf, _fold_fp8: DeviceBuf, _fold_scales: DeviceBuf,
+        _pmax: DeviceBuf, _pidx: DeviceBuf, _pmax2: DeviceBuf,
+        _r: usize, _v: usize, _v_pad: usize, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("dspark_markov_step_fast".into()))
+    }
+
+    /// Parallel 2-pass greedy argmax of `rows` rows of `n` f32: `out[r]` u32 (`scratch` holds
+    /// `rows * 16` f32 values + `rows * 16` u32 indices).
+    fn argmax_rows_fast(&self, out: DeviceBuf, scratch: DeviceBuf, x: DeviceBuf, rows: usize, n: usize, stream: Stream) -> Result<()> {
+        let _ = scratch;
+        self.argmax_rows(out, x, rows, n, stream)
+    }
+
+    /// Split-K WMMA causal attention for low-row speculative verify (`rows <= 8`). Falls back to
+    /// `attn_prefill_fp8` when key count is short or backend lacks Split-K.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_prefill_fp8_split(&self, out: DeviceBuf, _part_o: DeviceBuf, _part_m: DeviceBuf, _part_l: DeviceBuf,
+        q: DeviceBuf, k_cache: DeviceBuf, k_scales: DeviceBuf, v_cache: DeviceBuf, v_scales: DeviceBuf,
+        rel_table: Option<DeviceBuf>, sinks: Option<DeviceBuf>, params: PrefillAttnParams, stream: Stream) -> Result<()> {
+        self.attn_prefill_fp8(out, q, k_cache, k_scales, v_cache, v_scales, rel_table, sinks, params, stream)
+    }
+
+    /// FP8 context K/V store of `rows` rows at positions `pos0..` (`ring` = 0: linear).
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_ctx_store_fp8(&self, _kc: DeviceBuf, _ks: DeviceBuf, _vc: DeviceBuf, _vs: DeviceBuf,
+        _k: DeviceBuf, _v: DeviceBuf, _pos0: usize, _rows: usize, _ring: usize, _nkv: usize,
+        _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("dspark_ctx_store_fp8".into()))
+    }
+
+    /// Grouped Split-K FP8 drafter attention (`rows == nblk == 8`, `nh == 3 * nkv`).
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_attn_fp8(&self, _out: DeviceBuf, _part_o: DeviceBuf, _part_m: DeviceBuf, _part_l: DeviceBuf,
+        _q: DeviceBuf, _kb: DeviceBuf, _vb: DeviceBuf, _kc: DeviceBuf, _ks: DeviceBuf,
+        _vc: DeviceBuf, _vs: DeviceBuf, _rows: usize, _p: usize, _lo: usize, _ring: usize,
+        _nh: usize, _nkv: usize, _nblk: usize, _scale: f32, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("dspark_attn_fp8".into()))
+    }
+
+    /// Fused drafter block input prep (`res[0]=rmsnorm(anchor_in, embed_norm)`, `res[1..8]=mask_embed`, `xn=rmsnorm(res, in_ln)`).
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_embed_prep(&self, _res: DeviceBuf, _xn: DeviceBuf, _anchor_in: DeviceBuf,
+        _embed_norm: DeviceBuf, _mask_embed: DeviceBuf, _in_ln: DeviceBuf, _d: usize, _eps: f32,
+        _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("dspark_embed_prep".into()))
+    }
+
+    /// Fused `res += tmp; xn = RMSNorm(res, w)` over `rows` rows.
+    #[allow(clippy::too_many_arguments)]
+    fn add_rmsnorm_rows(&self, _res: DeviceBuf, _xn: DeviceBuf, _tmp: DeviceBuf, _w: DeviceBuf,
+        _rows: usize, _d: usize, _eps: f32, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("add_rmsnorm_rows".into()))
+    }
+
+    /// Fused Q + K per-head RMSNorm + neox RoPE in one launch.
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_qk_norm_rope(&self, _q: DeviceBuf, _k: DeviceBuf, _qw: DeviceBuf, _kw: DeviceBuf,
+        _hq: usize, _hk: usize, _rows: usize, _pos0: usize, _theta: f32, _eps: f32,
+        _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("dspark_qk_norm_rope".into()))
+    }
+
     /// Device address of `buf` (for pointer tables consumed by kernels).
     fn device_address(&self, buf: DeviceBuf) -> Result<u64>;
 
@@ -844,4 +919,22 @@ pub trait ComputeBackend: Send + Sync {
 
     /// Final fixed-order reduce of `tmp[M*8][H]` into `out[M][H]`.
     fn moe_reduce_rows(&self, out: DeviceBuf, tmp: DeviceBuf, hidden: usize, rows: usize, stream: Stream) -> Result<()>;
+
+    /// Extracts `(idx, val)` entries per row with `val >= row_max[r] - margin` into compact
+    /// `[rows][cap]` buffers (for fast stochastic verify sampling: ~16 KB D2H instead of 6.4 MB).
+    #[allow(clippy::too_many_arguments)]
+    fn logits_filter_rows(
+        &self,
+        out_idx: DeviceBuf,
+        out_val: DeviceBuf,
+        counts: DeviceBuf,
+        row_max: DeviceBuf,
+        scratch: DeviceBuf,
+        x: DeviceBuf,
+        rows: usize,
+        n: usize,
+        margin: f32,
+        cap: usize,
+        stream: Stream,
+    ) -> Result<()>;
 }

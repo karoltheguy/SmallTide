@@ -69,10 +69,12 @@ impl Default for SamplingParams {
     }
 }
 
-/// Rewindable sequence state (local KV rings + short-conv histories) after `pos` tokens,
-/// held in pinned host RAM. Created and restored by `Inkling2Engine::{snapshot,restore}_state`.
+/// Rewindable sequence state (local KV rings + short-conv histories, plus optional DSpark drafter
+/// KV state) after `pos` tokens, held in pinned host RAM. Created and restored by
+/// `Inkling2Engine::{snapshot,restore}_state`.
 pub struct SeqSnapshot {
     pub pos: usize,
+    pub drafter_valid: bool,
     host: PinnedBuf,
 }
 
@@ -264,8 +266,10 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// final normed hidden), filled when `capture_taps`.
     pub(crate) taps_buf: Option<DeviceBuf>,
     pub capture_taps: bool,
-    /// `[MAX_BATCH_ROWS]` u32 argmax output.
+    /// `[MAX_BATCH_ROWS * 33]` u32/f32 argmax output + parallel reduction scratch.
     argmax_rows_buf: Option<DeviceBuf>,
+    /// Starting position of the most recent `verify` whose drafter tap ingest is deferred to `verify_rewind`.
+    verify_ingest_pos0: Option<usize>,
     /// Prompt-aware loading: max async swaps between prefill chunks / before a request.
     pub prefill_chunk_swaps: usize,
     pub anticipate_swaps: usize,
@@ -513,6 +517,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             dev_rounds: 0,
             dev_unique_resident: 0,
             argmax_rows_buf: None,
+            verify_ingest_pos0: None,
             prefill_chunk_swaps: 96,
             anticipate_swaps: 256,
             anticipate_wait: true,
@@ -573,18 +578,44 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.snapshot_regions().iter().map(|b| b.size_bytes).sum()
     }
 
-    /// Bytes of a `SeqSnapshot` of `pos` tokens (fixed part + the global KV of the prefix).
+    /// Bytes of a `SeqSnapshot` of `pos` tokens (fixed part + the global KV of the prefix,
+    /// plus the DSpark drafter's local + global KV when attached).
     pub fn snapshot_bytes_at(&self, pos: usize) -> usize {
-        self.snapshot_bytes() + self.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>()
+        let mut total = self.snapshot_bytes()
+            + self.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>();
+        if let Some(d) = self.drafter.as_ref() {
+            total += d.local_kv_regions().iter().map(|b| b.size_bytes).sum::<usize>();
+            total += d.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>();
+        }
+        total
     }
 
-    /// Captures the state after `pos` tokens into `snap` (allocating or growing its pinned buffer):
-    /// local KV rings, short-conv histories and the global KV of positions `< pos`, so the
-    /// snapshot can be restored after other sequences overwrote the device KV.
-    /// Stream-ordered on the compute stream: no CPU stall.
+    /// Captures the state after `pos` tokens into `snap` (allocating or growing its pinned buffer).
     pub fn snapshot_state(&mut self, pos: usize, snap: &mut Option<SeqSnapshot>) -> Result<()> {
+        let save_drafter = self.drafter.is_some();
+        self.snapshot_state_opt(pos, snap, save_drafter)
+    }
+
+    /// Like `snapshot_state`, allowing callers (e.g., multi-lane server) to specify whether the
+    /// drafter's KV state is currently coherent for this sequence and should be captured too.
+    pub fn snapshot_state_opt(
+        &mut self,
+        pos: usize,
+        snap: &mut Option<SeqSnapshot>,
+        save_drafter: bool,
+    ) -> Result<()> {
         let s = self.tide.compute_stream;
-        let total = self.snapshot_bytes_at(pos);
+        let save_drafter = save_drafter && self.drafter.is_some();
+        let target_total = self.snapshot_bytes()
+            + self.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>();
+        let drafter_total = if save_drafter {
+            let d = self.drafter.as_ref().unwrap();
+            d.local_kv_regions().iter().map(|b| b.size_bytes).sum::<usize>()
+                + d.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>()
+        } else {
+            0
+        };
+        let total = target_total + drafter_total;
         if snap.as_ref().map_or(true, |x| x.host.size_bytes < total) {
             if let Some(old) = snap.take() {
                 self.backend.sync_stream(s)?;
@@ -592,10 +623,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             // A little headroom so a recycled buffer fits the next, slightly longer prefix.
             let alloc = total + total / 8;
-            *snap = Some(SeqSnapshot { pos, host: self.backend.alloc_pinned(alloc)? });
+            *snap = Some(SeqSnapshot { pos, drafter_valid: save_drafter, host: self.backend.alloc_pinned(alloc)? });
         }
         let sn = snap.as_mut().unwrap();
         sn.pos = pos;
+        sn.drafter_valid = save_drafter;
         let mut off = 0usize;
         for b in self.snapshot_regions() {
             self.backend.memcpy_d2h_async(sn.host, off, b, 0, b.size_bytes, s)?;
@@ -609,12 +641,27 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 off += len;
             }
         }
+        if save_drafter {
+            let d = self.drafter.as_ref().unwrap();
+            for b in d.local_kv_regions() {
+                self.backend.memcpy_d2h_async(sn.host, off, b, 0, b.size_bytes, s)?;
+                off += b.size_bytes;
+            }
+            for (buf, per_pos) in d.global_kv_regions() {
+                let len = pos * per_pos;
+                if len > 0 {
+                    self.backend.memcpy_d2h_async(sn.host, off, buf.slice(0, len), 0, len, s)?;
+                    off += len;
+                }
+            }
+        }
         Ok(())
     }
 
     /// Restores a snapshot taken by `snapshot_state`; the next token to process is `snap.pos`.
     /// With `global = false` the device global KV is assumed to still hold this prefix (the live
-    /// sequence starts with it) and is not copied back.
+    /// sequence starts with it) and is not copied back. When `snap.drafter_valid` is true and a
+    /// drafter is attached, its local rings and global KV are also restored (~4.2 MiB + 2.1 KB/pos).
     pub fn restore_state(&mut self, snap: &SeqSnapshot, global: bool) -> Result<()> {
         let s = self.tide.compute_stream;
         self.kv_release(self.active_lane, snap.pos)?;
@@ -631,6 +678,23 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     let len = n * per_pos;
                     self.backend.memcpy_h2d_async(buf.slice(first * per_pos, len), 0, snap.host, off, len, s)?;
                     off += len;
+                }
+            }
+        } else {
+            off += self.global_kv_regions().iter().map(|r| snap.pos * r.1).sum::<usize>();
+        }
+        if snap.drafter_valid {
+            if let Some(d) = self.drafter.as_ref() {
+                for b in d.local_kv_regions() {
+                    self.backend.memcpy_h2d_async(b, 0, snap.host, off, b.size_bytes, s)?;
+                    off += b.size_bytes;
+                }
+                for (buf, per_pos) in d.global_kv_regions() {
+                    let len = snap.pos * per_pos;
+                    if len > 0 {
+                        self.backend.memcpy_h2d_async(buf.slice(0, len), 0, snap.host, off, len, s)?;
+                        off += len;
+                    }
                 }
             }
         }
@@ -989,7 +1053,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if self.verify_hist.is_none() {
             self.verify_hist = Some(self.backend.alloc_device(n_log * (3 + MAX_BATCH_ROWS) * (2 * kv + 2 * h) * 4)?);
             self.taps_buf = Some(self.backend.alloc_device(4 * PREFILL_CHUNK * h * 4)?);
-            self.argmax_rows_buf = Some(self.backend.alloc_device(MAX_BATCH_ROWS * 4)?);
+            self.argmax_rows_buf = Some(self.backend.alloc_device(ARGMAX_FILTER_BUF_BYTES)?);
         }
         self.ensure_rows_buffers()
     }
@@ -1518,10 +1582,25 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         d.draft(&self.dense, anchor, p, taps, PREFILL_CHUNK, tap_row, n, s)
     }
 
+    /// Like `draft`, returning `(token_id, top1_minus_top2_logit_margin)` per drafted token.
+    pub fn draft_with_margins(&mut self, anchor: u32, p: usize, tap_row: usize, n: usize) -> Result<Vec<(u32, f32)>> {
+        let taps = self.taps_buf.expect("taps buffer");
+        let s = self.tide.compute_stream;
+        let d = self.drafter.as_mut().expect("drafter attached");
+        d.draft_with_margins(&self.dense, anchor, p, taps, PREFILL_CHUNK, tap_row, n, s)
+    }
+
+    /// Speculative verify (greedy): skips monotonic final logit softcap; follow with `rows_argmax`
+    /// and `verify_rewind`.
+    pub fn verify(&mut self, tokens: &[u32], pos0: usize) -> Result<()> {
+        self.verify_for_sampling(tokens, pos0, true)
+    }
+
     /// Speculative verify: runs `tokens` (<= 8, the anchor then the drafts) of the active lane at
     /// positions `pos0..` in one pass; logits of every row land in the batch logits buffer and the
-    /// drafter taps in `taps_buf` (if `capture_taps`). Then `verify_argmax`, `verify_rewind`.
-    pub fn verify(&mut self, tokens: &[u32], pos0: usize) -> Result<()> {
+    /// drafter taps in `taps_buf` (if `capture_taps`). Set `greedy = false` when sampling with
+    /// `temperature > 0` or `repetition_penalty != 1.0` so final logit softcapping is applied.
+    pub fn verify_for_sampling(&mut self, tokens: &[u32], pos0: usize, greedy: bool) -> Result<()> {
         let m = tokens.len();
         self.kv_ensure(self.active_lane, pos0 + m)?;
         if m == 0 || m > MAX_BATCH_ROWS {
@@ -1536,10 +1615,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let published = self.tide.poll_pending()?;
         self.tide.scheduler.telemetry.stage1_async_published += published as u64;
         self.map_batch_rows = tokens.iter().enumerate().map(|(i, &t)| (self.active_lane, pos0 + i, t)).collect();
-        self.rows_forward(tokens, crate::prefill::RowsMode::Verify { pos0 }, true)?;
-        if self.capture_taps {
-            self.drafter_ingest(pos0, m)?;
-        }
+        self.rows_forward(tokens, crate::prefill::RowsMode::Verify { pos0, greedy }, true)?;
+        // Defer drafter context KV ingest until `verify_rewind`, so `rows_argmax` / `verify_sample`
+        // doesn't wait behind it and rejected rows are never ingested.
+        self.verify_ingest_pos0 = self.capture_taps.then_some(pos0);
         self.batch_pending_rows = m;
         self.batch_rows_run = m;
         self.batch_lanes = vec![self.active_lane; m];
@@ -1549,22 +1628,135 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// Greedy next token of each of the last `m` verify / batch rows (one readback).
     pub fn rows_argmax(&mut self, m: usize) -> Result<Vec<u32>> {
         if self.argmax_rows_buf.is_none() {
-            self.argmax_rows_buf = Some(self.backend.alloc_device(MAX_BATCH_ROWS * 4)?);
+            self.argmax_rows_buf = Some(self.backend.alloc_device(ARGMAX_FILTER_BUF_BYTES)?);
         }
-        let out = self.argmax_rows_buf.unwrap();
+        let buf = self.argmax_rows_buf.unwrap();
+        let out = buf.slice(0, MAX_BATCH_ROWS * 4);
+        let scratch = buf.slice(MAX_BATCH_ROWS * 8, MAX_BATCH_ROWS * 32 * 4);
         let s = self.tide.compute_stream;
-        self.backend.argmax_rows(out, self.batch_logits.expect("batch logits"), m, self.cfg.unpadded_vocab_size, s)?;
+        self.backend.argmax_rows_fast(out, scratch, self.batch_logits.expect("batch logits"), m, self.cfg.unpadded_vocab_size, s)?;
         let mut b = vec![0u8; m * 4];
         self.backend.memcpy_d2h_sync(&mut b, out.slice(0, m * 4), 0, s)?;
         Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
 
-    /// After a verify of `m` rows of which `keep` are committed: rewinds every short conv of the
-    /// active lane to its state after `keep` rows (the KV of later positions is simply overwritten
-    /// by the next tokens).
+    /// Exact lossless speculative verification for any `SamplingParams` (greedy or stochastic).
+    ///
+    /// - When `temperature <= 0` and `repetition_penalty == 1.0`, uses GPU `rows_argmax` (32 B D2H).
+    /// - When `temperature > 0` and `repetition_penalty == 1.0`, runs GPU `logits_filter_rows`
+    ///   (extracting only entries within `20 * T` of `row_max`, ~16 KB D2H instead of 6.4 MB!)
+    ///   and performs exact rejection sampling (`q(d) = 1`) on the compact candidates, falling
+    ///   back to full-row D2H only if a row overflows 256 candidates.
+    /// - Otherwise, reads back the `block.len()` logit rows in one D2H copy and runs exact
+    ///   rejection sampling for deterministic drafter proposals (`q(d) = 1`).
+    ///
+    /// Returns `(accepted_drafts, next_token)` where `block[1..=accepted_drafts]` are accepted
+    /// and `next_token` is the replacement or bonus token (total `accepted_drafts + 1` tokens).
+    pub fn verify_sample(
+        &mut self,
+        block: &[u32],
+        params: &SamplingParams,
+        recent_tokens: &[u32],
+    ) -> Result<(usize, u32)> {
+        let m = block.len();
+        let n = m.saturating_sub(1);
+        let no_rep = (params.repetition_penalty - 1.0).abs() < 1e-6;
+        if params.temperature <= 0.0 && no_rep {
+            let am = self.rows_argmax(m)?;
+            let mut c = 0usize;
+            while c < n && block[c + 1] == am[c] {
+                c += 1;
+            }
+            return Ok((c, am[c]));
+        }
+
+        let vocab = self.cfg.unpadded_vocab_size;
+        let s = self.tide.compute_stream;
+        let bl = self.batch_logits.expect("batch logits");
+
+        if params.temperature > 0.0 && no_rep {
+            if self.argmax_rows_buf.is_none() {
+                self.argmax_rows_buf = Some(self.backend.alloc_device(ARGMAX_FILTER_BUF_BYTES)?);
+            }
+            let buf = self.argmax_rows_buf.unwrap();
+            let row_max = buf.slice(MAX_BATCH_ROWS * 4, MAX_BATCH_ROWS * 4);
+            let scratch = buf.slice(MAX_BATCH_ROWS * 8, MAX_BATCH_ROWS * 32 * 4);
+            let d2h_base = MAX_BATCH_ROWS * 40 * 4; // 1280
+            let counts = buf.slice(d2h_base, MAX_BATCH_ROWS * 4);
+            let out_idx = buf.slice(d2h_base + MAX_BATCH_ROWS * 4, MAX_BATCH_ROWS * FILTER_CAP * 4);
+            let out_val = buf.slice(
+                d2h_base + MAX_BATCH_ROWS * 4 + MAX_BATCH_ROWS * FILTER_CAP * 4,
+                MAX_BATCH_ROWS * FILTER_CAP * 4,
+            );
+            let margin = 20.0 * params.temperature;
+            self.backend.logits_filter_rows(
+                out_idx, out_val, counts, row_max, scratch, bl, m, vocab, margin, FILTER_CAP, s,
+            )?;
+            let d2h_bytes = (MAX_BATCH_ROWS + 2 * MAX_BATCH_ROWS * FILTER_CAP) * 4;
+            let mut raw = vec![0u8; d2h_bytes];
+            self.backend.memcpy_d2h_sync(&mut raw, buf.slice(d2h_base, d2h_bytes), 0, s)?;
+
+            let word = |w: usize| u32::from_le_bytes(raw[w * 4..(w + 1) * 4].try_into().unwrap());
+            let idx_base = MAX_BATCH_ROWS;
+            let val_base = MAX_BATCH_ROWS + MAX_BATCH_ROWS * FILTER_CAP;
+            let inv_t = 1.0 / params.temperature;
+
+            let row_probs = |r: usize| -> Result<Vec<(u32, f32)>> {
+                let cnt = word(r) as usize;
+                if cnt > 0 && cnt <= FILTER_CAP {
+                    let mut cands = Vec::with_capacity(cnt);
+                    for j in 0..cnt {
+                        let id = word(idx_base + r * FILTER_CAP + j);
+                        let v = f32::from_bits(word(val_base + r * FILTER_CAP + j));
+                        cands.push((id, v * inv_t));
+                    }
+                    Ok(finalize_probs(cands, params.top_k.clamp(1, vocab), params.top_p))
+                } else {
+                    // Rare overflow (> 256 tokens within 20*T of max): read just this single row.
+                    let mut row = vec![0.0f32; vocab];
+                    let bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut u8, vocab * 4)
+                    };
+                    self.backend.memcpy_d2h_sync(bytes, bl.slice(r * vocab * 4, vocab * 4), 0, s)?;
+                    Ok(row_target_probs(&mut row, params, &[], &[]))
+                }
+            };
+
+            for c in 0..n {
+                let mut probs = row_probs(c)?;
+                let draft = block[c + 1];
+                let p_d = probs.iter().find(|&&(id, _)| id == draft).map(|&(_, p)| p).unwrap_or(0.0);
+                if next_rand_f32(&mut self.rng_state) < p_d {
+                    continue;
+                }
+                probs.retain(|&(id, _)| id != draft);
+                if probs.is_empty() {
+                    return Ok((c, draft));
+                }
+                return Ok((c, sample_from_probs(&probs, &mut self.rng_state)));
+            }
+            let probs = row_probs(n)?;
+            return Ok((n, sample_from_probs(&probs, &mut self.rng_state)));
+        }
+
+        let mut all_logits = vec![0.0f32; m * vocab];
+        let raw_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(all_logits.as_mut_ptr() as *mut u8, m * vocab * 4)
+        };
+        self.backend.memcpy_d2h_sync(raw_bytes, bl.slice(0, m * vocab * 4), 0, s)?;
+
+        Ok(verify_sample_rows(&mut all_logits, vocab, block, params, recent_tokens, &mut self.rng_state))
+    }
+
+    /// After a verify of `m` rows of which `keep` are committed: ingests ONLY the `keep`
+    /// committed rows into the drafter's context KV, and rewinds every short conv of the active
+    /// lane to its state after `keep` rows (the KV of later positions is overwritten later).
     pub fn verify_rewind(&mut self, m: usize, keep: usize) -> Result<()> {
         // Only committed rows count for Tide (heat / demand); call before post_batch_tide_step.
         self.batch_pending_rows = self.batch_pending_rows.min(keep);
+        if let Some(pos0) = self.verify_ingest_pos0.take() {
+            self.drafter_ingest(pos0, keep)?;
+        }
         if keep >= m {
             return Ok(());
         }
@@ -2762,6 +2954,211 @@ impl<B: ComputeBackend> Drop for Inkling2Engine<B> {
             s.moe_out, s.logits, s.argmax_buf,
         ] {
             let _ = self.backend.free_device(buf);
+        }
+    }
+}
+
+const FILTER_CAP: usize = 256;
+/// Layout: `[out: 8][row_max: 8][scratch: 8*32][counts: 8][idx: 8*256][val: 8*256]` (u32/f32 words).
+const ARGMAX_FILTER_BUF_BYTES: usize =
+    (MAX_BATCH_ROWS * 40 + MAX_BATCH_ROWS + 2 * MAX_BATCH_ROWS * FILTER_CAP) * 4;
+
+fn finalize_probs(mut indexed: Vec<(u32, f32)>, k: usize, top_p: f32) -> Vec<(u32, f32)> {
+    if indexed.len() > k {
+        indexed.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+        indexed.truncate(k);
+    }
+    indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let max_l = indexed[0].1;
+    let mut sum = 0.0f32;
+    for (_, v) in &mut indexed {
+        *v = (*v - max_l).exp();
+        sum += *v;
+    }
+    let inv_sum = 1.0 / sum.max(1e-12);
+    let mut cum = 0.0f32;
+    let mut cut = indexed.len();
+    for (i, (_, p)) in indexed.iter_mut().enumerate() {
+        *p *= inv_sum;
+        cum += *p;
+        if cum >= top_p {
+            cut = i + 1;
+            break;
+        }
+    }
+    indexed.truncate(cut);
+    let renorm: f32 = indexed.iter().map(|(_, p)| *p).sum();
+    let inv_renorm = 1.0 / renorm.max(1e-12);
+    for (_, p) in &mut indexed {
+        *p *= inv_renorm;
+    }
+    indexed
+}
+
+#[inline]
+fn next_rand_f32(rng: &mut u64) -> f32 {
+    *rng ^= *rng >> 12;
+    *rng ^= *rng << 25;
+    *rng ^= *rng >> 27;
+    (((*rng).wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32) / ((1u32 << 24) as f32)
+}
+
+/// Builds the exact filtered, normalized `(token_id, prob)` target distribution for one logit row,
+/// matching `sample_logits` (`repetition_penalty` -> `/ temperature` -> `top_k` -> softmax -> `top_p`).
+fn row_target_probs(
+    logits: &mut [f32],
+    params: &SamplingParams,
+    recent_tokens: &[u32],
+    extra_recent: &[u32],
+) -> Vec<(u32, f32)> {
+    let vocab = logits.len();
+    if (params.repetition_penalty - 1.0).abs() > 1e-6 {
+        let rep = params.repetition_penalty;
+        for &t in recent_tokens.iter().chain(extra_recent.iter()) {
+            if (t as usize) < vocab {
+                let v = &mut logits[t as usize];
+                if *v > 0.0 { *v /= rep; } else { *v *= rep; }
+            }
+        }
+    }
+    if params.temperature <= 0.0 {
+        let mut best_i = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_v {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        return vec![(best_i as u32, 1.0)];
+    }
+
+    let inv_t = 1.0 / params.temperature;
+    let k = params.top_k.clamp(1, vocab);
+    let mut max_raw = f32::NEG_INFINITY;
+    for &v in logits.iter() {
+        if v > max_raw {
+            max_raw = v;
+        }
+    }
+    // Fast threshold prefilter: tokens > 25*T below max have exp(-25) ~ 1.4e-11 weight.
+    let thresh = max_raw - 25.0 * params.temperature;
+    let mut indexed: Vec<(u32, f32)> = Vec::with_capacity(k.min(256));
+    for (i, &v) in logits.iter().enumerate() {
+        if v >= thresh {
+            indexed.push((i as u32, v * inv_t));
+        }
+    }
+    if indexed.len() < k {
+        indexed.clear();
+        indexed.reserve(vocab);
+        for (i, &v) in logits.iter().enumerate() {
+            indexed.push((i as u32, v * inv_t));
+        }
+    }
+    finalize_probs(indexed, k, params.top_p)
+}
+
+fn sample_from_probs(probs: &[(u32, f32)], rng: &mut u64) -> u32 {
+    let total: f32 = probs.iter().map(|(_, p)| *p).sum();
+    let target = next_rand_f32(rng) * total;
+    let mut acc = 0.0f32;
+    for &(id, p) in probs {
+        acc += p;
+        if acc >= target {
+            return id;
+        }
+    }
+    probs[0].0
+}
+
+/// Exact lossless speculative verification over `block.len()` flat logit rows (`[m][vocab]`).
+/// Returns `(accepted_drafts, next_token)`.
+pub(crate) fn verify_sample_rows(
+    all_logits: &mut [f32],
+    vocab: usize,
+    block: &[u32],
+    params: &SamplingParams,
+    recent_tokens: &[u32],
+    rng: &mut u64,
+) -> (usize, u32) {
+    let m = block.len();
+    let n = m.saturating_sub(1);
+    for c in 0..n {
+        let row = &mut all_logits[c * vocab..(c + 1) * vocab];
+        let mut probs = row_target_probs(row, params, recent_tokens, &block[1..=c]);
+        let draft = block[c + 1];
+        if params.temperature <= 0.0 {
+            let best = probs[0].0;
+            if best == draft {
+                continue;
+            }
+            return (c, best);
+        }
+        let p_d = probs.iter().find(|&&(id, _)| id == draft).map(|&(_, p)| p).unwrap_or(0.0);
+        let u = next_rand_f32(rng);
+        if u < p_d {
+            continue;
+        }
+        // Reject `draft`: sample from residual `max(0, p(y) - q(y))` = `p \ {draft}` (since `q(draft) = 1`).
+        probs.retain(|&(id, _)| id != draft);
+        if probs.is_empty() {
+            return (c, draft);
+        }
+        return (c, sample_from_probs(&probs, rng));
+    }
+    // All `n` drafts accepted: sample the bonus token from row `n`.
+    let bonus_row = &mut all_logits[n * vocab..(n + 1) * vocab];
+    let probs = row_target_probs(bonus_row, params, recent_tokens, &block[1..=n]);
+    let bonus = if params.temperature <= 0.0 {
+        probs[0].0
+    } else {
+        sample_from_probs(&probs, rng)
+    };
+    (n, bonus)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_sample_exact_target_distribution() {
+        // Verify that rejection sampling with deterministic draft `q(d) = 1` reproduces the
+        // exact target probability distribution `p(y)` for every token (accepted OR rejected).
+        let base_logits = [2.0f32, 1.5, 1.0, 0.2, -1.0, -3.0];
+        let vocab = base_logits.len();
+        let params = SamplingParams {
+            temperature: 0.7,
+            top_p: 0.95,
+            top_k: 4,
+            repetition_penalty: 1.0,
+            seed: 42,
+        };
+        let mut ref_logits = base_logits;
+        let target_probs = row_target_probs(&mut ref_logits, &params, &[], &[]);
+
+        for draft in [0u32, 1, 2, 5] {
+            let mut rng = 0x1234_5678_9ABC_DEF1u64 ^ (draft as u64 + 1);
+            let mut counts = vec![0usize; vocab];
+            let trials = 60_000usize;
+            let mut buf = vec![0.0f32; 2 * vocab];
+            for _ in 0..trials {
+                buf[..vocab].copy_from_slice(&base_logits);
+                buf[vocab..].copy_from_slice(&base_logits);
+                let (acc, next_tok) = verify_sample_rows(&mut buf, vocab, &[99, draft], &params, &[], &mut rng);
+                let emitted = if acc == 1 { draft } else { next_tok };
+                counts[emitted as usize] += 1;
+            }
+            for i in 0..vocab {
+                let expected = target_probs.iter().find(|&&(id, _)| id == i as u32).map(|&(_, p)| p).unwrap_or(0.0);
+                let empirical = counts[i] as f32 / trials as f32;
+                assert!(
+                    (empirical - expected).abs() < 0.01,
+                    "draft={draft} tok={i}: empirical={empirical:.4} vs expected={expected:.4}"
+                );
+            }
         }
     }
 }

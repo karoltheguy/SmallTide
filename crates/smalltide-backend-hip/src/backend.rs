@@ -185,7 +185,14 @@ impl HipBackend {
                 Some(r) => {
                     let mut rr = r;
                     let mut args = [p(&mut a), p(&mut rr)];
-                    self.launch(self.kernels.gemv_multi_rows, (a.total_rows.div_ceil(4), 1, 1), 128, &mut args, stream, "launch(gemv_multi_rows)")?;
+                    let can_wmma = r >= 4
+                        && chunk.iter().all(|sg| sg.row_scales.is_some() && sg.n_rows % 16 == 0 && sg.k_cols % 32 == 0)
+                        && std::env::var_os("SMALLTIDE_NO_WMMA_MULTI").is_none();
+                    if can_wmma {
+                        self.launch(self.kernels.gemv_multi_wmma, (a.total_rows.div_ceil(32), 1, 1), 64, &mut args, stream, "launch(gemv_multi_wmma)")?;
+                    } else {
+                        self.launch(self.kernels.gemv_multi_rows, (a.total_rows.div_ceil(4), 1, 1), 128, &mut args, stream, "launch(gemv_multi_rows)")?;
+                    }
                 }
             }
         }
@@ -364,7 +371,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, moe_w2_rows)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, rescue_write_route, rescue_apply_patch, rescue_wait_and_patch, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, gemv_multi_wmma, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, dspark_argmax_final_margin, argmax_rows_part, argmax_rows_reduce, attn_prefill_wmma_split, attn_prefill_wmma_reduce, dspark_quant_fold_fp8, dspark_logits_argmax_fp8, dspark_rnn_step, dspark_ctx_store_fp8, dspark_attn_fp8_split, dspark_attn_reduce, dspark_embed_prep, add_rmsnorm_rows, dspark_qk_norm_rope, moe_w2_rows)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -1970,7 +1977,7 @@ impl ComputeBackend for HipBackend {
             // Both WMMA kernels compute every output element identically, so a row's result does
             // not depend on how many rows share the call (prefill segmentation invariance).
             if rows <= 16 {
-                return self.launch(self.kernels.gemm_fp8_rows_wmma_small, (n.div_ceil(128), 1, 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma_small)");
+                return self.launch(self.kernels.gemm_fp8_rows_wmma_small, (n.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma_small)");
             }
             return self.launch(self.kernels.gemm_fp8_rows_wmma, (n.div_ceil(64), m.div_ceil(128), 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma)");
         }
@@ -1985,6 +1992,9 @@ impl ComputeBackend for HipBackend {
         let (mut a, mut b, mut c, mut d) = (self.dev_ptr(y)?, self.dev_ptr(x)?, self.dev_ptr(w_fp8)?, self.dev_ptr(row_scales)?);
         let (mut m, mut n, mut k) = (rows as u32, n_rows as u32, k_cols as u32);
         let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut m), p(&mut n), p(&mut k)];
+        if rows >= 4 && k_cols % 32 == 0 && std::env::var_os("SMALLTIDE_NO_WMMA_DECODE").is_none() {
+            return self.launch(self.kernels.gemm_fp8_rows_wmma_small, (n.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma_small)");
+        }
         // (The LDS-staged smalltide_gemv_fp8_rows2 measured slower for 1..8 rows.)
         self.launch(self.kernels.gemv_fp8_rows, (n.div_ceil(4), 1, 1), 128, &mut args, stream, "launch(gemv_fp8_rows)")
     }
@@ -2223,6 +2233,189 @@ impl ComputeBackend for HipBackend {
         let (mut dr2, mut sp2, mut pm2, mut pi2, mut np) = (self.dev_ptr(drafts)?, step as u32, self.dev_ptr(pmax)?, self.dev_ptr(pidx)?, nparts);
         let mut args = [p(&mut dr2), p(&mut sp2), p(&mut pm2), p(&mut pi2), p(&mut np)];
         self.launch(self.kernels.dspark_argmax_final, (1, 1, 1), 1024, &mut args, stream, "launch(dspark_argmax_final)")
+    }
+
+    fn dspark_quant_fold_fp8(&self, dst: DeviceBuf, scales: DeviceBuf, src: DeviceBuf,
+        r: usize, v: usize, v_pad: usize, stream: Stream) -> Result<()> {
+        let (mut d, mut sc, mut s, mut vv, mut vp) = (self.dev_ptr(dst)?, self.dev_ptr(scales)?, self.dev_ptr(src)?, v as u32, v_pad as u32);
+        let mut args = [p(&mut d), p(&mut sc), p(&mut s), p(&mut vv), p(&mut vp)];
+        self.launch(self.kernels.dspark_quant_fold_fp8, (r as u32, 1, 1), 1024, &mut args, stream, "launch(dspark_quant_fold_fp8)")
+    }
+
+    fn dspark_markov_step_fast(&self, state: DeviceBuf, latent: DeviceBuf, w1: DeviceBuf,
+        drafts: DeviceBuf, margins: DeviceBuf, step: usize, anchor: u32, w_dyn: DeviceBuf,
+        frnn_proj: DeviceBuf, hb_proj: DeviceBuf, rnn_b: DeviceBuf, base: DeviceBuf,
+        fold_b: DeviceBuf, fold_fp8: DeviceBuf, fold_scales: DeviceBuf,
+        pmax: DeviceBuf, pidx: DeviceBuf, pmax2: DeviceBuf,
+        r: usize, v: usize, v_pad: usize, stream: Stream) -> Result<()> {
+        let (mut st, mut la, mut w1p, mut dr, mut sp, mut an) = (self.dev_ptr(state)?, self.dev_ptr(latent)?,
+            self.dev_ptr(w1)?, self.dev_ptr(drafts)?, step as u32, anchor);
+        let (mut wd, mut fp, mut hp, mut rb, mut rr) = (self.dev_ptr(w_dyn)?, self.dev_ptr(frnn_proj)?,
+            self.dev_ptr(hb_proj)?, self.dev_ptr(rnn_b)?, r as u32);
+        let mut args = [p(&mut st), p(&mut la), p(&mut w1p), p(&mut dr), p(&mut sp), p(&mut an),
+            p(&mut wd), p(&mut fp), p(&mut hp), p(&mut rb), p(&mut rr)];
+        self.launch(self.kernels.dspark_rnn_step, (rr.div_ceil(8), 1, 1), 256, &mut args, stream, "launch(dspark_rnn_step)")?;
+
+        let nparts = (v as u32).div_ceil(1024);
+        let (mut pm, mut pi, mut pm2, mut bs, mut fb, mut ff, mut fs, mut la2, mut vv, mut vp, mut r2) = (
+            self.dev_ptr(pmax)?, self.dev_ptr(pidx)?, self.dev_ptr(pmax2)?, self.dev_ptr(base)?,
+            self.dev_ptr(fold_b)?, self.dev_ptr(fold_fp8)?, self.dev_ptr(fold_scales)?,
+            self.dev_ptr(latent)?, v as u32, v_pad as u32, r as u32);
+        let mut args = [p(&mut pm), p(&mut pi), p(&mut pm2), p(&mut bs), p(&mut fb), p(&mut ff), p(&mut fs), p(&mut la2), p(&mut vv), p(&mut vp), p(&mut r2)];
+        self.launch(self.kernels.dspark_logits_argmax_fp8, (nparts, 1, 1), 256, &mut args, stream, "launch(dspark_logits_argmax_fp8)")?;
+
+        let (mut dr2, mut mg, mut sp2, mut pm_b, mut pi_b, mut pm2_b, mut np) = (
+            self.dev_ptr(drafts)?, self.dev_ptr(margins)?, step as u32,
+            self.dev_ptr(pmax)?, self.dev_ptr(pidx)?, self.dev_ptr(pmax2)?, nparts);
+        let mut args = [p(&mut dr2), p(&mut mg), p(&mut sp2), p(&mut pm_b), p(&mut pi_b), p(&mut pm2_b), p(&mut np)];
+        self.launch(self.kernels.dspark_argmax_final_margin, (1, 1, 1), 256, &mut args, stream, "launch(dspark_argmax_final_margin)")
+    }
+
+    fn argmax_rows_fast(&self, out: DeviceBuf, scratch: DeviceBuf, x: DeviceBuf, rows: usize, n: usize, stream: Stream) -> Result<()> {
+        const PARTS: u32 = 16;
+        let pbytes = rows * (PARTS as usize) * 4;
+        let (mut pv, mut pi, mut xx, mut nn) = (
+            self.dev_ptr(scratch.slice(0, pbytes))?,
+            self.dev_ptr(scratch.slice(pbytes, pbytes))?,
+            self.dev_ptr(x)?,
+            n as u32,
+        );
+        let mut args1 = [p(&mut pv), p(&mut pi), p(&mut xx), p(&mut nn)];
+        self.launch(self.kernels.argmax_rows_part, (PARTS, rows as u32, 1), 256, &mut args1, stream, "launch(argmax_rows_part)")?;
+        let (mut oo, mut pv2, mut pi2, mut np) = (self.dev_ptr(out)?, pv, pi, PARTS);
+        let mut args2 = [p(&mut oo), p(&mut pv2), p(&mut pi2), p(&mut np)];
+        self.launch(self.kernels.argmax_rows_reduce, (rows as u32, 1, 1), 32, &mut args2, stream, "launch(argmax_rows_reduce)")
+    }
+
+    fn logits_filter_rows(
+        &self,
+        out_idx: DeviceBuf,
+        out_val: DeviceBuf,
+        counts: DeviceBuf,
+        row_max: DeviceBuf,
+        scratch: DeviceBuf,
+        x: DeviceBuf,
+        rows: usize,
+        n: usize,
+        margin: f32,
+        cap: usize,
+        stream: Stream,
+    ) -> Result<()> {
+        const PARTS: u32 = 16;
+        let pbytes = rows * (PARTS as usize) * 4;
+        let (mut pv, mut pi, mut xx, mut nn) = (
+            self.dev_ptr(scratch.slice(0, pbytes))?,
+            self.dev_ptr(scratch.slice(pbytes, pbytes))?,
+            self.dev_ptr(x)?,
+            n as u32,
+        );
+        let mut args1 = [p(&mut pv), p(&mut pi), p(&mut xx), p(&mut nn)];
+        self.launch(self.kernels.argmax_rows_part, (PARTS, rows as u32, 1), 256, &mut args1, stream, "launch(argmax_rows_part)")?;
+        let (mut rm, mut cnt, mut pv2, mut np) = (self.dev_ptr(row_max)?, self.dev_ptr(counts)?, pv, PARTS);
+        let mut args2 = [p(&mut rm), p(&mut cnt), p(&mut pv2), p(&mut np)];
+        self.launch(self.kernels.argmax_rows_reduce_max, (rows as u32, 1, 1), 32, &mut args2, stream, "launch(argmax_rows_reduce_max)")?;
+        let (mut oi, mut ov, mut cnt2, mut rm2, mut xx2, mut nn2, mut mg, mut cp) = (
+            self.dev_ptr(out_idx)?,
+            self.dev_ptr(out_val)?,
+            cnt,
+            rm,
+            xx,
+            n as u32,
+            margin,
+            cap as u32,
+        );
+        let mut args3 = [p(&mut oi), p(&mut ov), p(&mut cnt2), p(&mut rm2), p(&mut xx2), p(&mut nn2), p(&mut mg), p(&mut cp)];
+        self.launch(self.kernels.logits_filter_rows, ((n as u32).div_ceil(1024), rows as u32, 1), 256, &mut args3, stream, "launch(logits_filter_rows)")
+    }
+
+    fn attn_prefill_fp8_split(&self, out: DeviceBuf, part_o: DeviceBuf, part_m: DeviceBuf, part_l: DeviceBuf,
+        q: DeviceBuf, k_cache: DeviceBuf, k_scales: DeviceBuf, v_cache: DeviceBuf, v_scales: DeviceBuf,
+        rel_table: Option<DeviceBuf>, sinks: Option<DeviceBuf>, pp: PrefillAttnParams, stream: Stream) -> Result<()> {
+        let g = pp.n_q_heads / pp.n_kv_heads;
+        let lo0 = if pp.window != 0 && pp.pos0 + 1 > pp.window { pp.pos0 + 1 - pp.window } else { 0 };
+        let key_lo = lo0 & !15;
+        let key_hi = pp.pos0 + pp.rows.saturating_sub(1);
+        let n_tiles = (key_hi.saturating_sub(key_lo)) / 16 + 1;
+        let q_blks = (pp.rows * g).div_ceil(16);
+        let num_splits = (n_tiles / 8).clamp(1, 16);
+        if pp.rows > 8 || num_splits <= 1 || std::env::var_os("SMALLTIDE_ATTN_NOSPLIT").is_some() {
+            return self.attn_prefill_fp8(out, q, k_cache, k_scales, v_cache, v_scales, rel_table, sinks, pp, stream);
+        }
+        let (mut po, mut pm, mut pl) = (self.dev_ptr(part_o)?, self.dev_ptr(part_m)?, self.dev_ptr(part_l)?);
+        let (mut qq, mut kc, mut ks, mut vc, mut vs) = (self.dev_ptr(q)?, self.dev_ptr(k_cache)?, self.dev_ptr(k_scales)?,
+            self.dev_ptr(v_cache)?, self.dev_ptr(v_scales)?);
+        let (mut rt, mut pt) = (self.opt_dev_ptr(rel_table)?, self.opt_dev_ptr(pp.page_table)?);
+        let (mut nqh, mut nkv, mut ms, mut win, mut p0, mut re, mut isd, mut rr, mut ns) = (
+            pp.n_q_heads as u32, pp.n_kv_heads as u32, pp.max_seq as u32, pp.window as u32,
+            pp.pos0 as u32, pp.rel_extent as u32, pp.inv_sqrt_d, pp.rows as u32, num_splits as u32);
+        let mut args1 = [p(&mut po), p(&mut pm), p(&mut pl), p(&mut qq), p(&mut kc), p(&mut ks), p(&mut vc), p(&mut vs),
+            p(&mut rt), p(&mut nqh), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd),
+            p(&mut rr), p(&mut ns), p(&mut pt)];
+        self.launch(self.kernels.attn_prefill_wmma_split, (nkv, q_blks as u32, ns), 128, &mut args1, stream, "launch(attn_prefill_wmma_split)")?;
+        let (mut oo, mut po2, mut pm2, mut pl2, mut sk, mut nqh2, mut ns2) = (
+            self.dev_ptr(out)?, po, pm, pl, self.opt_dev_ptr(sinks)?, pp.n_q_heads as u32, num_splits as u32);
+        let mut args2 = [p(&mut oo), p(&mut po2), p(&mut pm2), p(&mut pl2), p(&mut sk), p(&mut nqh2), p(&mut ns2)];
+        self.launch(self.kernels.attn_prefill_wmma_reduce, (nqh2, rr, 1), 32, &mut args2, stream, "launch(attn_prefill_wmma_reduce)")
+    }
+
+    fn dspark_ctx_store_fp8(&self, kc: DeviceBuf, ks: DeviceBuf, vc: DeviceBuf, vs: DeviceBuf,
+        k: DeviceBuf, v: DeviceBuf, pos0: usize, rows: usize, ring: usize, nkv: usize,
+        stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c, mut d, mut kk, mut vv) = (self.dev_ptr(kc)?, self.dev_ptr(ks)?,
+            self.dev_ptr(vc)?, self.dev_ptr(vs)?, self.dev_ptr(k)?, self.dev_ptr(v)?);
+        let (mut p0, mut rg, mut nk) = (pos0 as u32, ring as u32, nkv as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut kk), p(&mut vv), p(&mut p0), p(&mut rg), p(&mut nk)];
+        self.launch(self.kernels.dspark_ctx_store_fp8, (rows as u32, nk, 1), 128, &mut args, stream, "launch(dspark_ctx_store_fp8)")
+    }
+
+    fn dspark_attn_fp8(&self, out: DeviceBuf, part_o: DeviceBuf, part_m: DeviceBuf, part_l: DeviceBuf,
+        q: DeviceBuf, kb: DeviceBuf, vb: DeviceBuf, kc: DeviceBuf, ks: DeviceBuf,
+        vc: DeviceBuf, vs: DeviceBuf, rows: usize, pp: usize, lo: usize, ring: usize,
+        nh: usize, nkv: usize, nblk: usize, scale: f32, stream: Stream) -> Result<()> {
+        let nctx = pp.saturating_sub(lo);
+        let num_splits = nctx.div_ceil(128).clamp(1, 16) as u32;
+        let (mut o, mut po, mut pm, mut pl) = (self.dev_ptr(out)?, self.dev_ptr(part_o)?, self.dev_ptr(part_m)?, self.dev_ptr(part_l)?);
+        let (mut qq, mut a, mut b, mut c, mut cs, mut d, mut ds) = (self.dev_ptr(q)?, self.dev_ptr(kb)?, self.dev_ptr(vb)?,
+            self.dev_ptr(kc)?, self.dev_ptr(ks)?, self.dev_ptr(vc)?, self.dev_ptr(vs)?);
+        let (mut pv, mut lv, mut rg, mut n1, mut n2, mut nb, mut ns, mut sc) =
+            (pp as u32, lo as u32, ring as u32, nh as u32, nkv as u32, nblk as u32, num_splits, scale);
+        let mut args = [p(&mut o), p(&mut po), p(&mut pm), p(&mut pl), p(&mut qq), p(&mut a), p(&mut b),
+            p(&mut c), p(&mut cs), p(&mut d), p(&mut ds), p(&mut pv), p(&mut lv), p(&mut rg),
+            p(&mut n1), p(&mut n2), p(&mut nb), p(&mut ns), p(&mut sc)];
+        self.launch(self.kernels.dspark_attn_fp8_split, (n2, ns, 1), 256, &mut args, stream, "launch(dspark_attn_fp8_split)")?;
+        if num_splits > 1 {
+            let (mut o2, mut po2, mut pm2, mut pl2, mut n1b, mut ns2) = (o, po, pm, pl, nh as u32, num_splits);
+            let mut rargs = [p(&mut o2), p(&mut po2), p(&mut pm2), p(&mut pl2), p(&mut n1b), p(&mut ns2)];
+            self.launch(self.kernels.dspark_attn_reduce, (n1b, rows as u32, 1), 32, &mut rargs, stream, "launch(dspark_attn_reduce)")?;
+        }
+        Ok(())
+    }
+
+    fn dspark_embed_prep(&self, res: DeviceBuf, xn: DeviceBuf, anchor_in: DeviceBuf,
+        embed_norm: DeviceBuf, mask_embed: DeviceBuf, in_ln: DeviceBuf, d: usize, eps: f32,
+        stream: Stream) -> Result<()> {
+        let (mut r, mut x, mut ai, mut en, mut me, mut ln) = (self.dev_ptr(res)?, self.dev_ptr(xn)?,
+            self.dev_ptr(anchor_in)?, self.dev_ptr(embed_norm)?, self.dev_ptr(mask_embed)?, self.dev_ptr(in_ln)?);
+        let (mut dd, mut e) = (d as u32, eps);
+        let mut args = [p(&mut r), p(&mut x), p(&mut ai), p(&mut en), p(&mut me), p(&mut ln), p(&mut dd), p(&mut e)];
+        self.launch(self.kernels.dspark_embed_prep, (8, 1, 1), 1024, &mut args, stream, "launch(dspark_embed_prep)")
+    }
+
+    fn add_rmsnorm_rows(&self, res: DeviceBuf, xn: DeviceBuf, tmp: DeviceBuf, w: DeviceBuf,
+        rows: usize, d: usize, eps: f32, stream: Stream) -> Result<()> {
+        let (mut r, mut x, mut t, mut ww, mut dd, mut e) = (self.dev_ptr(res)?, self.dev_ptr(xn)?,
+            self.dev_ptr(tmp)?, self.dev_ptr(w)?, d as u32, eps);
+        let mut args = [p(&mut r), p(&mut x), p(&mut t), p(&mut ww), p(&mut dd), p(&mut e)];
+        self.launch(self.kernels.add_rmsnorm_rows, (rows as u32, 1, 1), 1024, &mut args, stream, "launch(add_rmsnorm_rows)")
+    }
+
+    fn dspark_qk_norm_rope(&self, q: DeviceBuf, k: DeviceBuf, qw: DeviceBuf, kw: DeviceBuf,
+        hq: usize, hk: usize, rows: usize, pos0: usize, theta: f32, eps: f32,
+        stream: Stream) -> Result<()> {
+        let (mut qp, mut kp, mut qwp, mut kwp) = (self.dev_ptr(q)?, self.dev_ptr(k)?, self.dev_ptr(qw)?, self.dev_ptr(kw)?);
+        let (mut nq, mut nk, mut p0, mut lt, mut e) = (hq as u32, hk as u32, pos0 as u32, theta.log2(), eps);
+        let mut args = [p(&mut qp), p(&mut kp), p(&mut qwp), p(&mut kwp), p(&mut nq), p(&mut nk), p(&mut p0), p(&mut lt), p(&mut e)];
+        self.launch(self.kernels.dspark_qk_norm_rope, (nq + nk, rows as u32, 1), 64, &mut args, stream, "launch(dspark_qk_norm_rope)")
     }
 
     fn device_address(&self, buf: DeviceBuf) -> Result<u64> {

@@ -183,7 +183,8 @@ extern "C" __global__ void smalltide_sconv_k4_rows_f32(
 extern "C" __global__ void smalltide_kv_store_fp8_rows(
     uint8_t* __restrict__ k_cache, float* __restrict__ k_scales, uint8_t* __restrict__ v_cache,
     float* __restrict__ v_scales, const float* __restrict__ k_in, const float* __restrict__ v_in,
-    uint32_t n_kv_heads, uint32_t max_seq, uint32_t head_dim, uint32_t pos0, uint32_t is_local
+    uint32_t n_kv_heads, uint32_t max_seq, uint32_t head_dim, uint32_t pos0, uint32_t is_local,
+    const uint32_t* __restrict__ page_table
 ) {
     uint32_t h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     if (h >= n_kv_heads || d >= head_dim) return;
@@ -203,7 +204,7 @@ extern "C" __global__ void smalltide_kv_store_fp8_rows(
     float vs = (vmax > 0.0f) ? (vmax / 448.0f) : 1.0f;
     uint32_t pos = pos0 + t;
     uint32_t slot = (is_local != 0u) ? (pos % max_seq) : pos;
-    size_t si = static_cast<size_t>(slot) * n_kv_heads + h;
+    size_t si = static_cast<size_t>(kv_phys(page_table, slot)) * n_kv_heads + h;
     if (d == 0u) { k_scales[si] = ks; v_scales[si] = vs; }
     k_cache[si * head_dim + d] = encode_fp8_e4m3fn(kv / ks);
     v_cache[si * head_dim + d] = encode_fp8_e4m3fn(vv / vs);
@@ -219,7 +220,8 @@ extern "C" __global__ void smalltide_attn_prefill_fp8(
     float* __restrict__ out, const float* __restrict__ q, const uint8_t* __restrict__ k_cache,
     const float* __restrict__ k_scales, const uint8_t* __restrict__ v_cache, const float* __restrict__ v_scales,
     const float* __restrict__ rel_table, const float* __restrict__ sinks, uint32_t n_q_heads, uint32_t n_kv_heads,
-    uint32_t max_seq, uint32_t window, uint32_t pos0, uint32_t rel_extent, float inv_sqrt_d
+    uint32_t max_seq, uint32_t window, uint32_t pos0, uint32_t rel_extent, float inv_sqrt_d,
+    const uint32_t* __restrict__ page_table
 ) {
     uint32_t kvh = blockIdx.x, t = blockIdx.y;
     if (kvh >= n_kv_heads) return;
@@ -249,7 +251,7 @@ extern "C" __global__ void smalltide_attn_prefill_fp8(
     const float* vsb = v_scales + kvh;
     const size_t kv_stride = static_cast<size_t>(n_kv_heads) * 128u;
     for (uint32_t kp = k_start + warp; kp <= p; kp += 4u) {
-        uint32_t slot = (window != 0u) ? (kp % max_seq) : kp;
+        uint32_t slot = kv_phys(page_table, (window != 0u) ? (kp % max_seq) : kp);
         uint32_t dist = p - kp;
         uint32_t k4 = reinterpret_cast<const uint32_t*>(kb + static_cast<size_t>(slot) * kv_stride)[lane];
         float kx = decode_fp8_e4m3fn(k4 & 0xFFu), ky = decode_fp8_e4m3fn((k4 >> 8) & 0xFFu);
@@ -900,7 +902,8 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
     float* __restrict__ out, const float* __restrict__ q, const uint8_t* __restrict__ k_cache,
     const float* __restrict__ k_scales, const uint8_t* __restrict__ v_cache, const float* __restrict__ v_scales,
     const float* __restrict__ rel_table, const float* __restrict__ sinks, uint32_t n_q_heads, uint32_t n_kv_heads,
-    uint32_t max_seq, uint32_t window, uint32_t pos0, uint32_t rel_extent, float inv_sqrt_d, uint32_t rows
+    uint32_t max_seq, uint32_t window, uint32_t pos0, uint32_t rel_extent, float inv_sqrt_d, uint32_t rows,
+    const uint32_t* __restrict__ page_table
 ) {
     const float LOG2E = 1.4426950408889634f;
     uint32_t kvh = blockIdx.x;
@@ -974,7 +977,7 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
         // This lane's key (column n = l % 16) for S and its cache slot.
         uint32_t kp = k0 + nl;
         bool kin = kp <= key_hi;
-        uint32_t slot = (window != 0u) ? (kp % max_seq) : kp;
+        uint32_t slot = kv_phys(page_table, (window != 0u) ? (kp % max_seq) : kp);
         // S = Q K^T over 8 dim chunks.
         st_float8 sacc = {};
         #pragma unroll
@@ -1021,7 +1024,7 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
         #pragma unroll
         for (uint32_t r = 0u; r < 16u; ++r) {
             uint32_t kr = k0 + r;
-            uint32_t vslot = (window != 0u) ? (kr % max_seq) : kr;
+            uint32_t vslot = kv_phys(page_table, (window != 0u) ? (kr % max_seq) : kr);
             uint32_t vw = (kr <= key_hi) ? reinterpret_cast<const uint32_t*>(vb + static_cast<size_t>(vslot) * kv_stride)[l] : 0u;
             float4 vv = decode_fp8x4(vw);
             s_v[warp][r][l * 4u + 0u] = (_Float16)vv.x; s_v[warp][r][l * 4u + 1u] = (_Float16)vv.y;

@@ -1,154 +1,128 @@
-//! Paged global KV: every lane's global-attention caches are paged out of one fixed pool of
-//! physical pages (TideLM's `PagedKv`, here on HIP virtual memory).
+//! Paged global KV: every sequence's global-attention caches live in one fixed pool of pages
+//! shared by all lanes (TideLM's paged KV; there through CUDA virtual memory, here through page
+//! tables the attention kernels read - HIP virtual memory is not usable on the Windows driver).
 //!
-//! Each global cache keeps the layout the kernels address (position-major `[slot][head][..]`),
-//! but per lane it is a reserved address range of the lane's full context, not an allocation: a
-//! lane is backed by real pages only as far as its sequence reaches. A page is `PAGE_POS`
-//! positions of every global buffer (8 layers x K, V, K scales, V scales): one physical allocation
-//! per buffer, all created once at startup, so the pool's VRAM never changes - a long
-//! conversation takes pages other lanes are not using, it never evicts experts.
+//! The pool holds `PAGE_POS` positions a page of every global buffer (8 layers x K, V and their
+//! scales); a lane owns the pages its sequence reaches, listed in its device page table
+//! (`kv_phys` in the kernels maps a position through it). The pool's VRAM never changes: a long
+//! conversation takes pages other lanes are not using and never evicts experts; no lane is
+//! special - any may grow to the full context while the pool has pages.
 //!
-//! `ensure` maps a lane's pages up to a step's end before the step's device work; when the pool
-//! is empty it reclaims every page of an idle (unpinned) lane, whose conversation then lives on
-//! in the prefix cache's host snapshot. `release` returns a lane's pages past a position (after a
-//! reset or a restore to a shorter prefix). Unmapping needs the device to be done with the range:
-//! callers synchronize first.
+//! `ensure` gives a lane pages up to a step's end before the step's device work (the table upload
+//! is stream-ordered on the compute stream); an empty pool reclaims every page of an idle
+//! (unpinned) lane, whose conversation then lives on in the prefix cache's host snapshot.
+//! `release` returns a lane's pages past a position (reset, restore to a shorter prefix).
 
-use smalltide_core::{ComputeBackend, DeviceBuf, Result};
+use smalltide_core::{ComputeBackend, DeviceBuf, PinnedBuf, Result, Stream};
 
-/// Positions a page covers (2 MiB of K or V a global layer, 64 KiB of its scales).
+/// Positions a page covers (must match `KV_PAGE_SHIFT` in the kernels).
 pub const PAGE_POS: usize = 2048;
 
-struct LaneVa {
-    /// (address range, bytes a page) of each global buffer, in pool buffer order
-    bufs: Vec<(DeviceBuf, usize)>,
-    /// pool page ids mapped at page slots 0, 1, ...
-    pages: Vec<usize>,
+struct LanePages {
+    pages: Vec<u32>,
+    /// device page table `[max_pages]` u32 and its pinned staging copy
+    table: DeviceBuf,
+    staging: PinnedBuf,
 }
 
-pub struct KvPager {
-    /// bytes a page of each buffer
-    layout: Vec<usize>,
-    /// physical allocations of each pool page, in buffer order
-    phys: Vec<Vec<u64>>,
-    free: Vec<usize>,
-    lanes: Vec<LaneVa>,
+pub struct KvPool {
+    n_pages: usize,
+    max_pages: usize,
+    free: Vec<u32>,
+    lanes: Vec<LanePages>,
     /// lanes serving a request (never reclaimed)
     pub pinned: Vec<bool>,
     /// lanes whose pages were reclaimed since the last `take_lost`
     lost: Vec<bool>,
 }
 
-impl KvPager {
-    /// A pool of `n_pages` pages of buffers with `layout` bytes a page each.
-    pub fn new<B: ComputeBackend>(b: &B, layout: Vec<usize>, n_pages: usize) -> Result<Self> {
-        let mut phys = Vec::with_capacity(n_pages);
-        for _ in 0..n_pages {
-            let mut v = Vec::with_capacity(layout.len());
-            for &bytes in &layout {
-                v.push(b.vmm_create(bytes)?);
-            }
-            phys.push(v);
+impl KvPool {
+    /// A pool of `n_pages` pages; every lane may hold up to `max_positions`.
+    pub fn new(n_pages: usize, max_positions: usize) -> Self {
+        Self {
+            n_pages,
+            max_pages: max_positions.div_ceil(PAGE_POS),
+            free: (0..n_pages as u32).rev().collect(),
+            lanes: Vec::new(),
+            pinned: Vec::new(),
+            lost: Vec::new(),
         }
-        Ok(Self { layout, free: (0..n_pages).rev().collect(), phys, lanes: Vec::new(), pinned: Vec::new(), lost: Vec::new() })
-    }
-
-    pub fn page_bytes(&self) -> usize {
-        self.layout.iter().sum()
     }
 
     pub fn pages_total(&self) -> usize {
-        self.phys.len()
+        self.n_pages
     }
 
     pub fn pages_free(&self) -> usize {
         self.free.len()
     }
 
-    /// Registers the next lane's address ranges (`(range, bytes a page)` in layout order).
-    pub fn add_lane(&mut self, bufs: Vec<(DeviceBuf, usize)>) {
-        debug_assert_eq!(bufs.iter().map(|b| b.1).collect::<Vec<_>>(), self.layout);
-        self.lanes.push(LaneVa { bufs, pages: Vec::new() });
+    /// Adds a lane; returns its device page table (pass it to the kernels of its global layers).
+    pub fn add_lane<B: ComputeBackend>(&mut self, b: &B) -> Result<DeviceBuf> {
+        let table = b.alloc_device(self.max_pages * 4)?;
+        let staging = b.alloc_pinned(self.max_pages * 4)?;
+        self.lanes.push(LanePages { pages: Vec::new(), table, staging });
         self.pinned.push(false);
         self.lost.push(false);
+        Ok(table)
     }
 
-    /// Positions currently backed for `lane`.
-    pub fn mapped_positions(&self, lane: usize) -> usize {
-        self.lanes[lane].pages.len() * PAGE_POS
+    pub fn lane_pages(&self, lane: usize) -> &[u32] {
+        &self.lanes[lane].pages
     }
 
-    pub fn lane_pages(&self, lane: usize) -> usize {
-        self.lanes[lane].pages.len()
-    }
-
-    /// Touches every pool page once (maps it at lane 0's first slot and zeroes it through
-    /// `zero(range, bytes)`), so the driver commits the pool before the expert pools are sized.
-    pub fn touch_all<B: ComputeBackend>(&mut self, b: &B, mut zero: impl FnMut(DeviceBuf, usize) -> Result<()>,
-        mut sync: impl FnMut() -> Result<()>) -> Result<()> {
-        let Some(l0) = self.lanes.first() else { return Ok(()) };
-        debug_assert!(l0.pages.is_empty());
-        let bufs = l0.bufs.clone();
-        for p in 0..self.phys.len() {
-            for (i, &(va, bytes)) in bufs.iter().enumerate() {
-                b.vmm_map(va, 0, self.phys[p][i])?;
-                zero(va.slice(0, bytes), bytes)?;
-            }
-            sync()?;
-            for &(va, bytes) in &bufs {
-                b.vmm_unmap(va, 0, bytes)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Maps `lane`'s pages up to position `end` (exclusive). An empty pool reclaims an idle lane
-    /// (`quiesce` is called once before its ranges are unmapped). Returns false when the pool
-    /// cannot back `end` positions for this lane.
-    pub fn ensure<B: ComputeBackend>(&mut self, b: &B, lane: usize, end: usize, mut quiesce: impl FnMut() -> Result<()>) -> Result<bool> {
+    /// Gives `lane` pages up to position `end` (exclusive), reclaiming an idle lane when the pool
+    /// is empty; the new table is uploaded on `stream`. False when it cannot.
+    pub fn ensure<B: ComputeBackend>(&mut self, b: &B, lane: usize, end: usize, stream: Stream) -> Result<bool> {
         let need = end.div_ceil(PAGE_POS);
-        let mut quiesced = false;
+        if need > self.max_pages {
+            return Ok(false);
+        }
+        let had = self.lanes[lane].pages.len();
         while self.lanes[lane].pages.len() < need {
             if self.free.is_empty() {
                 // the idle lane holding the most pages gives them all back
                 let victim = (0..self.lanes.len())
                     .filter(|&l| l != lane && !self.pinned[l] && !self.lanes[l].pages.is_empty())
                     .max_by_key(|&l| self.lanes[l].pages.len());
-                let Some(v) = victim else { return Ok(false) };
-                if !quiesced {
-                    quiesce()?;
-                    quiesced = true;
-                }
-                self.unmap_from(b, v, 0)?;
+                let Some(v) = victim else {
+                    self.upload(b, lane, had, stream)?;
+                    return Ok(false);
+                };
+                let taken = std::mem::take(&mut self.lanes[v].pages);
+                self.free.extend(taken.into_iter().rev());
                 self.lost[v] = true;
             }
             let page = self.free.pop().expect("a free page");
-            let slot = self.lanes[lane].pages.len();
-            let bufs = self.lanes[lane].bufs.clone();
-            for (i, &(va, bytes)) in bufs.iter().enumerate() {
-                b.vmm_map(va, slot * bytes, self.phys[page][i])?;
-            }
             self.lanes[lane].pages.push(page);
         }
+        self.upload(b, lane, had, stream)?;
         Ok(true)
     }
 
-    /// Returns `lane`'s pages past position `keep` to the pool. The device must be done with
-    /// them (callers synchronize first).
-    pub fn release<B: ComputeBackend>(&mut self, b: &B, lane: usize, keep: usize) -> Result<()> {
-        self.unmap_from(b, lane, keep.div_ceil(PAGE_POS))
+    /// Uploads `lane`'s table entries from `from` on (stream-ordered: later kernels see them).
+    fn upload<B: ComputeBackend>(&mut self, b: &B, lane: usize, from: usize, stream: Stream) -> Result<()> {
+        let l = &self.lanes[lane];
+        let n = l.pages.len();
+        if n <= from {
+            return Ok(());
+        }
+        unsafe {
+            let dst = b.pinned_as_mut_slice(l.staging)?;
+            for (i, &p) in l.pages.iter().enumerate().skip(from) {
+                dst[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+            }
+        }
+        b.memcpy_h2d_async(l.table, from * 4, l.staging, from * 4, (n - from) * 4, stream)
     }
 
-    fn unmap_from<B: ComputeBackend>(&mut self, b: &B, lane: usize, keep_pages: usize) -> Result<()> {
+    /// Returns `lane`'s pages past position `keep` to the pool.
+    pub fn release(&mut self, lane: usize, keep: usize) {
+        let keep_pages = keep.div_ceil(PAGE_POS);
         while self.lanes[lane].pages.len() > keep_pages {
-            let page = self.lanes[lane].pages.pop().unwrap();
-            let slot = self.lanes[lane].pages.len();
-            for &(va, bytes) in &self.lanes[lane].bufs {
-                b.vmm_unmap(va, slot * bytes, bytes)?;
-            }
-            self.free.push(page);
+            let p = self.lanes[lane].pages.pop().unwrap();
+            self.free.push(p);
         }
-        Ok(())
     }
 
     /// Lanes whose pages were reclaimed since the last call (their device sequence is gone).

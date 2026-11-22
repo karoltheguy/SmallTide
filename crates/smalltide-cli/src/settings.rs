@@ -219,9 +219,7 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     // other lanes at lane_ctx held before), any lane up to max_ctx; pages carry one per lane of slack.
     let page = smalltide_model_inkling2::kv_pager::PAGE_POS;
     let kv_tokens = parse("SMALLTIDE_KV_TOKENS", s.max_ctx + extra_lanes * lane_ctx, "a token count");
-    // Opt-in: HIP virtual memory on the 26.10 Windows driver backs every mapped allocation with
-    // the same memory (and hangs host copies into mapped ranges), so paging is off by default.
-    let kv_pool_pages = (std::env::var("SMALLTIDE_KV_PAGED").map_or(false, |v| v.trim() == "1"))
+    let kv_pool_pages = (std::env::var("SMALLTIDE_KV_PAGED").map_or(true, |v| v.trim() != "0"))
         .then(|| kv_tokens.div_ceil(page) + lanes.max(1));
     let global_per_pos = 8 * (2 * 8 * 128 + 2 * 8 * 4);
     let est_kv_bytes = match kv_pool_pages {
@@ -325,7 +323,6 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     }
     match engine.kv_pool_info() {
         Some((pages, _, per, bytes)) => {
-            engine.kv_touch_pool().expect("commit KV pool");
             println!("[kv] paged: {} concurrent sequences share {} pages x {} positions ({:.2} GiB, {} positions); any sequence up to {} ctx",
                 lanes.max(1), pages, per, (pages * bytes) as f64 / (1u64 << 30) as f64, pages * per, s.max_ctx);
         }

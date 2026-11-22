@@ -293,6 +293,16 @@ extern "C" __global__ void smalltide_gemv_mxfp8_f32(
     }
 }
 
+// Paged KV: a sequence position's row in a KV pool shared by all sequences. `page_table` maps
+// the sequence's pages (KV_PAGE_POS positions each) to pool pages; null: the position itself
+// (an unpaged cache, e.g. a sliding-window ring).
+#define KV_PAGE_SHIFT 11u
+__device__ __forceinline__ uint32_t kv_phys(const uint32_t* __restrict__ page_table, uint32_t slot) {
+    return (page_table != nullptr)
+        ? ((page_table[slot >> KV_PAGE_SHIFT] << KV_PAGE_SHIFT) | (slot & ((1u << KV_PAGE_SHIFT) - 1u)))
+        : slot;
+}
+
 #include "moe_ops.hip"
 #include "attn_ops.hip"
 #include "inkling2_ops.hip"
@@ -402,6 +412,7 @@ struct AttnPrepArgs {
     float rel_thr;
     float tau;
     float eps;
+    const uint32_t* page_table; // nullable (see kv_phys)
 };
 
 __device__ __forceinline__ float block128_sum(float v, float* sh) {
@@ -454,7 +465,7 @@ extern "C" __global__ void smalltide_attn_prep_decode(AttnPrepArgs a) {
         float vm = block128_max(fabsf(v), sh);
         float ks = (km > 0.0f) ? km / 448.0f : 1.0f;
         float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
-        size_t si = static_cast<size_t>(a.slot) * a.n_kv + h;
+        size_t si = static_cast<size_t>(kv_phys(a.page_table, a.slot)) * a.n_kv + h;
         if (t == 0u) { a.k_scales[si] = ks; a.v_scales[si] = vsc; }
         a.k_cache[si * 128u + t] = encode_fp8_e4m3fn(k / ks);
         a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);
@@ -792,7 +803,7 @@ extern "C" __global__ void smalltide_attn_prep_rows(AttnPrepArgs a, AttnPrepRows
             float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
             uint32_t pos = e.pos0 + r;
             uint32_t slot = (e.is_local != 0u) ? (pos % a.max_seq) : pos;
-            size_t si = static_cast<size_t>(slot) * a.n_kv + h;
+            size_t si = static_cast<size_t>(kv_phys(a.page_table, slot)) * a.n_kv + h;
             if (t == 0u) { a.k_scales[si] = ks; a.v_scales[si] = vsc; }
             a.k_cache[si * 128u + t] = encode_fp8_e4m3fn(k / ks);
             a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);

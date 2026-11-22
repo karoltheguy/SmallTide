@@ -672,6 +672,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let tau = (!is_local).then_some((cfg.log_scaling_alpha, cfg.log_scaling_n_floor as f32));
             b.attn_prep_rows(
                 smalltide_core::backend::AttnPrepParams {
+                    page_table: st.page_table,
                     q: pf.q,
                     r: pf.r,
                     k_raw: pf.k_raw,
@@ -780,12 +781,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         match lanes {
             None => {
                 if !prepped {
-                    b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, s)?;
+                    b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, st.page_table, s)?;
                 }
                 b.attn_prefill_fp8(
                     pf.attn_out, pf.q, st.k_cache, st.k_scales, st.v_cache, st.v_scales,
                     Some(pf.rel_table), Some(pf.sinks),
                     PrefillAttnParams {
+                        page_table: st.page_table,
                         n_q_heads: nqh,
                         n_kv_heads: nkv,
                         max_seq: st.max_seq,
@@ -803,7 +805,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 for (r, &(lane, p)) in rows.iter().enumerate() {
                     let ls = self.lane_layer_state(lane, il);
                     b.kv_store_fp8_rows(ls.k_cache, ls.k_scales, ls.v_cache, ls.v_scales, row(pf.k, r, kv_dim), row(pf.v, r, kv_dim),
-                        nkv, ls.max_seq, hd, p, 1, is_local, s)?;
+                        nkv, ls.max_seq, hd, p, 1, is_local, ls.page_table, s)?;
                     let n_valid = if is_local { (p + 1).min(ls.window) } else { p + 1 };
                     let num_splits = n_valid.div_ceil(128).clamp(1, crate::engine::MAX_FLASH_SPLITS);
                     b.flash_decode_fp8(
@@ -819,6 +821,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                         Some(row(pf.rel_table, r, nqh * cfg.rel_extent)),
                         Some(row(pf.sinks, r, nqh)),
                         smalltide_core::backend::FlashDecodeParams {
+                            page_table: ls.page_table,
                             n_q_heads: nqh,
                             n_kv_heads: nkv,
                             max_seq: ls.max_seq,

@@ -84,6 +84,8 @@ pub struct MoeDispatchParams {
 /// Parameters for Split-K FlashDecoding FP8 KV attention (local sliding-window or global 256K).
 #[derive(Debug, Clone, Copy)]
 pub struct FlashDecodeParams {
+    /// Paged KV pool: the sequence's page table (`None`: the cache is the sequence's own).
+    pub page_table: Option<DeviceBuf>,
     pub n_q_heads: usize,
     pub n_kv_heads: usize,
     pub max_seq: usize,
@@ -99,6 +101,8 @@ pub struct FlashDecodeParams {
 /// Parameters for the multi-row causal prefill attention.
 #[derive(Debug, Clone, Copy)]
 pub struct PrefillAttnParams {
+    /// Paged KV pool: the sequence's page table (`None`: the cache is the sequence's own).
+    pub page_table: Option<DeviceBuf>,
     pub n_q_heads: usize,
     pub n_kv_heads: usize,
     /// KV buffer length (ring size for local layers).
@@ -138,6 +142,8 @@ pub struct GemvSegment {
 /// Inputs/outputs of the fused decode attention prep (see `ComputeBackend::attn_prep_decode`).
 #[derive(Debug, Clone, Copy)]
 pub struct AttnPrepParams {
+    /// Paged KV pool: the sequence's page table (`None`: the cache is the sequence's own).
+    pub page_table: Option<DeviceBuf>,
     pub q: DeviceBuf,
     pub r: DeviceBuf,
     pub k_raw: DeviceBuf,
@@ -718,7 +724,7 @@ pub trait ComputeBackend: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn kv_store_fp8_rows(&self, k_cache: DeviceBuf, k_scales: DeviceBuf, v_cache: DeviceBuf,
         v_scales: DeviceBuf, k_in: DeviceBuf, v_in: DeviceBuf, n_kv_heads: usize, max_seq: usize,
-        head_dim: usize, pos0: usize, rows: usize, is_local: bool, stream: Stream) -> Result<()>;
+        head_dim: usize, pos0: usize, rows: usize, is_local: bool, page_table: Option<DeviceBuf>, stream: Stream) -> Result<()>;
 
     /// Multi-row causal attention over the FP8 KV cache (relative bias + sinks).
     #[allow(clippy::too_many_arguments)]

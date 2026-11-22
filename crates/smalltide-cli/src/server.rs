@@ -552,6 +552,7 @@ fn engine_worker_loop(
                         "prompt_aware_swaps": tel.prompt_aware_swaps,
                         "experts_vram_resident": { "prelude": pre, "loop_core": core, "coda": coda },
                         "experts_ram_warm": ram,
+                        "kv_pool": engine.kv_pool_info().map(|(pages, free, per, _)| json!({"pages": pages, "free": free, "positions_per_page": per})),
                         "prefix_cache": {
                             "requests": pc.stats.requests,
                             "extend_hits": pc.stats.extend_hits,

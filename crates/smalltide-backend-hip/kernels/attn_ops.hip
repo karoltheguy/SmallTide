@@ -240,7 +240,8 @@ extern "C" __global__ void smalltide_flash_decode_fp8_split(
     uint32_t is_local,                   // 1 = sliding window ring of size max_seq, 0 = global [0..=q_pos]
     uint32_t num_splits,
     float inv_sqrt_d,
-    uint32_t window                      // local layers: attention window (<= max_seq ring size)
+    uint32_t window,                     // local layers: attention window (<= max_seq ring size)
+    const uint32_t* __restrict__ page_table // nullable: paged KV pool (see kv_phys)
 ) {
     uint32_t kvh = blockIdx.x;
     uint32_t split = blockIdx.y;
@@ -286,7 +287,7 @@ extern "C" __global__ void smalltide_flash_decode_fp8_split(
 
     for (uint32_t idx = i_start + warp_id; idx < i_end; idx += 4u) {
         uint32_t t_pos = t_win_start + idx;
-        uint32_t slot = (is_local != 0u) ? (t_pos % max_seq) : t_pos;
+        uint32_t slot = kv_phys(page_table, (is_local != 0u) ? (t_pos % max_seq) : t_pos);
         uint32_t dist = q_pos - t_pos;
 
         // Read K[slot] ONCE from GDDR6 and decode 4 FP8 elements in registers

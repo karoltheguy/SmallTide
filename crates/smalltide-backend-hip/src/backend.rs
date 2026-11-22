@@ -1511,8 +1511,9 @@ impl ComputeBackend for HipBackend {
         let mut splits_arg = params.num_splits as u32;
         let mut inv_sqrt_d = params.inv_sqrt_d;
         let mut window_arg = params.window as u32;
+        let mut d_pt = self.opt_dev_ptr(params.page_table)?;
 
-        let mut p1: [*mut c_void; 18] = [
+        let mut p1: [*mut c_void; 19] = [
             &mut d_po as *mut _ as *mut c_void,
             &mut d_pm as *mut _ as *mut c_void,
             &mut d_pl as *mut _ as *mut c_void,
@@ -1531,6 +1532,7 @@ impl ComputeBackend for HipBackend {
             &mut splits_arg as *mut _ as *mut c_void,
             &mut inv_sqrt_d as *mut _ as *mut c_void,
             &mut window_arg as *mut _ as *mut c_void,
+            &mut d_pt as *mut _ as *mut c_void,
         ];
         let mut p2: [*mut c_void; 7] = [
             &mut d_out as *mut _ as *mut c_void,
@@ -2126,11 +2128,12 @@ impl ComputeBackend for HipBackend {
 
     fn kv_store_fp8_rows(&self, k_cache: DeviceBuf, k_scales: DeviceBuf, v_cache: DeviceBuf,
         v_scales: DeviceBuf, k_in: DeviceBuf, v_in: DeviceBuf, n_kv_heads: usize, max_seq: usize,
-        head_dim: usize, pos0: usize, rows: usize, is_local: bool, stream: Stream) -> Result<()> {
+        head_dim: usize, pos0: usize, rows: usize, is_local: bool, page_table: Option<DeviceBuf>, stream: Stream) -> Result<()> {
         let (mut a, mut b, mut c, mut d, mut e, mut f) = (self.dev_ptr(k_cache)?, self.dev_ptr(k_scales)?,
             self.dev_ptr(v_cache)?, self.dev_ptr(v_scales)?, self.dev_ptr(k_in)?, self.dev_ptr(v_in)?);
         let (mut nkv, mut ms, mut hd, mut p0, mut loc) = (n_kv_heads as u32, max_seq as u32, head_dim as u32, pos0 as u32, is_local as u32);
-        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut nkv), p(&mut ms), p(&mut hd), p(&mut p0), p(&mut loc)];
+        let mut pt = self.opt_dev_ptr(page_table)?;
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut nkv), p(&mut ms), p(&mut hd), p(&mut p0), p(&mut loc), p(&mut pt)];
         self.launch(self.kernels.kv_store_fp8_rows, (nkv, rows as u32, 1), hd, &mut args, stream, "launch(kv_store_fp8_rows)")
     }
 
@@ -2142,15 +2145,16 @@ impl ComputeBackend for HipBackend {
             self.opt_dev_ptr(rel_table)?, self.opt_dev_ptr(sinks)?);
         let (mut nq, mut nkv, mut ms, mut win, mut p0, mut re, mut isd) = (pp.n_q_heads as u32, pp.n_kv_heads as u32,
             pp.max_seq as u32, pp.window as u32, pp.pos0 as u32, pp.rel_extent as u32, pp.inv_sqrt_d);
+        let mut pt = self.opt_dev_ptr(pp.page_table)?;
         if std::env::var_os("SMALLTIDE_ATTN_SCALAR").is_none() && pp.n_q_heads % pp.n_kv_heads == 0 {
             let mut rows = pp.rows as u32;
             let nqv = rows * (nq / nkv);
             let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut g), p(&mut h),
-                p(&mut nq), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd), p(&mut rows)];
+                p(&mut nq), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd), p(&mut rows), p(&mut pt)];
             return self.launch(self.kernels.attn_prefill_wmma, (nkv, nqv.div_ceil(16), 1), 128, &mut args, stream, "launch(attn_prefill_wmma)");
         }
         let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut g), p(&mut h),
-            p(&mut nq), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd)];
+            p(&mut nq), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd), p(&mut pt)];
         self.launch(self.kernels.attn_prefill_fp8, (nkv, pp.rows as u32, 1), 128, &mut args, stream, "launch(attn_prefill_fp8)")
     }
 
@@ -2305,6 +2309,7 @@ impl ComputeBackend for HipBackend {
             rel_thr: f32,
             tau: f32,
             eps: f32,
+            page_table: *mut c_void,
         }
         if pp.n_q_heads == 0 || pp.n_kv_heads == 0 {
             return Err(SmallTideError::Backend { backend: "hip", message: "attn_prep_decode: bad head counts".into() });
@@ -2337,6 +2342,7 @@ impl ComputeBackend for HipBackend {
             rel_thr: pp.rel_threshold,
             tau: pp.tau,
             eps: pp.eps,
+            page_table: self.opt_dev_ptr(pp.page_table)?,
         };
         let blocks = (pp.n_kv_heads + 2 * pp.n_q_heads) as u32;
         let mut args = [p(&mut a)];
@@ -2384,6 +2390,7 @@ impl ComputeBackend for HipBackend {
             rel_thr: f32,
             tau: f32,
             eps: f32,
+            page_table: *mut c_void,
         }
         if pp.n_q_heads == 0 || pp.n_kv_heads == 0 {
             return Err(SmallTideError::Backend { backend: "hip", message: "attn_prep_decode: bad head counts".into() });
@@ -2416,6 +2423,7 @@ impl ComputeBackend for HipBackend {
             rel_thr: pp.rel_threshold,
             tau: pp.tau,
             eps: pp.eps,
+            page_table: self.opt_dev_ptr(pp.page_table)?,
         };
         let (ta, tf) = tau.unwrap_or((0.0, 1.0));
         let mut e = ExtC {

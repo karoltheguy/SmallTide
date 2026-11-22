@@ -123,6 +123,9 @@ pub struct TideCache {
     /// Hard physical slot capacities of the allocated NVFP4 and MXFP8 VRAM pools (`None` = byte-only budget).
     max_vram_slots_nvfp4: Option<usize>,
     max_vram_slots_mxfp8: Option<usize>,
+    /// When set, a disk -> VRAM load does not also keep a RAM copy (startup placement: RAM is
+    /// filled afterwards, experts that are not in VRAM first).
+    pub no_ram_copy_on_direct: bool,
     used_vram_slots_nvfp4: usize,
     used_vram_slots_mxfp8: usize,
     scratch_ring_size: u32,
@@ -183,6 +186,7 @@ impl TideCache {
             scratch_base_mxfp8: 4096,
             max_vram_slots_nvfp4: None,
             max_vram_slots_mxfp8: None,
+            no_ram_copy_on_direct: false,
             used_vram_slots_nvfp4: 0,
             used_vram_slots_mxfp8: 0,
             scratch_ring_size: 8,
@@ -808,6 +812,7 @@ impl TideCache {
         } else {
             // Not ready in RAM yet: optionally keep a RAM copy unless exclusive pinned.
             let keep_ram_slot = if !release_ram
+                && !self.no_ram_copy_on_direct
                 && src_ram.is_missing()
                 && self.ram_used_bytes + need <= self.ram_budget_bytes
             {

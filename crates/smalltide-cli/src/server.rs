@@ -280,6 +280,8 @@ struct ActiveReq {
     log_think: usize,
     log_tail: String,
     log_w0: (f64, f64),
+    /// (sync rescues, skipped misses, disk reads) telemetry at admission.
+    log_c0: (u64, u64, u64),
 }
 
 impl ActiveReq {
@@ -421,8 +423,14 @@ fn finish_req(
     let hit = engine.telemetry().total_vram_hit_rate();
     let tel = engine.telemetry();
     let (dw, ds) = (tel.routed_weight_total - req.log_w0.0, tel.routed_weight_skipped - req.log_w0.1);
+    let (dr, dm, dd) = (
+        tel.stage1_sync_rescues - req.log_c0.0,
+        tel.stage1_skipped_tail_misses - req.log_c0.1,
+        tel.stage2_disk_reads - req.log_c0.2,
+    );
+    let ntok = req.generated.len().max(1) as f64;
     eprintln!(
-        "[req] lane {lane}: finish={} prompt {} (cached {}) -> {} tokens: answer {} chars, thinking {} chars, {} tool call(s) | skipped expert weight {:.1}% | ends with {:?}",
+        "[req] lane {lane}: finish={} prompt {} (cached {}) -> {} tokens: answer {} chars, thinking {} chars, {} tool call(s) | skipped expert weight {:.1}% | per token: {:.1} rescue loads, {:.1} skipped experts, {:.1} disk reads | ends with {:?}",
         if req.n_tool_calls > 0 && req.finish_reason == "stop" { "tool_calls" } else { req.finish_reason },
         req.prompt_len,
         req.reuse_len,
@@ -431,6 +439,9 @@ fn finish_req(
         req.log_think,
         req.n_tool_calls,
         if dw > 0.0 { 100.0 * ds / dw } else { 0.0 },
+        dr as f64 / ntok,
+        dm as f64 / ntok,
+        dd as f64 / ntok,
         req.log_tail
     );
     let tps = req.finish(hit);
@@ -849,6 +860,10 @@ fn admit(
         log_think: 0,
         log_tail: String::new(),
         log_w0: (engine.telemetry().routed_weight_total, engine.telemetry().routed_weight_skipped),
+        log_c0: {
+            let t = engine.telemetry();
+            (t.stage1_sync_rescues, t.stage1_skipped_tail_misses, t.stage2_disk_reads)
+        },
     })
 }
 

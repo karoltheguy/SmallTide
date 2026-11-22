@@ -147,21 +147,18 @@ impl TideScheduler {
                 })
                 .collect();
             ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            self.cache.no_ram_copy_on_direct = true;
             for &(id, _) in &ranked {
                 if self.cache.has_free_vram_room_for(id) {
                     if let Some(op) = self.cache.promote_to_vram(id, false, true) {
                         self.record_transfer_telemetry(&op, false);
                         ops.push(op);
                     }
-                } else if self.cache.entry(id).vram_slot.is_missing()
-                    && self.cache.ram_used_bytes() + self.cache.expert_bytes(id) <= self.cache.ram_budget_bytes()
-                {
-                    if let Some(op) = self.cache.promote_to_ram(id) {
-                        self.record_transfer_telemetry(&op, false);
-                        ops.push(op);
-                    }
                 }
             }
+            self.cache.no_ram_copy_on_direct = false;
+            let order: Vec<ExpertId> = ranked.iter().map(|&(id, _)| id).collect();
+            self.fill_ram(&order, &mut ops);
             return ops;
         }
 
@@ -178,6 +175,8 @@ impl TideScheduler {
             }
         }
         loop_experts.sort_by(|a, b| b.1.total_cmp(&a.1));
+        self.cache.no_ram_copy_on_direct = true;
+        let loop_order: Vec<ExpertId> = loop_experts.iter().map(|&(id, _)| id).collect();
         for (id, _) in loop_experts {
             if !self.cache.has_free_vram_room_for(id) {
                 break;
@@ -213,17 +212,37 @@ impl TideScheduler {
                     self.record_transfer_telemetry(&op, false);
                     ops.push(op);
                 }
-            } else if self.cache.ram_used_bytes() + self.cache.expert_bytes(id)
-                <= self.cache.ram_budget_bytes()
-            {
+            }
+        }
+        self.cache.no_ram_copy_on_direct = false;
+        let mut order: Vec<ExpertId> = outer_experts.iter().map(|&(id, _)| id).collect();
+        order.extend(loop_order);
+        self.fill_ram(&order, &mut ops);
+
+        ops
+    }
+
+    /// Startup RAM warm-up in `order` (most valuable first): experts that are NOT in VRAM first
+    /// (a miss on them would otherwise read the disk), then RAM copies of VRAM-resident experts
+    /// with the budget left (cheap fallback once they are evicted from VRAM).
+    fn fill_ram(&mut self, order: &[ExpertId], ops: &mut Vec<TransferOp>) {
+        for want_resident in [false, true] {
+            for &id in order {
+                let e = self.cache.entry(id);
+                let in_vram = !e.vram_slot.is_missing();
+                // Pinned experts are never evicted from VRAM: a RAM copy would be dead weight.
+                if in_vram != want_resident || !e.ram_slot.is_missing() || e.vram_pinned {
+                    continue;
+                }
+                if self.cache.ram_used_bytes() + self.cache.expert_bytes(id) > self.cache.ram_budget_bytes() {
+                    continue;
+                }
                 if let Some(op) = self.cache.promote_to_ram(id) {
                     self.record_transfer_telemetry(&op, false);
                     ops.push(op);
                 }
             }
         }
-
-        ops
     }
 
     /// Records router activations during prefill so Mode 2 can perform a prompt-aware rebalance.
@@ -764,6 +783,36 @@ mod tests {
         let (_pre2, loop_c2, _coda2) = sched.cache.count_vram_resident();
         assert_eq!(loop_c2, 1536, "Loop Core must remain 100% intact at 327K FP8 KV");
         assert!(sched.cache.vram_used_bytes() <= sched.cache.vram_expert_budget_bytes());
+    }
+
+    #[test]
+    fn test_startup_ram_holds_non_resident_experts_first() {
+        // 6 GiB VRAM for experts, 9 GiB RAM: RAM must hold every expert that is not in VRAM
+        // before it spends anything on copies of VRAM-resident ones.
+        let model_cfg = Inkling2Config::default();
+        let tide_cfg = TideConfig::default();
+        let mut sched = TideScheduler::new(model_cfg.clone(), tide_cfg, 6 * GIB, 9 * GIB);
+        let _ = sched.plan_pre_prefill(None);
+        sched.cache.publish_all_pending();
+        let total = model_cfg.num_physical_layers * model_cfg.n_routed_experts;
+        let (mut non_res, mut non_res_in_ram, mut res_in_ram, mut non_res_bytes) = (0usize, 0usize, 0usize, 0usize);
+        for i in 0..total {
+            let id = sched.cache.expert_from_flat(i);
+            let e = sched.cache.entry(id);
+            if e.vram_slot.is_missing() {
+                non_res += 1;
+                non_res_bytes += sched.cache.expert_bytes(id);
+                non_res_in_ram += (!e.ram_slot.is_missing()) as usize;
+            } else {
+                res_in_ram += (!e.ram_slot.is_missing()) as usize;
+            }
+        }
+        assert!(non_res > 0);
+        if non_res_bytes <= 9 * GIB {
+            assert_eq!(non_res_in_ram, non_res, "every non-resident expert must be in RAM");
+        } else {
+            assert_eq!(res_in_ram, 0, "no RAM copies of resident experts while non-resident ones are missing");
+        }
     }
 
     #[test]

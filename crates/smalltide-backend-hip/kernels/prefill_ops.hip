@@ -731,7 +731,28 @@ __device__ __forceinline__ st_float8 wmma_dot_k(uint32_t tag, const _Float16* __
     const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
     uint32_t hoff = (kh != 0u) ? 32u : 0u;
     if (tag == 0u) {
-        for (uint32_t k = 0u; k < K; k += 64u) {
+        uint32_t k = 0u;
+        // Two 64-k blocks per iteration: both blocks' loads are in flight before the 8 WMMAs.
+        for (; k + 128u <= K; k += 128u) {
+            uint32_t b0 = k + hoff, b1 = k + 64u + hoff;
+            const uint4* ap0 = reinterpret_cast<const uint4*>(ar + b0);
+            const uint4* ap1 = reinterpret_cast<const uint4*>(ar + b1);
+            uint4 wv0 = *reinterpret_cast<const uint4*>(w + (b0 >> 1));
+            uint4 wv1 = *reinterpret_cast<const uint4*>(w + (b1 >> 1));
+            uint8_t q0 = sc[b0 >> 4], q1 = sc[(b0 >> 4) + 1u], q2 = sc[b1 >> 4], q3 = sc[(b1 >> 4) + 1u];
+            uint4 a00 = valid ? ap0[0] : zero, a01 = valid ? ap0[1] : zero, a02 = valid ? ap0[2] : zero, a03 = valid ? ap0[3] : zero;
+            uint4 a10 = valid ? ap1[0] : zero, a11 = valid ? ap1[1] : zero, a12 = valid ? ap1[2] : zero, a13 = valid ? ap1[3] : zero;
+            float s0 = decode_fp8_e4m3fn(q0), s1 = decode_fp8_e4m3fn(q1), s2 = decode_fp8_e4m3fn(q2), s3 = decode_fp8_e4m3fn(q3);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a00), wmma_nvfp4_frag(wv0.x, s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a01), wmma_nvfp4_frag(wv0.y, s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a02), wmma_nvfp4_frag(wv0.z, s1), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a03), wmma_nvfp4_frag(wv0.w, s1), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a10), wmma_nvfp4_frag(wv1.x, s2), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a11), wmma_nvfp4_frag(wv1.y, s2), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a12), wmma_nvfp4_frag(wv1.z, s3), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a13), wmma_nvfp4_frag(wv1.w, s3), c);
+        }
+        for (; k < K; k += 64u) {
             uint32_t base = k + hoff;
             const uint4* ap = reinterpret_cast<const uint4*>(ar + base);
             uint4 av0 = valid ? ap[0] : zero, av1 = valid ? ap[1] : zero, av2 = valid ? ap[2] : zero, av3 = valid ? ap[3] : zero;
@@ -743,7 +764,28 @@ __device__ __forceinline__ st_float8 wmma_dot_k(uint32_t tag, const _Float16* __
             c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(av3), wmma_nvfp4_frag(wv.w, s1), c);
         }
     } else {
-        for (uint32_t k = 0u; k < K; k += 64u) {
+        uint32_t k = 0u;
+        for (; k + 128u <= K; k += 128u) {
+            uint32_t b0 = k + hoff, b1 = k + 64u + hoff;
+            const uint4* ap0 = reinterpret_cast<const uint4*>(ar + b0);
+            const uint4* ap1 = reinterpret_cast<const uint4*>(ar + b1);
+            const uint4* wp0 = reinterpret_cast<const uint4*>(w + b0);
+            const uint4* wp1 = reinterpret_cast<const uint4*>(w + b1);
+            uint4 wa0 = wp0[0], wb0 = wp0[1], wa1 = wp1[0], wb1 = wp1[1];
+            uint8_t q0 = sc[b0 >> 5], q1 = sc[b1 >> 5];
+            uint4 a00 = valid ? ap0[0] : zero, a01 = valid ? ap0[1] : zero, a02 = valid ? ap0[2] : zero, a03 = valid ? ap0[3] : zero;
+            uint4 a10 = valid ? ap1[0] : zero, a11 = valid ? ap1[1] : zero, a12 = valid ? ap1[2] : zero, a13 = valid ? ap1[3] : zero;
+            float s0 = decode_ue8m0(q0), s1 = decode_ue8m0(q1);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a00), wmma_mxfp8_frag(make_uint2(wa0.x, wa0.y), s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a01), wmma_mxfp8_frag(make_uint2(wa0.z, wa0.w), s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a02), wmma_mxfp8_frag(make_uint2(wb0.x, wb0.y), s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a03), wmma_mxfp8_frag(make_uint2(wb0.z, wb0.w), s0), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a10), wmma_mxfp8_frag(make_uint2(wa1.x, wa1.y), s1), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a11), wmma_mxfp8_frag(make_uint2(wa1.z, wa1.w), s1), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a12), wmma_mxfp8_frag(make_uint2(wb1.x, wb1.y), s1), c);
+            c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(as_half8(a13), wmma_mxfp8_frag(make_uint2(wb1.z, wb1.w), s1), c);
+        }
+        for (; k < K; k += 64u) {
             uint32_t base = k + hoff;
             const uint4* ap = reinterpret_cast<const uint4*>(ar + base);
             uint4 av0 = valid ? ap[0] : zero, av1 = valid ? ap[1] : zero, av2 = valid ? ap[2] : zero, av3 = valid ? ap[3] : zero;

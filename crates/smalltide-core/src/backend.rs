@@ -674,6 +674,9 @@ pub trait ComputeBackend: Send + Sync {
     /// copy of the residual, attention-residual mix with up to 3 queries, per-query RMSNorm.
     fn fused_mix_decode(&self, p: FusedMixParams, stream: Stream) -> Result<()>;
 
+    /// `gemv_multi` over `rows` (<= 8) contiguous rows of every segment's x / y.
+    fn gemv_multi_rows(&self, segs: &[GemvSegment], rows: usize, stream: Stream) -> Result<()>;
+
     /// Several independent GEMVs in as few launches as possible (8 segments per launch).
     fn gemv_multi(&self, segs: &[GemvSegment], stream: Stream) -> Result<()>;
 

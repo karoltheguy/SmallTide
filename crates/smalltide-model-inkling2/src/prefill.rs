@@ -8,6 +8,7 @@
 //! Scratch Rescue slots in waves, so prefill is always exact (no skipped experts).
 
 use crate::engine::{Inkling2Engine, PREFILL_CHUNK};
+use smalltide_core::backend::GemvSegment;
 use crate::weights::{Fp8MatrixGpu, LoopControllerGpu};
 use smalltide_core::backend::{GroupedMoeParams, PrefillAttnParams};
 use smalltide_core::{
@@ -405,6 +406,39 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
     }
 
+    /// Up to 4 controllers over the same <= 8 rows: down and gain / forget projections each in one
+    /// launch (scratch slices of 8 rows per controller).
+    fn control_rows_multi(
+        &self,
+        items: &[(DeviceBuf, DeviceBuf, DeviceBuf, &LoopControllerGpu)],
+        m: usize,
+        s: Stream,
+    ) -> Result<()> {
+        let pf = self.pf.as_ref().unwrap();
+        let h = self.cfg.hidden_size;
+        let r = self.cfg.loop_gate_rank;
+        const R8: usize = 8;
+        let sl = |buf: DeviceBuf, j: usize, n: usize| buf.slice(j * R8 * n * 4, m * n * 4);
+        for (j, (_, cur, msg, _)) in items.iter().enumerate() {
+            self.backend.loop_control_prep_rows(sl(pf.ctrl_prep, j, 2 * h), *cur, *msg, h, self.cfg.rms_norm_eps, m, s)?;
+        }
+        let seg = |mm: &crate::weights::Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment {
+            w: mm.data, row_scales: Some(mm.row_scales), x, y, n_rows: mm.n_rows, k_cols: mm.k_cols,
+        };
+        let downs: Vec<GemvSegment> = items.iter().enumerate().map(|(j, it)| seg(&it.3.down, sl(pf.ctrl_prep, j, 2 * h), sl(pf.ctrl_gate, j, r))).collect();
+        self.backend.gemv_multi_rows(&downs, m, s)?;
+        let mut gf = Vec::with_capacity(2 * items.len());
+        for (j, it) in items.iter().enumerate() {
+            gf.push(seg(&it.3.gain, sl(pf.ctrl_gate, j, r), sl(pf.ctrl_gain, j, h)));
+            gf.push(seg(&it.3.forget, sl(pf.ctrl_gate, j, r), sl(pf.ctrl_forget, j, h)));
+        }
+        self.backend.gemv_multi_rows(&gf, m, s)?;
+        for (j, (out, cur, msg, _)) in items.iter().enumerate() {
+            self.backend.loop_control_apply(*out, *cur, *msg, sl(pf.ctrl_gain, j, h), sl(pf.ctrl_forget, j, h), m * h, s)?;
+        }
+        Ok(())
+    }
+
     fn control_rows(
         &self,
         out: DeviceBuf,
@@ -483,8 +517,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let ctrls = layer.controllers.as_ref().expect("controllers");
             let c = [part(pf.ctrl_qkv, 0, m, h), part(pf.ctrl_qkv, 1, m, h), part(pf.ctrl_qkv, 2, m, h)];
             let ins = [in0, in1, in2];
-            for j in 0..3 {
-                self.control_rows(c[j], ins[j], part(msgs, j, m, h), &ctrls[j], m, s)?;
+            if self.rows_decode {
+                let items: Vec<_> = (0..3).map(|j| (c[j], ins[j], part(msgs, j, m, h), &ctrls[j])).collect();
+                self.control_rows_multi(&items, m, s)?;
+            } else {
+                for j in 0..3 {
+                    self.control_rows(c[j], ins[j], part(msgs, j, m, h), &ctrls[j], m, s)?;
+                }
             }
             (c[0], c[1], c[2])
         } else {
@@ -514,15 +553,40 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         };
         // 4. projections
         b.seg_mark("pf: qkvr proj,conv,clip", s);
-        self.mm_rows(pf.q, nq, &layer.wq, m, s)?;
-        self.mm_rows(pf.k_raw, nk, &layer.wk, m, s)?;
-        self.mm_rows(pf.v_raw, nv, &layer.wv, m, s)?;
-        self.mm_rows(pf.r, nq, &layer.wr, m, s)?;
-        let st = &self.layer_states[il];
+        let fused_proj = self.rows_decode;
         let taps = nkv * cfg.sconv_kernel_size;
+        if fused_proj {
+            // One launch: Q, K, V, R, the output gate (FP8), sinks and dynamic conv taps (F32).
+            let seg = |mm: &crate::weights::Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment {
+                w: mm.data, row_scales: Some(mm.row_scales), x, y, n_rows: mm.n_rows, k_cols: mm.k_cols,
+            };
+            let mut segs = vec![
+                seg(&layer.wq, nq, pf.q),
+                seg(&layer.wk, nk, pf.k_raw),
+                seg(&layer.wv, nv, pf.v_raw),
+                seg(&layer.wr, nq, pf.r),
+                seg(&layer.gate_attn, nq, pf.gate_out),
+                GemvSegment { w: layer.attn_sink, row_scales: None, x: nq, y: pf.sinks, n_rows: nqh, k_cols: h },
+            ];
+            if let Some(w) = layer.k_sconv_dyn_proj {
+                segs.push(GemvSegment { w, row_scales: None, x: nk, y: pf.k_dyn, n_rows: taps, k_cols: h });
+            }
+            if let Some(w) = layer.v_sconv_dyn_proj {
+                segs.push(GemvSegment { w, row_scales: None, x: nv, y: pf.v_dyn, n_rows: taps, k_cols: h });
+            }
+            b.gemv_multi_rows(&segs, m, s)?;
+        } else {
+            self.mm_rows(pf.q, nq, &layer.wq, m, s)?;
+            self.mm_rows(pf.k_raw, nk, &layer.wk, m, s)?;
+            self.mm_rows(pf.v_raw, nv, &layer.wv, m, s)?;
+            self.mm_rows(pf.r, nq, &layer.wr, m, s)?;
+        }
+        let st = &self.layer_states[il];
         let k_dyn = match layer.k_sconv_dyn_proj {
             Some(w) => {
-                b.gemm_f32_rows(pf.k_dyn, nk, w, m, taps, h, s)?;
+                if !fused_proj {
+                    b.gemm_f32_rows(pf.k_dyn, nk, w, m, taps, h, s)?;
+                }
                 Some(pf.k_dyn)
             }
             None => None,
@@ -539,7 +603,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         let v_dyn = match layer.v_sconv_dyn_proj {
             Some(w) => {
-                b.gemm_f32_rows(pf.v_dyn, nv, w, m, taps, h, s)?;
+                if !fused_proj {
+                    b.gemm_f32_rows(pf.v_dyn, nv, w, m, taps, h, s)?;
+                }
                 Some(pf.v_dyn)
             }
             None => None,
@@ -574,7 +640,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         b.value_norm_no_gamma(pf.v, m * nkv, hd, eps, s)?;
         // 6. sinks, relative bias, KV store, attention
         b.seg_mark("pf: sinks,rel,kv,attention", s);
-        b.gemm_f32_rows(pf.sinks, nq, layer.attn_sink, m, nqh, h, s)?;
+        if !fused_proj {
+            b.gemm_f32_rows(pf.sinks, nq, layer.attn_sink, m, nqh, h, s)?;
+        }
         b.rel_table(pf.rel_table, pf.r, layer.rel_logits_proj, m * nqh, cfg.rel_extent, s)?;
         match lanes {
             None => {
@@ -633,7 +701,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         // 7. output gate, wo, post-attention conv
         b.seg_mark("pf: gate,wo,conv,mix,router", s);
-        self.mm_rows(pf.gate_out, nq, &layer.gate_attn, m, s)?;
+        if !fused_proj {
+            self.mm_rows(pf.gate_out, nq, &layer.gate_attn, m, s)?;
+        }
         b.gate_attn_sigmoid_mul(pf.attn_out, pf.attn_out, pf.gate_out, m * q_dim, s)?;
         self.mm_rows(pf.o_raw, pf.attn_out, &layer.wo, m, s)?;
         match lanes {
@@ -659,7 +729,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         b.attn_res_mix_rows(pf.moe_in, bv, pf.cur, layer.mlp_res_query, *nb, 1, h, eps, m, s)?;
         let moe_x = if let Some(msgs) = messages {
             let ctrls = layer.controllers.as_ref().unwrap();
-            self.control_rows(pf.moe_ctrl, pf.moe_in, part(msgs, 3, m, h), &ctrls[3], m, s)?;
+            if self.rows_decode {
+                self.control_rows_multi(&[(pf.moe_ctrl, pf.moe_in, part(msgs, 3, m, h), &ctrls[3])], m, s)?;
+            } else {
+                self.control_rows(pf.moe_ctrl, pf.moe_in, part(msgs, 3, m, h), &ctrls[3], m, s)?;
+            }
             pf.moe_ctrl
         } else {
             pf.moe_in

@@ -189,6 +189,7 @@ pub struct CoreKernels {
     pub moe_post_rows: HipFunction,
     pub gemv_fp8_rows2: HipFunction,
     pub moe_group_rows2: HipFunction,
+    pub gemv_multi_rows: HipFunction,
     pub moe_w2_rows: HipFunction,
 }
 
@@ -411,6 +412,7 @@ impl HipRuntime {
             moe_post_rows: get_fn("smalltide_moe_post_rows")?,
             gemv_fp8_rows2: get_fn("smalltide_gemv_fp8_rows2")?,
             moe_group_rows2: get_fn("smalltide_moe_group_rows2")?,
+            gemv_multi_rows: get_fn("smalltide_gemv_multi_rows")?,
             moe_w2_rows: get_fn("smalltide_moe_w2_rows")?,
         })
     }

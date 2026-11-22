@@ -613,13 +613,28 @@ impl<B: ComputeBackend> TideExecutor<B> {
         if experts.is_empty() {
             return Ok(Vec::new());
         }
+        self.fence_scratch()?;
+        self.stage_into_scratch_fenced(experts)
+    }
+
+    /// Marks the point on the compute stream after which nothing queued so far uses the scratch
+    /// ring: a following `stage_into_scratch_fenced` copies as soon as that point is reached, so
+    /// kernels queued in between (which must not touch the ring) overlap the copy.
+    pub fn fence_scratch(&mut self) -> Result<()> {
+        self.backend.record_event(self.compute_fence, self.compute_stream)
+    }
+
+    /// `stage_into_scratch` behind the fence set by the last `fence_scratch`.
+    pub fn stage_into_scratch_fenced(&mut self, experts: &[ExpertId]) -> Result<Vec<SlotIndex>> {
+        if experts.is_empty() {
+            return Ok(Vec::new());
+        }
         let cls = self.scheduler.cache.expert_class(experts[0]);
         let (base, size) = self.scheduler.cache.scratch_ring(cls);
         if experts.len() > size as usize {
             return Err(SmallTideError::Backend { backend: "tide", message: "too many experts for scratch ring".into() });
         }
-        // Previous users of these slots (earlier kernels on the compute stream) must be done.
-        self.backend.record_event(self.compute_fence, self.compute_stream)?;
+        // Previous users of these slots (kernels on the compute stream before the fence) must be done.
         self.backend.stream_wait_event(self.copy_stream, self.compute_fence)?;
         let mut slots = Vec::with_capacity(experts.len());
         for (i, &id) in experts.iter().enumerate() {

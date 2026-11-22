@@ -233,12 +233,13 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     let pack = StidePackReader::open(&pack_path).expect("open experts.stide");
     let backend = Arc::new(HipBackend::new_auto().expect("init HipBackend"));
     let dense_gpu = Inkling2DenseGpu::upload(backend.clone(), dense_host).expect("upload dense GPU");
+    smalltide_model_inkling2::engine::set_prefill_chunk(parse("SMALLTIDE_PREFILL_CHUNK", 512usize, "a token count (64 to 1024)"));
     // The drafter goes before the VRAM measurement so the pool budget accounts for it.
     let drafter = if s.spec {
         let path = dir.join("mtp.safetensors");
         let t = Instant::now();
         let d = smalltide_model_inkling2::drafter::Drafter::load(backend.clone(), &path, &dense_gpu, cfg.unpadded_vocab_size, s.max_ctx,
-            smalltide_model_inkling2::engine::PREFILL_CHUNK, s.kv_v_q4).expect("load drafter (mtp.safetensors)");
+            smalltide_model_inkling2::engine::prefill_chunk(), s.kv_v_q4).expect("load drafter (mtp.safetensors)");
         println!("[spec] DSpark drafter loaded ({:.0} MiB VRAM, kv={}, {:.1}s)", d.vram_bytes as f64 / (1u64 << 20) as f64,
             if s.kv_v_q4 { "k8v4" } else { "fp8" }, t.elapsed().as_secs_f64());
         Some(d)

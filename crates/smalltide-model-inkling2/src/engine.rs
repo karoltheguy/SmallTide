@@ -21,9 +21,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) const MAX_FLASH_SPLITS: usize = 64;
-/// Maximum tokens per batched prefill chunk. Local KV rings hold `window + PREFILL_CHUNK` slots so
-/// a chunk's own keys never overwrite keys an earlier row of the same chunk still attends to.
-pub const PREFILL_CHUNK: usize = 256;
+static PREFILL_CHUNK_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(512);
+
+/// Maximum tokens per batched prefill chunk (`SMALLTIDE_PREFILL_CHUNK`, default 512). Local KV
+/// rings hold `window + prefill_chunk()` slots so a chunk's own keys never overwrite keys an
+/// earlier row of the same chunk still attends to. Larger chunks prefill faster (fewer host round
+/// trips, each weight read once per more rows) for more scratch VRAM.
+pub fn prefill_chunk() -> usize {
+    PREFILL_CHUNK_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets the prefill chunk (clamped to 64..=1024). Call before the drafter and engine are built:
+/// their buffers are sized by it.
+pub fn set_prefill_chunk(rows: usize) {
+    PREFILL_CHUNK_ROWS.store(rows.clamp(64, 1024), std::sync::atomic::Ordering::Relaxed);
+}
 const MAX_ATTN_RES_BLOCKS: usize = 8;
 
 /// Optional per-component wall-clock breakdown (accumulated across steps when profiling is enabled).
@@ -326,7 +338,7 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     pub(crate) verify_hist: Option<DeviceBuf>,
     /// Per lane: device rewind table (hist, state, dim, 0) x 4 per logical layer.
     rewind_tables: Vec<Option<DeviceBuf>>,
-    /// Drafter taps of the last rows forward: `[4][PREFILL_CHUNK][H]` (layer 4 / 22 / 40 outputs,
+    /// Drafter taps of the last rows forward: `[4][prefill_chunk()][H]` (layer 4 / 22 / 40 outputs,
     /// final normed hidden), filled when `capture_taps`.
     pub(crate) taps_buf: Option<DeviceBuf>,
     pub capture_taps: bool,
@@ -406,7 +418,7 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
         let is_local = cfg.is_local_layer(phys.0 as usize);
         let v_q4 = !is_local && global_v_q4;
         let (max_seq, window) = if is_local {
-            (cfg.local_window_size + PREFILL_CHUNK, cfg.local_window_size)
+            (cfg.local_window_size + prefill_chunk(), cfg.local_window_size)
         } else {
             let g = global_max_seq.max(cfg.local_window_size);
             (g, g)
@@ -1180,7 +1192,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let n_log = self.layer_states.len();
         if self.verify_hist.is_none() {
             self.verify_hist = Some(self.backend.alloc_device(n_log * (3 + MAX_BATCH_ROWS) * (2 * kv + 2 * h) * 4)?);
-            self.taps_buf = Some(self.backend.alloc_device(4 * PREFILL_CHUNK * h * 4)?);
+            self.taps_buf = Some(self.backend.alloc_device(4 * prefill_chunk() * h * 4)?);
             self.argmax_rows_buf = Some(self.backend.alloc_device(ARGMAX_FILTER_BUF_BYTES)?);
         }
         self.ensure_rows_buffers()
@@ -1960,7 +1972,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     pub(crate) fn drafter_ingest(&mut self, pos0: usize, m: usize) -> Result<()> {
         self.last_tap_rows = m;
         if let (Some(d), Some(taps)) = (self.drafter.as_ref(), self.taps_buf) {
-            d.ingest(taps, PREFILL_CHUNK, pos0, m, self.tide.compute_stream)?;
+            d.ingest(taps, prefill_chunk(), pos0, m, self.tide.compute_stream)?;
         }
         Ok(())
     }
@@ -1971,7 +1983,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let taps = self.taps_buf.expect("taps buffer");
         let s = self.tide.compute_stream;
         let d = self.drafter.as_mut().expect("drafter attached");
-        d.draft(&self.dense, anchor, p, taps, PREFILL_CHUNK, tap_row, n, s)
+        d.draft(&self.dense, anchor, p, taps, prefill_chunk(), tap_row, n, s)
     }
 
     /// Like `draft`, returning `(token_id, top1_minus_top2_logit_margin)` per drafted token.
@@ -1979,7 +1991,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let taps = self.taps_buf.expect("taps buffer");
         let s = self.tide.compute_stream;
         let d = self.drafter.as_mut().expect("drafter attached");
-        d.draft_with_margins(&self.dense, anchor, p, taps, PREFILL_CHUNK, tap_row, n, s)
+        d.draft_with_margins(&self.dense, anchor, p, taps, prefill_chunk(), tap_row, n, s)
     }
 
     /// Speculative verify (greedy): skips monotonic final logit softcap; follow with `rows_argmax`

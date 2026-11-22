@@ -90,8 +90,20 @@ impl PrefixDisk {
         for b in sig.bytes() {
             r.push(b as u32);
         }
-        let dir = root.join(format!("v1-{:016x}", r.0 ^ r.1));
+        let name = format!("v1-{:016x}", r.0 ^ r.1);
+        let dir = root.join(&name);
         std::fs::create_dir_all(&dir)?;
+        // Stores of other snapshot layouts (another KV format, context size or prefill chunk)
+        // cannot be read by this engine and would sit outside the budget: remove them.
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                let stale = n.len() == 19 && n.starts_with("v1-") && n[3..].bytes().all(|b| b.is_ascii_hexdigit()) && n != name;
+                if stale && e.path().join("index.json").is_file() && std::fs::remove_dir_all(e.path()).is_ok() {
+                    println!("[prefix] disk: removed {n} (saved for a different engine configuration)");
+                }
+            }
+        }
         let mut s = PrefixDisk { dir, budget, min_gain, segs: BTreeMap::new(), next: 0, clock: 0, layout };
         s.load_index();
         Ok(s)

@@ -149,8 +149,9 @@ __device__ __forceinline__ uint8_t encode_fp8_e4m3fn(float x) {
 // ---------------------------------------------------------------------------
 // 4. Write 1 Decode Token's K & V into FP8 KV Cache:
 //    k_in, v_in: [n_kv_heads, head_dim] (8 x 128) FP32
-//    k_cache, v_cache: [n_kv_heads, max_seq, head_dim] uint8 FP8 (head-major for coalesced 256K reads!)
-//    k_scales, v_scales: [n_kv_heads, max_seq] float (per-head-token absmax / 448.0)
+//    k_cache, v_cache: [max_seq, n_kv_heads, head_dim] uint8 FP8 (position-major: a sequence's
+//    cache grows as one contiguous range, so it can be paged)
+//    k_scales, v_scales: [max_seq, n_kv_heads] float (per-head-token absmax / 448.0)
 //    Grid: (n_kv_heads, 1, 1), Block: (128, 1, 1) -> 1 thread per head_dim element
 // ---------------------------------------------------------------------------
 extern "C" __global__ void smalltide_kv_store_fp8_decode(
@@ -202,13 +203,13 @@ extern "C" __global__ void smalltide_kv_store_fp8_decode(
         float vmax = fmaxf(fmaxf(sv_max[0], sv_max[1]), fmaxf(sv_max[2], sv_max[3]));
         k_scale_s = (kmax > 0.0f) ? (kmax / 448.0f) : 1.0f;
         v_scale_s = (vmax > 0.0f) ? (vmax / 448.0f) : 1.0f;
-        size_t s_idx = static_cast<size_t>(h) * max_seq + slot_pos;
+        size_t s_idx = static_cast<size_t>(slot_pos) * n_kv_heads + h;
         k_scales[s_idx] = k_scale_s;
         v_scales[s_idx] = v_scale_s;
     }
     __syncthreads();
 
-    size_t dst_idx = (static_cast<size_t>(h) * max_seq + slot_pos) * head_dim + d;
+    size_t dst_idx = (static_cast<size_t>(slot_pos) * n_kv_heads + h) * head_dim + d;
     k_cache[dst_idx] = encode_fp8_e4m3fn(kv / k_scale_s);
     v_cache[dst_idx] = encode_fp8_e4m3fn(vv / v_scale_s);
 }
@@ -268,10 +269,12 @@ extern "C" __global__ void smalltide_flash_decode_fp8_split(
     float m1 = -1e30f, l1 = 0.0f; float4 o1 = make_float4(0,0,0,0);
     float m2 = -1e30f, l2 = 0.0f; float4 o2 = make_float4(0,0,0,0);
 
-    const uint8_t* k_base = k_cache + static_cast<size_t>(kvh) * max_seq * 128u;
-    const uint8_t* v_base = v_cache + static_cast<size_t>(kvh) * max_seq * 128u;
-    const float* ks_base = k_scales + static_cast<size_t>(kvh) * max_seq;
-    const float* vs_base = v_scales + static_cast<size_t>(kvh) * max_seq;
+    // Position-major cache ([slot][n_kv_heads][128], scales [slot][n_kv_heads]).
+    const uint8_t* k_base = k_cache + static_cast<size_t>(kvh) * 128u;
+    const uint8_t* v_base = v_cache + static_cast<size_t>(kvh) * 128u;
+    const float* ks_base = k_scales + kvh;
+    const float* vs_base = v_scales + kvh;
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * 128u;
 
     const float* rel0 = (rel_table != nullptr) ? (rel_table + static_cast<size_t>(qh0 + 0u) * rel_extent) : nullptr;
     const float* rel1 = (rel_table != nullptr && gqa_ratio > 1u) ? (rel_table + static_cast<size_t>(qh0 + 1u) * rel_extent) : nullptr;
@@ -287,16 +290,16 @@ extern "C" __global__ void smalltide_flash_decode_fp8_split(
         uint32_t dist = q_pos - t_pos;
 
         // Read K[slot] ONCE from GDDR6 and decode 4 FP8 elements in registers
-        uint32_t k4 = reinterpret_cast<const uint32_t*>(k_base + static_cast<size_t>(slot) * 128u)[lane];
+        uint32_t k4 = reinterpret_cast<const uint32_t*>(k_base + static_cast<size_t>(slot) * kv_stride)[lane];
         float kx = decode_fp8_e4m3fn(k4 & 0xFFu);
         float ky = decode_fp8_e4m3fn((k4 >> 8) & 0xFFu);
         float kz = decode_fp8_e4m3fn((k4 >> 16) & 0xFFu);
         float kw = decode_fp8_e4m3fn((k4 >> 24) & 0xFFu);
-        float k_scale = ks_base[slot] * inv_sqrt_d_log2;
+        float k_scale = ks_base[static_cast<size_t>(slot) * n_kv_heads] * inv_sqrt_d_log2;
 
         // Read V[slot] ONCE from GDDR6 and decode 4 FP8 elements in registers
-        uint32_t v4 = reinterpret_cast<const uint32_t*>(v_base + static_cast<size_t>(slot) * 128u)[lane];
-        float v_scale = vs_base[slot];
+        uint32_t v4 = reinterpret_cast<const uint32_t*>(v_base + static_cast<size_t>(slot) * kv_stride)[lane];
+        float v_scale = vs_base[static_cast<size_t>(slot) * n_kv_heads];
         float vx = decode_fp8_e4m3fn(v4 & 0xFFu) * v_scale;
         float vy = decode_fp8_e4m3fn((v4 >> 8) & 0xFFu) * v_scale;
         float vz = decode_fp8_e4m3fn((v4 >> 16) & 0xFFu) * v_scale;

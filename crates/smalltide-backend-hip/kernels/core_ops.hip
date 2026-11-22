@@ -454,7 +454,7 @@ extern "C" __global__ void smalltide_attn_prep_decode(AttnPrepArgs a) {
         float vm = block128_max(fabsf(v), sh);
         float ks = (km > 0.0f) ? km / 448.0f : 1.0f;
         float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
-        size_t si = static_cast<size_t>(h) * a.max_seq + a.slot;
+        size_t si = static_cast<size_t>(a.slot) * a.n_kv + h;
         if (t == 0u) { a.k_scales[si] = ks; a.v_scales[si] = vsc; }
         a.k_cache[si * 128u + t] = encode_fp8_e4m3fn(k / ks);
         a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);
@@ -792,7 +792,7 @@ extern "C" __global__ void smalltide_attn_prep_rows(AttnPrepArgs a, AttnPrepRows
             float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
             uint32_t pos = e.pos0 + r;
             uint32_t slot = (e.is_local != 0u) ? (pos % a.max_seq) : pos;
-            size_t si = static_cast<size_t>(h) * a.max_seq + slot;
+            size_t si = static_cast<size_t>(slot) * a.n_kv + h;
             if (t == 0u) { a.k_scales[si] = ks; a.v_scales[si] = vsc; }
             a.k_cache[si * 128u + t] = encode_fp8_e4m3fn(k / ks);
             a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);

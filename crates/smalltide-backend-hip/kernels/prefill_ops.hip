@@ -203,7 +203,7 @@ extern "C" __global__ void smalltide_kv_store_fp8_rows(
     float vs = (vmax > 0.0f) ? (vmax / 448.0f) : 1.0f;
     uint32_t pos = pos0 + t;
     uint32_t slot = (is_local != 0u) ? (pos % max_seq) : pos;
-    size_t si = static_cast<size_t>(h) * max_seq + slot;
+    size_t si = static_cast<size_t>(slot) * n_kv_heads + h;
     if (d == 0u) { k_scales[si] = ks; v_scales[si] = vs; }
     k_cache[si * head_dim + d] = encode_fp8_e4m3fn(kv / ks);
     v_cache[si * head_dim + d] = encode_fp8_e4m3fn(vv / vs);
@@ -242,19 +242,21 @@ extern "C" __global__ void smalltide_attn_prefill_fp8(
     float sc_mul = inv_sqrt_d * LOG2E;
     float m[3] = {-1e30f, -1e30f, -1e30f}, l[3] = {0, 0, 0};
     float4 o[3] = {make_float4(0, 0, 0, 0), make_float4(0, 0, 0, 0), make_float4(0, 0, 0, 0)};
-    const uint8_t* kb = k_cache + static_cast<size_t>(kvh) * max_seq * 128u;
-    const uint8_t* vb = v_cache + static_cast<size_t>(kvh) * max_seq * 128u;
-    const float* ksb = k_scales + static_cast<size_t>(kvh) * max_seq;
-    const float* vsb = v_scales + static_cast<size_t>(kvh) * max_seq;
+    // Position-major cache ([slot][n_kv_heads][128], scales [slot][n_kv_heads]).
+    const uint8_t* kb = k_cache + static_cast<size_t>(kvh) * 128u;
+    const uint8_t* vb = v_cache + static_cast<size_t>(kvh) * 128u;
+    const float* ksb = k_scales + kvh;
+    const float* vsb = v_scales + kvh;
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * 128u;
     for (uint32_t kp = k_start + warp; kp <= p; kp += 4u) {
         uint32_t slot = (window != 0u) ? (kp % max_seq) : kp;
         uint32_t dist = p - kp;
-        uint32_t k4 = reinterpret_cast<const uint32_t*>(kb + static_cast<size_t>(slot) * 128u)[lane];
+        uint32_t k4 = reinterpret_cast<const uint32_t*>(kb + static_cast<size_t>(slot) * kv_stride)[lane];
         float kx = decode_fp8_e4m3fn(k4 & 0xFFu), ky = decode_fp8_e4m3fn((k4 >> 8) & 0xFFu);
         float kz = decode_fp8_e4m3fn((k4 >> 16) & 0xFFu), kw = decode_fp8_e4m3fn((k4 >> 24) & 0xFFu);
-        float kscale = ksb[slot] * sc_mul;
-        uint32_t v4 = reinterpret_cast<const uint32_t*>(vb + static_cast<size_t>(slot) * 128u)[lane];
-        float vscale = vsb[slot];
+        float kscale = ksb[static_cast<size_t>(slot) * n_kv_heads] * sc_mul;
+        uint32_t v4 = reinterpret_cast<const uint32_t*>(vb + static_cast<size_t>(slot) * kv_stride)[lane];
+        float vscale = vsb[static_cast<size_t>(slot) * n_kv_heads];
         float vx = decode_fp8_e4m3fn(v4 & 0xFFu) * vscale, vy = decode_fp8_e4m3fn((v4 >> 8) & 0xFFu) * vscale;
         float vz = decode_fp8_e4m3fn((v4 >> 16) & 0xFFu) * vscale, vw = decode_fp8_e4m3fn((v4 >> 24) & 0xFFu) * vscale;
         #pragma unroll
@@ -952,10 +954,12 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
     #pragma unroll
     for (uint32_t i = 0u; i < 8u; ++i) qinfo(half_ * 8u + i, tC[i], qhC[i], pC[i], loC[i]);
 
-    const uint8_t* kb = k_cache + static_cast<size_t>(kvh) * max_seq * 128u;
-    const uint8_t* vb = v_cache + static_cast<size_t>(kvh) * max_seq * 128u;
-    const float* ksb = k_scales + static_cast<size_t>(kvh) * max_seq;
-    const float* vsb = v_scales + static_cast<size_t>(kvh) * max_seq;
+    // Position-major cache ([slot][n_kv_heads][128], scales [slot][n_kv_heads]).
+    const uint8_t* kb = k_cache + static_cast<size_t>(kvh) * 128u;
+    const uint8_t* vb = v_cache + static_cast<size_t>(kvh) * 128u;
+    const float* ksb = k_scales + kvh;
+    const float* vsb = v_scales + kvh;
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * 128u;
 
     float m_run[8], l_run[8];
     st_float8 o[8];
@@ -975,15 +979,15 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
         st_float8 sacc = {};
         #pragma unroll
         for (uint32_t c = 0u; c < 8u; ++c) {
-            uint2 kw = kin ? *reinterpret_cast<const uint2*>(kb + static_cast<size_t>(slot) * 128u + c * 16u + half_ * 8u) : make_uint2(0u, 0u);
+            uint2 kw = kin ? *reinterpret_cast<const uint2*>(kb + static_cast<size_t>(slot) * kv_stride + c * 16u + half_ * 8u) : make_uint2(0u, 0u);
             float4 a = decode_fp8x4(kw.x), b = decode_fp8x4(kw.y);
             st_half8 kf;
             kf[0] = (_Float16)a.x; kf[1] = (_Float16)a.y; kf[2] = (_Float16)a.z; kf[3] = (_Float16)a.w;
             kf[4] = (_Float16)b.x; kf[5] = (_Float16)b.y; kf[6] = (_Float16)b.z; kf[7] = (_Float16)b.w;
             sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qa[c], kf, sacc);
         }
-        float kscale = kin ? ksb[slot] : 0.0f;
-        float vscale = kin ? vsb[slot] : 0.0f;
+        float kscale = kin ? ksb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f;
+        float vscale = kin ? vsb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f;
         // Logits, masks, relative bias; online softmax (row max over the 16 key lanes).
         float pr[8];
         #pragma unroll
@@ -1018,7 +1022,7 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
         for (uint32_t r = 0u; r < 16u; ++r) {
             uint32_t kr = k0 + r;
             uint32_t vslot = (window != 0u) ? (kr % max_seq) : kr;
-            uint32_t vw = (kr <= key_hi) ? reinterpret_cast<const uint32_t*>(vb + static_cast<size_t>(vslot) * 128u)[l] : 0u;
+            uint32_t vw = (kr <= key_hi) ? reinterpret_cast<const uint32_t*>(vb + static_cast<size_t>(vslot) * kv_stride)[l] : 0u;
             float4 vv = decode_fp8x4(vw);
             s_v[warp][r][l * 4u + 0u] = (_Float16)vv.x; s_v[warp][r][l * 4u + 1u] = (_Float16)vv.y;
             s_v[warp][r][l * 4u + 2u] = (_Float16)vv.z; s_v[warp][r][l * 4u + 3u] = (_Float16)vv.w;

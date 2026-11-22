@@ -473,17 +473,18 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         v
     }
 
-    /// Per head, per global layer: `(tensor, bytes per position)` regions of the global KV.
-    fn global_kv_regions(&self) -> Vec<(DeviceBuf, usize, usize)> {
-        // (buffer, per-head stride in bytes, bytes per position)
+    /// Per global layer: `(tensor, bytes per position over all KV heads)` - the caches are
+    /// position-major, so a prefix of `pos` positions is the tensor's first `pos * bytes` bytes.
+    fn global_kv_regions(&self) -> Vec<(DeviceBuf, usize)> {
         let hd = self.cfg.head_dim;
+        let heads = self.cfg.num_key_value_heads;
         let mut v = Vec::new();
         for st in &self.layer_states {
             if !st._is_local {
-                v.push((st.k_cache, st.max_seq * hd, hd));
-                v.push((st.k_scales, st.max_seq * 4, 4));
-                v.push((st.v_cache, st.max_seq * hd, hd));
-                v.push((st.v_scales, st.max_seq * 4, 4));
+                v.push((st.k_cache, heads * hd));
+                v.push((st.k_scales, heads * 4));
+                v.push((st.v_cache, heads * hd));
+                v.push((st.v_scales, heads * 4));
             }
         }
         v
@@ -496,8 +497,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
     /// Bytes of a `SeqSnapshot` of `pos` tokens (fixed part + the global KV of the prefix).
     pub fn snapshot_bytes_at(&self, pos: usize) -> usize {
-        let heads = self.cfg.num_key_value_heads;
-        self.snapshot_bytes() + self.global_kv_regions().iter().map(|r| heads * pos * r.2).sum::<usize>()
+        self.snapshot_bytes() + self.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>()
     }
 
     /// Captures the state after `pos` tokens into `snap` (allocating or growing its pinned buffer):
@@ -523,14 +523,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.backend.memcpy_d2h_async(sn.host, off, b, 0, b.size_bytes, s)?;
             off += b.size_bytes;
         }
-        let heads = self.cfg.num_key_value_heads;
-        for (buf, stride, per_pos) in self.global_kv_regions() {
+        for (buf, per_pos) in self.global_kv_regions() {
             let len = pos * per_pos;
             if len == 0 {
                 continue;
             }
-            for hh in 0..heads {
-                self.backend.memcpy_d2h_async(sn.host, off, buf.slice(hh * stride, len), 0, len, s)?;
+            {
+                self.backend.memcpy_d2h_async(sn.host, off, buf.slice(0, len), 0, len, s)?;
                 off += len;
             }
         }
@@ -548,16 +547,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             off += b.size_bytes;
         }
         if global {
-            let heads = self.cfg.num_key_value_heads;
-            for (buf, stride, per_pos) in self.global_kv_regions() {
+            for (buf, per_pos) in self.global_kv_regions() {
                 let len = snap.pos * per_pos;
                 if len == 0 {
                     continue;
                 }
-                for hh in 0..heads {
-                    self.backend.memcpy_h2d_async(buf.slice(hh * stride, len), 0, snap.host, off, len, s)?;
-                    off += len;
-                }
+                self.backend.memcpy_h2d_async(buf.slice(0, len), 0, snap.host, off, len, s)?;
+                off += len;
             }
         }
         Ok(())

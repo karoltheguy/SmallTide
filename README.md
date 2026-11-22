@@ -8,18 +8,18 @@ Pre-built Windows releases embed the compiled `gfx1201` `.hsaco` GPU kernels ins
 
 ## Measured Performance (RX 9070 XT 16 GB, Windows 11)
 
-Measured with `bench/bench.py` (median of 3 runs after 1 warmup; one-shots: 1 run; `temperature=0.6`, `effort=none`, DSpark speculative decoding on, 128K shared paged KV pool, rescue gate 0.15 / Loop Core 0.10, rescue budget 24 per token, Adrenalin 26.10.44):
+Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver. *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
 
-| Workload | Prompt / output | Decode | TTFT | Skipped routing weight | Inline rescues / tok | Disk reads |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `prose` (essay) | 58 / 1,024 | **68.0 tok/s** | 228 ms | 1.43% | 1.3 | 0 |
-| `code` (LRU cache module + tests) | 74 / 1,024 | **68.9 tok/s** | 298 ms | 2.54% | 3.5 | 0 |
-| `edit` (refactor a 1.4K-token file) | 1,425 / 1,024 | **74.7 tok/s** | 2.24 s | 3.40% | 5.5 | 0 |
-| `random` (8K-token random prompt) | 8,266 / 372 | **47.9 tok/s** | 6.71 s | 8.58% | 10.8 | 0 |
-| `angry-birds` (one-shot HTML game) | 76 / 8,192 | **89.1 tok/s** | 418 ms | 2.42% | 2.7 | 0 |
-| `mario` (one-shot HTML game) | 66 / 6,678 | **85.7 tok/s** | 436 ms | 2.52% | 2.9 | 0 |
+| Workload | Prompt / output | Decode | TTFT |
+| --- | ---: | ---: | ---: |
+| `prose` (essay) | 58 / 1,024 | **68.0 tok/s** | 228 ms |
+| `code` (LRU cache module + tests) | 74 / 1,024 | **68.9 tok/s** | 298 ms |
+| `edit` (refactor a 1.4K-token file) | 1,425 / 1,024 | **74.7 tok/s** | 2.24 s |
+| `random` (8K-token random prompt) | 8,266 / 372 | **47.9 tok/s** | 6.71 s |
+| `angry-birds` (one-shot HTML game) | 76 / 8,192 | **89.1 tok/s** | 418 ms |
+| `mario` (one-shot HTML game) | 66 / 6,678 | **85.7 tok/s** | 436 ms |
 
-*VRAM hit rates on these runs: Prelude 91–93%, Loop Core 99%, Coda 80–88%; the `random` workload's prompt of random tokens is a worst case for expert residency. `angry-birds` reached the 8,192-token output limit.*
+*`random` uses a prompt of random tokens, a worst case for the engine; `angry-birds` reached the 8,192-token output limit.*
 
 ---
 

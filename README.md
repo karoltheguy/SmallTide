@@ -67,7 +67,7 @@ Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 
 
 | Method & Path | Description |
 | --- | --- |
-| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming SSE & non-streaming, `reasoning_content`, `reasoning_effort`, tool calls, `cache_prompt`) |
+| `POST /v1/chat/completions` | OpenAI Chat Completions (streaming SSE & non-streaming, `reasoning_content`, `reasoning_effort`, tool calls, image input, `cache_prompt`) |
 | `POST /v1/completions` | OpenAI Legacy Completions (streaming & non-streaming) |
 | `GET  /v1/models` | Lists `inkling-2-mini` |
 | `GET  /expert-map` | Live WebGL/Grid expert residency & routing visualizer |
@@ -82,6 +82,26 @@ curl.exe -s http://127.0.0.1:8000/v1/chat/completions `
   -H "Content-Type: application/json" `
   -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"Say hello in 10 words."}],"max_tokens":64}'
 ```
+
+---
+
+## Image Input
+
+Inkling-2-Mini reads images, and SmallTide runs its vision tower on demand: the tower's weights (636 MB) stay in the checkpoint file and are streamed through the GPU a layer at a time while an image is encoded, then everything is freed. Nothing of it is resident in RAM or VRAM, so text-only use is unaffected.
+
+Send images as content parts of a user (or tool) message, in the OpenAI format with a base64 `data:` URL:
+
+```json
+{"role": "user", "content": [
+  {"type": "text", "text": "What is in this picture?"},
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+]}
+```
+
+- **Formats:** PNG and JPEG. Anthropic-style parts (`{"type": "image", "source": {"type": "base64", "data": "..."}}`) are accepted too. `http(s)` image URLs are not fetched; send the image data.
+- **Cost:** an image is used at its own resolution, one token per 40 × 40 pixel cell: 1024 × 1024 is 676 tokens, 1920 × 1080 is 1,296. Larger images are scaled down to `SMALLTIDE_VISION_MAX_TOKENS`.
+- **Time:** encoding takes about 0.3 s for 1024 × 1024 and 0.8 s for 1920 × 1080 (RX 9070 XT), plus the prefill of the image's tokens. It uses 40–240 MB of VRAM for the duration of the encode.
+- **Caching:** the prefix cache keys image positions by the image's content, so a follow-up turn or a repeated request does not encode or prefill the image again.
 
 ---
 
@@ -108,6 +128,7 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 | `SMALLTIDE_RESCUE_THRESHOLD` / `..._CORE` | `0.15` / `0.1` | Routing-weight gate for inline rescues (Prelude & Coda / Loop Core). |
 | `SMALLTIDE_RESCUE_BUDGET_PRELUDE` / `_CORE` / `_CODA` | `8` / `6` / `10` | Per-token inline rescue caps per architectural zone. |
 | `SMALLTIDE_SPEC` | `1` | Enable (`1`) or disable (`0`) DSpark speculative decoding. |
+| `SMALLTIDE_VISION` / `SMALLTIDE_VISION_MAX_TOKENS` | `1` / `1536` | Image input on (`1`) or off (`0`), and the most tokens one image takes (larger images are scaled down). |
 | `SMALLTIDE_RAM_GB` | `16` | Host RAM tier for non-VRAM experts (lower to `10` on 16 GB RAM PCs). |
 | `SMALLTIDE_HOST` / `SMALLTIDE_PORT` | `0.0.0.0` / `8000` | Server bind address (`127.0.0.1` for local-only) and port. |
 

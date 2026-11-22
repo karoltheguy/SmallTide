@@ -72,6 +72,9 @@ enum StreamEvent {
     Error(String),
 }
 
+/// `max_tokens` when a request gives none: bounded by the lane's context instead.
+const UNLIMITED_TOKENS: usize = 1 << 24;
+
 enum EngineCommand {
     Generate {
         prompt_text: String,
@@ -1091,7 +1094,9 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     return;
                 }
             };
-            let max_tokens = req.max_completion_tokens.or(req.max_tokens).unwrap_or(512);
+            // No limit given: like OpenAI, generate until the answer ends or the lane's context is
+            // full (a thinking model can spend hundreds of tokens before its answer starts).
+            let max_tokens = req.max_completion_tokens.or(req.max_tokens).unwrap_or(UNLIMITED_TOKENS);
             let sampling = SamplingParams {
                 temperature: req.temperature.unwrap_or(0.6),
                 top_p: req.top_p.unwrap_or(0.95),
@@ -1318,7 +1323,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     .to_string(),
                 _ => String::new(),
             };
-            let max_tokens = req.max_tokens.unwrap_or(256);
+            let max_tokens = req.max_tokens.unwrap_or(UNLIMITED_TOKENS);
             let sampling = SamplingParams {
                 temperature: req.temperature.unwrap_or(0.6),
                 top_p: req.top_p.unwrap_or(0.95),

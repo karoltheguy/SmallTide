@@ -682,8 +682,8 @@ impl TideScheduler {
                 }
                 miss_stats.retain(|s| s.1 >= tau);
                 miss_stats.sort_by(|a, b| b.2.total_cmp(&a.2));
-                // 1/layer in Prelude/Core so budget spreads across layers; up to 2/layer in Coda.
-                let max_per_layer = if zone == 2 && m >= 4 { 2 } else { 1 };
+                // 1/layer in Loop Core (36 passes); up to 2/layer in Prelude & Coda on wide verify steps.
+                let max_per_layer = if zone != 1 && m >= 4 { 2 } else { 1 };
                 let rem_budget = zone_cap.saturating_sub(self.rescues_by_zone[zone]);
                 let take = max_per_layer.min(rem_budget);
                 for (id, max_share, _sum_share) in miss_stats.into_iter().take(take) {

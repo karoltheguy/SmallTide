@@ -839,6 +839,29 @@ fn run_generate(args: &[String]) {
         .sample_next_token(&sampling, &generated)
         .expect("sample first token");
 
+    if let Some(iters) = std::env::var("SMALLTIDE_DRAFT_BENCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+        // Dev: the drafter alone (anchor = first sampled token at the prompt end), wall time per
+        // draft for 1..7 drafts, then a per-kernel table for 7 drafts.
+        let p0 = prompt_ids.len();
+        let row = engine.last_tap_rows.max(1) - 1;
+        for n in [1usize, 2, 3, 5, 7] {
+            for _ in 0..3 { engine.draft(next_tok, p0, row, n).expect("draft"); }
+            let t0 = Instant::now();
+            for _ in 0..iters { engine.draft(next_tok, p0, row, n).expect("draft"); }
+            println!("[draft-bench] {n} drafts: {:.3} ms per draft call", t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+        }
+        backend.set_kernel_timing(true).expect("kt");
+        let _ = backend.take_kernel_times();
+        for _ in 0..iters { engine.draft(next_tok, p0, row, 7).expect("draft"); }
+        let mut kt = backend.take_kernel_times();
+        backend.set_kernel_timing(false).expect("kt off");
+        kt.sort_by(|a, b| b.2.total_cmp(&a.2));
+        for (name, cnt, ms) in kt.iter() {
+            println!("    {:<30} {:>5.1}x {:>8.3} ms/call ({:.1} us avg)", name, *cnt as f64 / iters as f64, ms / iters as f64, ms * 1000.0 / *cnt as f64);
+        }
+        return;
+    }
+
     if std::env::var_os("SMALLTIDE_ROWS_CMP").is_some() {
         // Dev: one token from the same state through forward_token, a 1-row batched round and a
         // 1-row verify; max |logit| differences.

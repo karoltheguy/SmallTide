@@ -20,9 +20,18 @@ use std::time::Instant;
 /// Loads `.env` into the process environment (existing variables are kept). Returns the file
 /// that was loaded, if any. Call first thing in `main`.
 pub fn load_dotenv() -> Option<PathBuf> {
-    let path = std::env::var_os("SMALLTIDE_ENV")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".env"));
+    let path = if let Some(p) = std::env::var_os("SMALLTIDE_ENV") {
+        PathBuf::from(p)
+    } else {
+        let cwd_env = PathBuf::from(".env");
+        if cwd_env.exists() {
+            cwd_env
+        } else if let Some(exe_env) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(".env"))).filter(|p| p.exists()) {
+            exe_env
+        } else {
+            cwd_env
+        }
+    };
     let text = std::fs::read_to_string(&path).ok()?;
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -186,10 +195,34 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     let dir = s.model_dir.as_path();
     let t_start = Instant::now();
 
-    let tok = BpeTokenizer::from_file(&dir.join("tokenizer.json")).expect("load tokenizer.json");
-    let dense_host = Inkling2DenseHost::load_from_safetensors(&cfg, &dir.join("model-00001-of-00001.safetensors"))
+    let tok_path = dir.join("tokenizer.json");
+    let dense_path = dir.join("model-00001-of-00001.safetensors");
+    let pack_path = dir.join("experts.stide");
+    if !tok_path.exists() || !dense_path.exists() {
+        eprintln!(
+            "error: Inkling-2-Mini weights not found in '{}'.\n\
+             Run `.\\smalltide.cmd setup` to download and pack the model,\n\
+             or set SMALLTIDE_MODEL_DIR in .env to your checkpoint directory.",
+            dir.display()
+        );
+        std::process::exit(1);
+    }
+    if !pack_path.exists() {
+        eprintln!(
+            "error: packed expert store '{}' not found.\n\
+             Build it once (~15s) with:\n  smalltide-cli pack \"{}\" \"{}\"\n\
+             or run `.\\smalltide.cmd setup`.",
+            pack_path.display(),
+            dense_path.display(),
+            pack_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    let tok = BpeTokenizer::from_file(&tok_path).expect("load tokenizer.json");
+    let dense_host = Inkling2DenseHost::load_from_safetensors(&cfg, &dense_path)
         .expect("load dense weights");
-    let pack = StidePackReader::open(&dir.join("experts.stide")).expect("open experts.stide");
+    let pack = StidePackReader::open(&pack_path).expect("open experts.stide");
     let backend = Arc::new(HipBackend::new_auto().expect("init HipBackend"));
     let dense_gpu = Inkling2DenseGpu::upload(backend.clone(), dense_host).expect("upload dense GPU");
     // The drafter goes before the VRAM measurement so the pool budget accounts for it.
@@ -254,6 +287,14 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
         Err(e) => {
             if path.exists() {
                 eprintln!("[priors] ignoring {}: {e}", path.display());
+            } else if let Some((seed_path, seeded)) = load_seed_priors() {
+                println!(
+                    "[priors] seeded from {} ({} requests); live updates will save to {}",
+                    seed_path.display(),
+                    seeded.sessions_recorded,
+                    path.display()
+                );
+                return seeded;
             } else {
                 println!("[priors] none yet at {}; collecting from this session", path.display());
             }
@@ -440,6 +481,33 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
 
 fn cfg_for_log() -> Inkling2Config {
     Inkling2Config::default()
+}
+
+/// Finds a bundled seed priors file on fresh installs (`profiles/inkling2-mini-priors.json`).
+fn load_seed_priors() -> Option<(PathBuf, TidePriors)> {
+    let mut candidates = Vec::new();
+    match var("SMALLTIDE_PRIORS_SEED").as_deref() {
+        Some("off") | Some("0") => return None,
+        Some(p) => candidates.push(PathBuf::from(p)),
+        None => {
+            candidates.push(PathBuf::from("profiles").join("inkling2-mini-priors.json"));
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    candidates.push(dir.join("profiles").join("inkling2-mini-priors.json"));
+                }
+            }
+        }
+    }
+    for cand in candidates {
+        if cand.exists() {
+            match TidePriors::load_from_file(&cand) {
+                Ok(p) if !p.is_empty() => return Some((cand, p)),
+                Ok(_) => {}
+                Err(e) => eprintln!("[priors] ignoring seed {}: {e}", cand.display()),
+            }
+        }
+    }
+    None
 }
 
 /// Prints where configuration came from (once, at startup).

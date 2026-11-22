@@ -277,6 +277,8 @@ pub fn run_serve(args: &[String]) {
     let bind_addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&bind_addr).expect("bind HTTP server");
     println!("Listening on http://{bind_addr}");
+    println!("  GET  http://127.0.0.1:{port}/expert-map");
+    println!("  GET  http://127.0.0.1:{port}/health");
     println!("  GET  http://127.0.0.1:{port}/v1/models");
     println!("  POST http://127.0.0.1:{port}/v1/completions");
     println!("  POST http://127.0.0.1:{port}/v1/chat/completions");

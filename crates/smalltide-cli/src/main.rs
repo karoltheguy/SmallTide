@@ -1328,6 +1328,10 @@ fn run_generate(args: &[String]) {
         println!("
 [rescue-check] {:.1} checks/token | wait {:.3} ms + plan {:.3} ms per check",
             pr.rescue_checks as f64 / dec_toks.max(1) as f64, pr.rescue_wait_ms / pr.rescue_checks as f64, pr.rescue_plan_ms / pr.rescue_checks as f64);
+        let (n, fill, sync) = engine.tide.rescue_stats;
+        if n > 0 {
+            println!("[rescue-check] {n} rescues: {:.3} ms staging copy + {:.3} ms copy-stream wait each", fill / n as f64, sync / n as f64);
+        }
     }
     if spec && spec_steps > 0 {
         let hist: Vec<String> = spec_hist[..spec_width].iter().enumerate().map(|(i, c)| format!("{i}:{c}")).collect();

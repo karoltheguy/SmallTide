@@ -61,6 +61,8 @@ pub struct TideExecutor<B: ComputeBackend> {
     /// Tier 1 Host RAM warm expert slabs, keyed by `(class, ram_slot)` and tagged with the
     /// expert they hold so a re-used slot can never silently feed stale bytes to a DMA.
     ram_slabs: HashMap<(ExpertClass, SlotIndex), (ExpertId, Vec<u8>)>,
+    /// Dev: (rescues, host ms issuing (RAM -> staging copies), ms waiting for the copy stream).
+    pub rescue_stats: (u64, f64, f64),
     /// Dedicated background Stage 2 NVMe I/O worker thread.
     stage2_worker: Option<Stage2IoWorker>,
 
@@ -159,6 +161,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             table_ring,
             table_ring_cursor: 0,
             ram_slabs: HashMap::new(),
+            rescue_stats: (0, 0.0, 0.0),
             stage2_worker,
             pending_batches: VecDeque::new(),
             free_events: Vec::new(),
@@ -549,9 +552,14 @@ impl<B: ComputeBackend> TideExecutor<B> {
     /// is pending (an in-flight async promotion of a picked expert).
     pub fn execute_rescue_now(&mut self, ops: &[TransferOp]) -> Result<()> {
         self.allocate_pools()?;
+        let t0 = std::time::Instant::now();
         let _ = self.issue_ops(ops, false)?;
+        let t1 = std::time::Instant::now();
         // The copy stream is in order: once it is idle, every earlier async batch landed too.
         self.backend.sync_stream(self.copy_stream)?;
+        self.rescue_stats.0 += 1;
+        self.rescue_stats.1 += (t1 - t0).as_secs_f64() * 1000.0;
+        self.rescue_stats.2 += t1.elapsed().as_secs_f64() * 1000.0;
         while let Some((ev, _)) = self.pending_batches.pop_front() {
             self.free_events.push(ev);
         }

@@ -8,16 +8,18 @@ Pre-built Windows releases embed the compiled `gfx1201` `.hsaco` GPU kernels ins
 
 ## Measured Performance (RX 9070 XT 16 GB, Windows 11)
 
-Measured with `bench/bench.py` (`temperature=0.6`, `effort=none`, 1,024 tokens, DSpark speculative decoding on, 49K shared paged KV cache, Adrenalin 26.10.44):
+Measured with `bench/bench.py` (median of 3 runs after 1 warmup; one-shots: 1 run; `temperature=0.6`, `effort=none`, DSpark speculative decoding on, 128K shared paged KV pool, rescue gate 0.15 / Loop Core 0.10, rescue budget 24 per token, Adrenalin 26.10.44):
 
-| Workload | Decode (warm) | Skipped routing weight | Inline rescues / tok | Disk reads |
-| --- | ---: | ---: | ---: | ---: |
-| `prose` (short story) | **71.7 tok/s** | 2.57% | 1.69 | 0 |
-| `code` (LRU cache in Python) | **77.2 tok/s** | 2.54% | 1.75 | 0 |
-| `edit` (4K-token file refactor) | **55.7 – 72.8 tok/s** | 3.34% | 2.13 | 0 |
-| Live agent session @ 17K ctx | **82.7 tok/s** | 4.2% (93.9% VRAM hit) | — | 0 |
+| Workload | Prompt / output | Decode | TTFT | Skipped routing weight | Inline rescues / tok | Disk reads |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `prose` (essay) | 58 / 1,024 | **68.0 tok/s** | 228 ms | 1.43% | 1.3 | 0 |
+| `code` (LRU cache module + tests) | 74 / 1,024 | **68.9 tok/s** | 298 ms | 2.54% | 3.5 | 0 |
+| `edit` (refactor a 1.4K-token file) | 1,425 / 1,024 | **74.7 tok/s** | 2.24 s | 3.40% | 5.5 | 0 |
+| `random` (8K-token random prompt) | 8,266 / 372 | **47.9 tok/s** | 6.71 s | 8.58% | 10.8 | 0 |
+| `angry-birds` (one-shot HTML game) | 76 / 8,192 | **89.1 tok/s** | 418 ms | 2.42% | 2.7 | 0 |
+| `mario` (one-shot HTML game) | 66 / 6,678 | **85.7 tok/s** | 436 ms | 2.52% | 2.9 | 0 |
 
-*Live session: 2,016 / 3,072 routed experts resident in dedicated VRAM (98.4% hit rate in the 4× Loop Core), 2.92 GiB VRAM free, zero PCIe spillover.*
+*VRAM hit rates on these runs: Prelude 91–93%, Loop Core 99%, Coda 80–88%; the `random` workload's prompt of random tokens is a worst case for expert residency. `angry-birds` reached the 8,192-token output limit.*
 
 ---
 
@@ -120,10 +122,12 @@ To reset learned routing priors back to the bundled seed, delete `models\Inkling
 With `.\smalltide.cmd serve` running in another terminal (requires Python 3, standard library only):
 
 ```powershell
-.\smalltide.cmd bench --only prose code edit --runs 2
+.\smalltide.cmd bench --workload prose --runs 3 --out results\prose.json
+# every workload: prose, code, edit, random (--isl 8192), angry-birds, mario
+foreach ($w in "prose","code","edit","random","angry-birds","mario") { .\smalltide.cmd bench --workload $w --out "results\$w.json" }
 ```
 
-Results are written to `results/<timestamp>/README.md` with per-request decode speed, TTFT, skipped routing weight, inline rescues/token, and disk reads.
+Each run prints decode speed, TTFT, skipped routing weight, inline rescues/token, VRAM hit rates by zone and disk reads; `--out` writes the summary JSON, and the one-shot games are saved to `results/oneshots/`.
 
 ---
 
@@ -134,8 +138,8 @@ Only needed if you want to modify the Rust engine/HIP kernels or compile for ano
 - **Prerequisites:** [Rust](https://rustup.rs/) (MSVC toolchain) + **AMD ROCm HIP SDK for Windows** (`hipcc.exe`, auto-detected under `C:\Program Files\AMD\ROCm\*\bin\` or `ROCM_PATH` / `SMALLTIDE_HIPCC`).
 
 ```powershell
-git clone https://github.com/raspberrypark/smalltide.git
-cd smalltide
+git clone https://github.com/raspy135/SmallTide.git
+cd SmallTide
 .\smalltide.cmd build
 .\smalltide.cmd setup
 .\smalltide.cmd serve

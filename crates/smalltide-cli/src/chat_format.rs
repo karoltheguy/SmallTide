@@ -575,6 +575,10 @@ fn canonicalize_messages(messages: &[OJson]) -> Result<Vec<OJson>, String> {
     for m in &mut out {
         let OJson::Obj(kv) = m else { continue };
         for (k, v) in kv.iter_mut() {
+            // OpenAI's "developer" role (the newer name for a system message) renders as system.
+            if k == "role" && matches!(v, OJson::Str(r) if r == "developer") {
+                *v = OJson::Str("system".into());
+            }
             if k != "tool_calls" {
                 continue;
             }
@@ -1087,6 +1091,19 @@ mod tests {
         // an escaped quote inside a string is still a quote
         let v = parse_json_lenient(r#"{"a":"say \"hi\" now","b":1,}"#).unwrap();
         assert_eq!(v.get("a").and_then(OJson::as_str), Some(r#"say "hi" now"#));
+    }
+
+    #[test]
+    fn developer_role_renders_as_system() {
+        let msgs = |role: &str| {
+            let OJson::Arr(m) = parse_json(&format!(r#"[{{"role":"{role}","content":"Be brief."}},{{"role":"user","content":"Hi"}}]"#)).unwrap() else {
+                unreachable!()
+            };
+            m
+        };
+        let dev = render_chat(&msgs("developer"), None, None).unwrap().prompt;
+        assert_eq!(dev, render_chat(&msgs("system"), None, None).unwrap().prompt);
+        assert!(render_chat(&msgs("narrator"), None, None).is_err());
     }
 
     #[test]

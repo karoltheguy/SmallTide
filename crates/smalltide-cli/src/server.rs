@@ -1123,6 +1123,12 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
             write_json_response(&mut stream, "500 Internal Server Error", &json!({"error": "engine unavailable"}));
         }
         ("POST", "/v1/chat/completions") => {
+            // Dev: SMALLTIDE_CAPTURE_DIR keeps every chat request body (replaying a failing one).
+            if let Some(dir) = std::env::var_os("SMALLTIDE_CAPTURE_DIR") {
+                let f = std::path::Path::new(&dir).join(format!("chat_{}.json", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)));
+                let _ = std::fs::write(&f, &body);
+            }
             let req: ChatCompletionReq = match serde_json::from_slice(&body) {
                 Ok(r) => r,
                 Err(e) => {

@@ -109,6 +109,9 @@ pub struct Settings {
     pub priors_update: bool,
     pub prior_weight: f32,
     pub priors_newest_share: f32,
+    /// Concurrent sequences served by `serve` (lane 0 has `max_ctx`, the others `lane_ctx`).
+    pub lanes: usize,
+    pub lane_ctx: usize,
 }
 
 impl Settings {
@@ -143,6 +146,8 @@ impl Settings {
             None => Some(model_dir.join("tide_priors.json")),
         };
         Self {
+            lanes: parse("SMALLTIDE_LANES", 4usize, "a lane count >= 1").max(1),
+            lane_ctx: parse("SMALLTIDE_LANE_CTX", 8192usize, "a token count"),
             priors_path,
             priors_update: parse::<u8>("SMALLTIDE_PRIORS_UPDATE", 1, "0 or 1") != 0,
             prior_weight: parse("SMALLTIDE_PRIOR_WEIGHT", 1.0f32, "a number >= 0"),
@@ -173,7 +178,7 @@ pub struct Loaded {
 }
 
 /// Loads tokenizer + dense weights, sizes and fills the expert pools, and prints the ready line.
-pub fn build_engine(s: &Settings) -> Loaded {
+pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     let cfg = Inkling2Config::default();
     let dir = s.model_dir.as_path();
     let t_start = Instant::now();
@@ -192,6 +197,12 @@ pub fn build_engine(s: &Settings) -> Loaded {
     let est_kv_bytes = 40 * (2 * 8 * cfg.local_window_size * 128 + 2 * 8 * cfg.local_window_size * 4)
         + 8 * (2 * 8 * s.max_ctx * 128 + 2 * 8 * s.max_ctx * 4)
         + 64 * 1024 * 1024;
+    // Extra lanes: their own KV (local rings + global KV of `lane_ctx`), allocated before the pools.
+    let extra_lanes = lanes.max(1) - 1;
+    let lane_ctx = s.lane_ctx.min(s.max_ctx).max(cfg.local_window_size);
+    let est_kv_bytes = est_kv_bytes
+        + extra_lanes * (40 * (2 * 8 * (cfg.local_window_size + 128) * 128 + 2 * 8 * (cfg.local_window_size + 128) * 4)
+            + 8 * (2 * 8 * lane_ctx * 128 + 2 * 8 * lane_ctx * 4));
     let headroom_bytes = 900 * 1024 * 1024usize;
     let scratch_ring_bytes = 8 * (nvfp4_slab + mxfp8_slab);
     let mut avail = info_after_dense
@@ -279,6 +290,10 @@ pub fn build_engine(s: &Settings) -> Loaded {
     // Engine buffers (activations, KV, prefill scratch) before the expert pools: on Windows the
     // driver backs allocations beyond the resident budget with system memory, in order.
     let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, s.max_ctx).expect("create Inkling2Engine");
+    if extra_lanes > 0 {
+        engine.add_lanes(extra_lanes, lane_ctx).expect("allocate lanes");
+        println!("[lanes] {} concurrent sequences (lane 0: {} ctx, lanes 1..: {} ctx)", lanes, s.max_ctx, lane_ctx);
+    }
     engine.tide.allocate_pools().expect("allocate expert pools");
     // Measure instead of trusting the budget estimate: only the part of each pool that the OS
     // keeps in VRAM is used (Windows silently backs the excess with system memory).

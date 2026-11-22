@@ -189,6 +189,67 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// share over the chunk is at least this many tokens' worth (else skip + renormalize).
     pub prefill_min_share: f32,
     pub profile: StepProfile,
+    /// Concurrent sequences ("lanes"): every lane owns its KV caches and short-conv histories.
+    /// The active lane's state lives in `layer_states`; the others are parked here (the active
+    /// lane's entry is `None`). See `select_lane`.
+    lane_store: Vec<Option<ParkedLane>>,
+    lane_max_seq: Vec<usize>,
+    active_lane: usize,
+}
+
+/// A lane's sequence state while another lane is active.
+pub(crate) struct ParkedLane {
+    layer_states: Vec<LogicalLayerState>,
+    rng_state: u64,
+}
+
+
+/// One sequence's per-logical-layer KV caches (local rings + global KV of `global_max_seq`
+/// positions) and short-conv histories.
+pub(crate) fn alloc_layer_states<B: ComputeBackend>(
+    backend: &B,
+    cfg: &Inkling2Config,
+    global_max_seq: usize,
+    stream: smalltide_core::Stream,
+) -> Result<Vec<LogicalLayerState>> {
+    let h = cfg.hidden_size;
+    let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+    let num_logical = cfg.num_logical_layers();
+    let mut layer_states = Vec::with_capacity(num_logical);
+    for il in 0..num_logical {
+        let (phys, _) = crate::map_logical_to_physical(&cfg, smalltide_core::LogicalLayerId(il as u16));
+        let is_local = cfg.is_local_layer(phys.0 as usize);
+        let (max_seq, window) = if is_local {
+            (cfg.local_window_size + PREFILL_CHUNK, cfg.local_window_size)
+        } else {
+            let g = global_max_seq.max(cfg.local_window_size);
+            (g, g)
+        };
+        let kv_bytes = cfg.num_key_value_heads * max_seq * cfg.head_dim;
+        let sc_bytes = cfg.num_key_value_heads * max_seq * 4;
+        let sconv_k = backend.alloc_device(3 * kv_dim * 4)?;
+        let sconv_v = backend.alloc_device(3 * kv_dim * 4)?;
+        let sconv_attn = backend.alloc_device(3 * h * 4)?;
+        let sconv_mlp = backend.alloc_device(3 * h * 4)?;
+        backend.zero_f32(sconv_k, 3 * kv_dim, stream)?;
+        backend.zero_f32(sconv_v, 3 * kv_dim, stream)?;
+        backend.zero_f32(sconv_attn, 3 * h, stream)?;
+        backend.zero_f32(sconv_mlp, 3 * h, stream)?;
+        layer_states.push(LogicalLayerState {
+            _is_local: is_local,
+            max_seq,
+            window,
+            k_cache: backend.alloc_device(kv_bytes)?,
+            k_scales: backend.alloc_device(sc_bytes)?,
+            v_cache: backend.alloc_device(kv_bytes)?,
+            v_scales: backend.alloc_device(sc_bytes)?,
+            sconv_k,
+            sconv_v,
+            sconv_attn,
+            sconv_mlp,
+        });
+    }
+    Ok(layer_states)
 }
 
 impl<B: ComputeBackend> Inkling2Engine<B> {
@@ -205,40 +266,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let num_logical = cfg.num_logical_layers();
 
-        let mut layer_states = Vec::with_capacity(num_logical);
-        for il in 0..num_logical {
-            let (phys, _) = crate::map_logical_to_physical(&cfg, smalltide_core::LogicalLayerId(il as u16));
-            let is_local = cfg.is_local_layer(phys.0 as usize);
-            let (max_seq, window) = if is_local {
-                (cfg.local_window_size + PREFILL_CHUNK, cfg.local_window_size)
-            } else {
-                let g = global_max_seq.max(cfg.local_window_size);
-                (g, g)
-            };
-            let kv_bytes = cfg.num_key_value_heads * max_seq * cfg.head_dim;
-            let sc_bytes = cfg.num_key_value_heads * max_seq * 4;
-            let sconv_k = backend.alloc_device(3 * kv_dim * 4)?;
-            let sconv_v = backend.alloc_device(3 * kv_dim * 4)?;
-            let sconv_attn = backend.alloc_device(3 * h * 4)?;
-            let sconv_mlp = backend.alloc_device(3 * h * 4)?;
-            backend.zero_f32(sconv_k, 3 * kv_dim, stream)?;
-            backend.zero_f32(sconv_v, 3 * kv_dim, stream)?;
-            backend.zero_f32(sconv_attn, 3 * h, stream)?;
-            backend.zero_f32(sconv_mlp, 3 * h, stream)?;
-            layer_states.push(LogicalLayerState {
-                _is_local: is_local,
-                max_seq,
-                window,
-                k_cache: backend.alloc_device(kv_bytes)?,
-                k_scales: backend.alloc_device(sc_bytes)?,
-                v_cache: backend.alloc_device(kv_bytes)?,
-                v_scales: backend.alloc_device(sc_bytes)?,
-                sconv_k,
-                sconv_v,
-                sconv_attn,
-                sconv_mlp,
-            });
-        }
+        let layer_states = alloc_layer_states(&*backend, &cfg, global_max_seq, stream)?;
 
         let alloc_f32 = |n: usize| backend.alloc_device(n * 4);
         let scratch = ActivationScratch {
@@ -323,6 +351,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             tokens_decoded: 0,
             profile_enabled: false,
             prefill_min_share: 1.0,
+            lane_store: vec![None],
+            lane_max_seq: vec![global_max_seq],
+            active_lane: 0,
             profile: StepProfile::default(),
         })
     }
@@ -622,6 +653,51 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
         }
         Ok(())
+    }
+
+    /// Allocates `extra` more lanes (concurrent sequences) of `max_seq` positions each. Call before
+    /// the expert pools are allocated (VRAM placement order).
+    pub fn add_lanes(&mut self, extra: usize, max_seq: usize) -> Result<()> {
+        let s = self.tide.compute_stream;
+        for _ in 0..extra {
+            let states = alloc_layer_states(&*self.backend, &self.cfg, max_seq, s)?;
+            self.lane_store.push(Some(ParkedLane { layer_states: states, rng_state: 0x9E37_79B9_7F4A_7C15 ^ (self.lane_store.len() as u64) }));
+            self.lane_max_seq.push(max_seq.max(self.cfg.local_window_size));
+        }
+        self.backend.sync_stream(s)?;
+        Ok(())
+    }
+
+    pub fn num_lanes(&self) -> usize {
+        self.lane_store.len()
+    }
+
+    pub fn active_lane(&self) -> usize {
+        self.active_lane
+    }
+
+    /// Context length (positions) of lane `i`.
+    pub fn lane_max_seq(&self, i: usize) -> usize {
+        self.lane_max_seq[i]
+    }
+
+    /// Makes lane `i` the active sequence: every single-sequence operation (`prefill`,
+    /// `forward_token`, sampling, snapshots) then works on its state. Host-side swap only; all
+    /// GPU work stays ordered on the compute stream.
+    pub fn select_lane(&mut self, i: usize) {
+        if i == self.active_lane {
+            return;
+        }
+        let parked = ParkedLane {
+            layer_states: std::mem::take(&mut self.layer_states),
+            rng_state: self.rng_state,
+        };
+        self.lane_store[self.active_lane] = Some(parked);
+        let next = self.lane_store[i].take().expect("lane state parked");
+        self.layer_states = next.layer_states;
+        self.rng_state = next.rng_state;
+        self.global_max_seq = self.lane_max_seq[i];
+        self.active_lane = i;
     }
 
     /// Dev: drop the pending routing-log readback (used before graph capture experiments).

@@ -1,6 +1,6 @@
-//! Prompt prefix cache for the server engine: many conversations, one live sequence.
+//! Prompt prefix cache for the server engine: many conversations, one live sequence per lane.
 //!
-//! The engine holds exactly one live sequence (`cached` tokens). Snapshots capture the engine
+//! Each engine lane holds one live sequence (`live[lane]` tokens). Snapshots capture the engine
 //! state after a token prefix: the sliding-window KV rings, short-conv histories and the global
 //! KV of that prefix. Each snapshot remembers its own tokens, so any request whose prompt starts
 //! with a snapshot's tokens can resume from it - whichever conversation ran in between (chat UIs
@@ -49,8 +49,8 @@ struct Snap<S> {
 }
 
 pub struct PrefixCache<S> {
-    /// Tokens whose state is live in the engine (positions `0..cached.len()`).
-    pub cached: Vec<u32>,
+    /// Per lane: tokens whose state is live in that lane (positions `0..live[lane].len()`).
+    pub live: Vec<Vec<u32>>,
     snaps: Vec<Snap<S>>,
     pool: Vec<S>,
     max_snaps: usize,
@@ -64,10 +64,11 @@ fn common_prefix(a: &[u32], b: &[u32]) -> usize {
 }
 
 impl<S> PrefixCache<S> {
-    /// At most `max_snaps` snapshots holding at most `max_tokens` prefix tokens in total.
-    pub fn new(max_snaps: usize, max_tokens: usize) -> Self {
+    /// `lanes` live sequences; at most `max_snaps` snapshots holding at most `max_tokens` prefix
+    /// tokens in total.
+    pub fn new(lanes: usize, max_snaps: usize, max_tokens: usize) -> Self {
         Self {
-            cached: Vec::new(),
+            live: vec![Vec::new(); lanes.max(1)],
             snaps: Vec::new(),
             pool: Vec::new(),
             max_snaps: max_snaps.max(1),
@@ -96,14 +97,38 @@ impl<S> PrefixCache<S> {
         &self.snaps[idx].payload
     }
 
-    /// Decides how to serve `new` (at least the last prompt token is always re-processed so the
-    /// engine produces fresh logits).
-    pub fn plan(&self, new: &[u32]) -> PrefixPlan {
+    /// Tokens reused by `plan` (0 for Reset).
+    pub fn plan_reuse(plan: &PrefixPlan) -> usize {
+        match plan {
+            PrefixPlan::Extend { from } => *from,
+            PrefixPlan::Restore { pos, .. } => *pos,
+            PrefixPlan::Reset => 0,
+        }
+    }
+
+    /// Among `lanes`, the one serving `new` with the most reuse (ties: no global KV copy, then
+    /// the first listed). Returns `(lane, plan)`.
+    pub fn best_lane(&self, lanes: &[usize], new: &[u32]) -> Option<(usize, PrefixPlan)> {
+        let mut best: Option<(usize, PrefixPlan, (usize, bool))> = None;
+        for &l in lanes {
+            let p = self.plan(l, new);
+            let key = (Self::plan_reuse(&p), !matches!(p, PrefixPlan::Restore { global: true, .. }));
+            if best.as_ref().map_or(true, |b| key > b.2) {
+                best = Some((l, p, key));
+            }
+        }
+        best.map(|(l, p, _)| (l, p))
+    }
+
+    /// Decides how to serve `new` on `lane` (at least the last prompt token is always
+    /// re-processed so the engine produces fresh logits).
+    pub fn plan(&self, lane: usize, new: &[u32]) -> PrefixPlan {
         if new.is_empty() {
             return PrefixPlan::Reset;
         }
+        let cached = &self.live[lane];
         let limit = new.len() - 1;
-        let live = common_prefix(&self.cached, new).min(limit);
+        let live = common_prefix(cached, new).min(limit);
         // Longest snapshot whose whole prefix starts `new`.
         let best = self
             .snaps
@@ -111,14 +136,14 @@ impl<S> PrefixCache<S> {
             .enumerate()
             .filter(|(_, s)| !s.tokens.is_empty() && s.tokens.len() <= limit && new.starts_with(&s.tokens))
             .max_by_key(|(_, s)| s.tokens.len());
-        if live == self.cached.len() && live > 0 && best.map_or(true, |(_, s)| s.tokens.len() <= live) {
+        if live == cached.len() && live > 0 && best.map_or(true, |(_, s)| s.tokens.len() <= live) {
             return PrefixPlan::Extend { from: live };
         }
         match best {
             Some((i, s)) => {
                 let pos = s.tokens.len();
                 // The device global KV is still this prefix's iff the live sequence starts with it.
-                let global = !(self.cached.len() >= pos && self.cached[..pos] == s.tokens[..]);
+                let global = !(cached.len() >= pos && cached[..pos] == s.tokens[..]);
                 PrefixPlan::Restore { snap_idx: i, pos, global }
             }
             None => PrefixPlan::Reset,
@@ -127,7 +152,7 @@ impl<S> PrefixCache<S> {
 
     /// Records the outcome of `plan` once the engine state was rewound to `pos` (0 for Reset).
     /// Snapshots of other sequences are kept: they carry their own global KV.
-    pub fn rewound_to(&mut self, plan: &PrefixPlan, pos: usize) {
+    pub fn rewound_to(&mut self, lane: usize, plan: &PrefixPlan, pos: usize) {
         self.stats.requests += 1;
         match plan {
             PrefixPlan::Extend { .. } => self.stats.extend_hits += 1,
@@ -138,14 +163,14 @@ impl<S> PrefixCache<S> {
                 }
                 self.tick += 1;
                 self.snaps[*snap_idx].tick = self.tick;
-                // The live sequence becomes the snapshot's prefix.
-                self.cached.clear();
-                self.cached.extend_from_slice(&self.snaps[*snap_idx].tokens);
+                // The lane's live sequence becomes the snapshot's prefix.
+                let toks = self.snaps[*snap_idx].tokens.clone();
+                self.live[lane] = toks;
             }
             PrefixPlan::Reset => self.stats.misses += 1,
         }
         self.stats.reused_tokens += pos as u64;
-        self.cached.truncate(pos);
+        self.live[lane].truncate(pos);
     }
 
     /// Returns a payload to fill for a new snapshot of `pos` tokens (recycled, or `None` if the
@@ -162,12 +187,12 @@ impl<S> PrefixCache<S> {
         self.pool.pop()
     }
 
-    /// Stores a filled snapshot describing the state after `cached[..pos]`.
-    pub fn insert(&mut self, pos: usize, payload: S) {
-        debug_assert!(pos <= self.cached.len());
+    /// Stores a filled snapshot describing `lane`'s state after `live[lane][..pos]`.
+    pub fn insert(&mut self, lane: usize, pos: usize, payload: S) {
+        debug_assert!(pos <= self.live[lane].len());
         self.tick += 1;
         self.stats.snapshots_taken += 1;
-        let tokens = self.cached[..pos].to_vec();
+        let tokens = self.live[lane][..pos].to_vec();
         if let Some(i) = self.snaps.iter().position(|s| s.tokens == tokens) {
             let old = std::mem::replace(&mut self.snaps[i], Snap { tokens, tick: self.tick, payload });
             self.pool.push(old.payload);
@@ -176,10 +201,10 @@ impl<S> PrefixCache<S> {
         self.snaps.push(Snap { tokens, tick: self.tick, payload });
     }
 
-    /// Drops the live sequence (e.g. after an engine error). Snapshots carry their own global KV
-    /// and stay valid.
-    pub fn invalidate(&mut self) {
-        self.cached.clear();
+    /// Drops `lane`'s live sequence (e.g. after an engine error). Snapshots carry their own global
+    /// KV and stay valid.
+    pub fn invalidate(&mut self, lane: usize) {
+        self.live[lane].clear();
     }
 }
 
@@ -187,32 +212,32 @@ impl<S> PrefixCache<S> {
 mod tests {
     use super::*;
 
-    fn run(pc: &mut PrefixCache<u32>, new: &[u32]) -> PrefixPlan {
-        let plan = pc.plan(new);
-        let pos = match plan {
-            PrefixPlan::Extend { from } => from,
-            PrefixPlan::Restore { pos, .. } => pos,
-            PrefixPlan::Reset => 0,
-        };
-        pc.rewound_to(&plan, pos);
-        pc.cached.extend_from_slice(&new[pos..]);
+    fn run_on(pc: &mut PrefixCache<u32>, lane: usize, new: &[u32]) -> PrefixPlan {
+        let plan = pc.plan(lane, new);
+        let pos = PrefixCache::<u32>::plan_reuse(&plan);
+        pc.rewound_to(lane, &plan, pos);
+        pc.live[lane].extend_from_slice(&new[pos..]);
         plan
+    }
+
+    fn run(pc: &mut PrefixCache<u32>, new: &[u32]) -> PrefixPlan {
+        run_on(pc, 0, new)
     }
 
     fn snap(pc: &mut PrefixCache<u32>, pos: usize, payload: u32) {
         let p = pc.take_payload(pos).unwrap_or(payload);
-        pc.insert(pos, p);
+        pc.insert(0, pos, p);
     }
 
     #[test]
     fn extend_restore_reset() {
-        let mut pc: PrefixCache<u32> = PrefixCache::new(8, 1000);
+        let mut pc: PrefixCache<u32> = PrefixCache::new(1, 8, 1000);
         // Request 1: system prefix [1,2,3] then user [9,4,5]; snapshots at boundary 3 and end-1 = 5.
         assert_eq!(run(&mut pc, &[1, 2, 3, 9, 4, 5]), PrefixPlan::Reset);
         snap(&mut pc, 3, 0);
         snap(&mut pc, 5, 1);
         // Decode appended 7, 8.
-        pc.cached.extend_from_slice(&[7, 8]);
+        pc.live[0].extend_from_slice(&[7, 8]);
 
         // Follow-up that strictly extends the live sequence: pure extension.
         assert_eq!(run(&mut pc, &[1, 2, 3, 9, 4, 5, 7, 8, 10]), PrefixPlan::Extend { from: 8 });
@@ -233,36 +258,53 @@ mod tests {
 
     #[test]
     fn interleaved_conversations_keep_their_snapshots() {
-        let mut pc: PrefixCache<u32> = PrefixCache::new(8, 1000);
+        let mut pc: PrefixCache<u32> = PrefixCache::new(1, 8, 1000);
         // Conversation A turn 1.
         run(&mut pc, &[1, 2, 3, 4]);
         snap(&mut pc, 3, 10);
-        pc.cached.extend_from_slice(&[50, 51]); // generated
+        pc.live[0].extend_from_slice(&[50, 51]); // generated
         // Unrelated side request (e.g. title generation) in between.
         assert_eq!(run(&mut pc, &[7, 7, 7, 7, 7]), PrefixPlan::Reset);
         snap(&mut pc, 4, 11);
         // Conversation A turn 2: resumes from A's snapshot, global KV must be copied back.
         let plan = run(&mut pc, &[1, 2, 3, 4, 60, 61]);
         assert_eq!(plan, PrefixPlan::Restore { snap_idx: 0, pos: 3, global: true });
-        assert_eq!(pc.cached, vec![1, 2, 3, 4, 60, 61]);
+        assert_eq!(pc.live[0], vec![1, 2, 3, 4, 60, 61]);
         assert_eq!(pc.stats.cross_restores, 1);
     }
 
     #[test]
+    fn lanes_pick_best_reuse() {
+        let mut pc: PrefixCache<u32> = PrefixCache::new(3, 8, 1000);
+        // Lane 1 serves conversation A; lane 2 conversation B.
+        run_on(&mut pc, 1, &[1, 2, 3, 4]);
+        run_on(&mut pc, 2, &[8, 8, 8]);
+        // A's next turn extends lane 1 best; lanes 0 / 2 would reset.
+        let (lane, plan) = pc.best_lane(&[0, 1, 2], &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!((lane, plan), (1, PrefixPlan::Extend { from: 4 }));
+        // A snapshot of A's prefix taken on lane 1 restores on lane 0 (global KV copied).
+        let p = pc.take_payload(3).unwrap_or(7);
+        pc.insert(1, 3, p);
+        assert_eq!(pc.plan(0, &[1, 2, 3, 9]), PrefixPlan::Restore { snap_idx: 0, pos: 3, global: true });
+        // Lane 1 holds 4 live tokens: rewinding to 3 needs the snapshot, but not its global KV.
+        assert_eq!(pc.plan(1, &[1, 2, 3, 9]), PrefixPlan::Restore { snap_idx: 0, pos: 3, global: false });
+    }
+
+    #[test]
     fn lru_eviction_by_count_and_tokens() {
-        let mut pc: PrefixCache<u32> = PrefixCache::new(2, 1000);
-        pc.cached = (0..100).collect();
-        pc.insert(10, 1);
-        pc.insert(20, 2);
+        let mut pc: PrefixCache<u32> = PrefixCache::new(1, 2, 1000);
+        pc.live[0] = (0..100).collect();
+        pc.insert(0, 10, 1);
+        pc.insert(0, 20, 2);
         // Count-full: taking a payload evicts the LRU snapshot (pos 10).
         assert_eq!(pc.take_payload(30), Some(1));
-        pc.insert(30, 1);
+        pc.insert(0, 30, 1);
         assert_eq!(pc.snapshot_positions(), vec![20, 30]);
 
-        let mut pc: PrefixCache<u32> = PrefixCache::new(8, 60);
-        pc.cached = (0..100).collect();
-        pc.insert(20, 1);
-        pc.insert(30, 2);
+        let mut pc: PrefixCache<u32> = PrefixCache::new(1, 8, 60);
+        pc.live[0] = (0..100).collect();
+        pc.insert(0, 20, 1);
+        pc.insert(0, 30, 2);
         // 20 + 30 + 40 > 60: the oldest goes, then 30 + 40 > 60: the next one too.
         assert_eq!(pc.take_payload(40), Some(2));
         assert_eq!(pc.snapshot_positions(), Vec::<usize>::new());

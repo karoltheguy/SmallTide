@@ -716,7 +716,7 @@ fn run_generate(args: &[String]) {
     let max_ctx = s.max_ctx;
     let enable_profile = s.profile;
     let prefill_mode = if s.batched_prefill { "batched" } else { "token" };
-    let settings::Loaded { mut engine, tok, backend, nvfp4_slots, mxfp8_slots } = settings::build_engine(&s);
+    let settings::Loaded { mut engine, tok, backend, nvfp4_slots, mxfp8_slots } = settings::build_engine(&s, 1);
 
     if std::env::var_os("SMALLTIDE_BENCH_MOE").is_some() {
         let n4 = nvfp4_slots as u32;

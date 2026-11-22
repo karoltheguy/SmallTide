@@ -222,7 +222,7 @@ pub fn run_serve(args: &[String]) {
     let (host, port) = (s.host.clone(), s.port);
     println!("=== SmallTide OpenAI API Server (model: {SERVED_MODEL_NAME}) ===");
     println!("Loading tokenizer, FP8 dense weights, and expert pools from {} ...", s.model_dir.display());
-    let crate::settings::Loaded { engine, tok, .. } = crate::settings::build_engine(&s);
+    let crate::settings::Loaded { engine, tok, .. } = crate::settings::build_engine(&s, s.lanes);
     let tok = Arc::new(tok);
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>();
@@ -249,339 +249,479 @@ pub fn run_serve(args: &[String]) {
     }
 }
 
+/// One generation in flight on an engine lane.
+struct ActiveReq {
+    is_chat: bool,
+    single_tool_call: bool,
+    max_tokens: usize,
+    sampling: SamplingParams,
+    parser: AnswerParser,
+    raw_utf8: Utf8Stream,
+    stopper: StopMatcher,
+    event_tx: Sender<StreamEvent>,
+    req_tag: u64,
+    n_tool_calls: usize,
+    prompt_len: usize,
+    reuse_len: usize,
+    pf_secs: f64,
+    t_dec: Instant,
+    generated: Vec<u32>,
+    /// Position the pending `next_tok` will be fed at.
+    pos: usize,
+    /// Sampled, already streamed to the client, not yet fed to the model.
+    next_tok: u32,
+    finish_reason: &'static str,
+}
+
+impl ActiveReq {
+    /// Routes parsed answer events to the client. Returns false to stop generating.
+    fn emit(&mut self, evs: Vec<AnswerEvent>) -> bool {
+        for ev in evs {
+            let sent = match ev {
+                AnswerEvent::Text(t) => {
+                    let (out, stopped) = self.stopper.push(&t);
+                    let ok = out.is_empty()
+                        || self.event_tx.send(StreamEvent::Delta { channel: OutputChannel::Text, text: out }).is_ok();
+                    if stopped {
+                        self.finish_reason = "stop";
+                        return false;
+                    }
+                    ok
+                }
+                AnswerEvent::Thinking(t) => {
+                    self.event_tx.send(StreamEvent::Delta { channel: OutputChannel::Thinking, text: t }).is_ok()
+                }
+                AnswerEvent::ToolCall { name, arguments } => {
+                    let index = self.n_tool_calls;
+                    self.n_tool_calls += 1;
+                    let ok = self
+                        .event_tx
+                        .send(StreamEvent::ToolCall {
+                            index,
+                            id: format!("call_{:x}_{index}", self.req_tag),
+                            name,
+                            arguments,
+                        })
+                        .is_ok();
+                    if ok && self.single_tool_call {
+                        // A single call was requested: the answer ends here.
+                        self.finish_reason = "stop";
+                        return false;
+                    }
+                    ok
+                }
+                AnswerEvent::EndOfAnswer => {
+                    self.finish_reason = "stop";
+                    return false;
+                }
+            };
+            if !sent {
+                // Client disconnected: abort generation.
+                self.finish_reason = "stop";
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Consumes the freshly sampled `next_tok`: streams it and decides whether generation goes on
+    /// (then `next_tok` must be fed at `pos`).
+    fn accept(&mut self, tok: &BpeTokenizer, lane_max_seq: usize) -> bool {
+        let t = self.next_tok;
+        if t == TOK_EOS || t == TOK_EOT {
+            self.finish_reason = "stop";
+            return false;
+        }
+        self.generated.push(t);
+        let bytes = tok.token_bytes(t);
+        let evs = if self.is_chat {
+            self.parser.feed(t, bytes, tok.is_special(t))
+        } else {
+            let s = self.raw_utf8.push(bytes);
+            if s.is_empty() { Vec::new() } else { vec![AnswerEvent::Text(s)] }
+        };
+        if !self.emit(evs) {
+            return false;
+        }
+        self.generated.len() < self.max_tokens && self.pos < lane_max_seq
+    }
+
+    /// Flushes held-back output and sends `Done`. Returns the request's decode tok/s.
+    fn finish(mut self, vram_hit_rate: f64) -> f64 {
+        // Flush held-back UTF-8, partial stop-string prefixes and an unterminated call.
+        let tail = if self.is_chat {
+            self.parser.finish()
+        } else {
+            let t = self.raw_utf8.finish();
+            if t.is_empty() { Vec::new() } else { vec![AnswerEvent::Text(t)] }
+        };
+        let tail_ok = self.emit(tail);
+        if tail_ok && self.finish_reason != "stop" {
+            let held = self.stopper.finish();
+            if !held.is_empty() {
+                let _ = self.event_tx.send(StreamEvent::Delta { channel: OutputChannel::Text, text: held });
+            }
+        }
+        if self.n_tool_calls > 0 && self.finish_reason == "stop" {
+            self.finish_reason = "tool_calls";
+        }
+        let dec_secs = self.t_dec.elapsed().as_secs_f64();
+        let _ = self.event_tx.send(StreamEvent::Done {
+            finish_reason: self.finish_reason,
+            cached_tokens: self.reuse_len,
+            prompt_tokens: self.prompt_len,
+            completion_tokens: self.generated.len(),
+            prefill_secs: self.pf_secs,
+            decode_secs: dec_secs,
+            vram_hit_rate,
+        });
+        if self.generated.is_empty() { 0.0 } else { self.generated.len() as f64 / dec_secs.max(1e-6) }
+    }
+}
+
+/// Engine worker: owns the engine and serves up to `engine.num_lanes()` requests at once.
+///
+/// Each round: drain commands (blocking only when idle), admit at most one queued request into
+/// a free lane (its prefill runs while the other lanes wait), then advance every active lane by
+/// one token. Lanes are independent sequences (own KV caches and short-conv state); the prefix
+/// cache's snapshots are shared by all lanes.
 fn engine_worker_loop(
     mut engine: Inkling2Engine<HipBackend>,
     tok: Arc<BpeTokenizer>,
     cmd_rx: Receiver<EngineCommand>,
 ) {
-    // Prompt prefix cache: live-sequence extension + rewind to pinned-RAM state snapshots.
+    let n_lanes = engine.num_lanes();
     let env_usize = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(d);
-    let mut pc: PrefixCache<SeqSnapshot> =
-        PrefixCache::new(env_usize("SMALLTIDE_PREFIX_SNAPSHOTS", 12), env_usize("SMALLTIDE_PREFIX_TOKENS", 65_536));
+    let mut pc: PrefixCache<SeqSnapshot> = PrefixCache::new(
+        n_lanes,
+        env_usize("SMALLTIDE_PREFIX_SNAPSHOTS", 12),
+        env_usize("SMALLTIDE_PREFIX_TOKENS", 65_536),
+    );
+    let mut active: Vec<Option<ActiveReq>> = (0..n_lanes).map(|_| None).collect();
+    let mut queue: std::collections::VecDeque<EngineCommand> = std::collections::VecDeque::new();
     let mut last_decode_tok_s: f64 = 0.0;
     let mut last_prefill_tok_s: f64 = 0.0;
+    let max_lane_ctx = (0..n_lanes).map(|l| engine.lane_max_seq(l)).max().unwrap_or(0);
 
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            EngineCommand::GetStats { reply_tx } => {
-                let tel = engine.telemetry();
-                let (pre, core, coda) = engine.tide.scheduler.cache.count_vram_resident();
-                let ram = engine.tide.scheduler.cache.count_ram_resident();
-                let vram_info = engine.backend.device_info().ok();
-                let pct = |h: u64, m: u64| {
-                    let tot = h + m;
-                    if tot == 0 { 100.0 } else { (h as f64 / tot as f64) * 100.0 }
+    loop {
+        // 1. Commands: block only when there is nothing to do.
+        let idle = queue.is_empty() && active.iter().all(|a| a.is_none());
+        let mut cmds = Vec::new();
+        if idle {
+            match cmd_rx.recv() {
+                Ok(c) => cmds.push(c),
+                Err(_) => return,
+            }
+        }
+        while let Ok(c) = cmd_rx.try_recv() {
+            cmds.push(c);
+        }
+        for cmd in cmds {
+            match cmd {
+                EngineCommand::GetStats { reply_tx } => {
+                    let tel = engine.telemetry();
+                    let (pre, core, coda) = engine.tide.scheduler.cache.count_vram_resident();
+                    let ram = engine.tide.scheduler.cache.count_ram_resident();
+                    let vram_info = engine.backend.device_info().ok();
+                    let pct = |h: u64, m: u64| {
+                        let tot = h + m;
+                        if tot == 0 { 100.0 } else { (h as f64 / tot as f64) * 100.0 }
+                    };
+                    let stats = json!({
+                        "model": SERVED_MODEL_NAME,
+                        "rescue_policy": format!("{:?}", engine.tide.scheduler.tide_cfg.rescue_policy),
+                        "last_prefill_tok_s": last_prefill_tok_s,
+                        "last_decode_tok_s": last_decode_tok_s,
+                        "lanes": {
+                            "count": n_lanes,
+                            "active": active.iter().filter(|a| a.is_some()).count(),
+                            "queued": queue.len(),
+                            "ctx": (0..n_lanes).map(|l| engine.lane_max_seq(l)).collect::<Vec<_>>(),
+                        },
+                        "vram_hit_rate_pct": tel.total_vram_hit_rate() * 100.0,
+                        "prelude_hit_rate_pct": pct(tel.vram_hits_prelude, tel.vram_misses_prelude),
+                        "loop_core_hit_rate_pct": pct(tel.vram_hits_loop, tel.vram_misses_loop),
+                        "coda_hit_rate_pct": pct(tel.vram_hits_coda, tel.vram_misses_coda),
+                        "stage1_sync_rescues": tel.stage1_sync_rescues,
+                        "stage1_async_promotions": tel.stage1_async_promotions,
+                        "stage1_skipped_tail_misses": tel.stage1_skipped_tail_misses,
+                        "stage2_disk_reads": tel.stage2_disk_reads,
+                        "stage1_bytes_transferred": tel.stage1_bytes_transferred,
+                        "routed_weight_total": tel.routed_weight_total,
+                        "routed_weight_skipped": tel.routed_weight_skipped,
+                        "prefill_weight_total": tel.prefill_weight_total,
+                        "prefill_weight_skipped": tel.prefill_weight_skipped,
+                        "decode_async_promotions": tel.decode_async_promotions,
+                        "experts_vram_resident": { "prelude": pre, "loop_core": core, "coda": coda },
+                        "experts_ram_warm": ram,
+                        "prefix_cache": {
+                            "requests": pc.stats.requests,
+                            "extend_hits": pc.stats.extend_hits,
+                            "restore_hits": pc.stats.restore_hits,
+                            "cross_restores": pc.stats.cross_restores,
+                            "evictions": pc.stats.evictions,
+                            "snapshot_tokens": pc.snapshot_tokens(),
+                            "misses": pc.stats.misses,
+                            "reused_tokens": pc.stats.reused_tokens,
+                            "prefilled_tokens": pc.stats.prefilled_tokens,
+                            "snapshots_taken": pc.stats.snapshots_taken,
+                            "snapshot_positions": pc.snapshot_positions(),
+                            "live_tokens": pc.live.iter().map(|l| l.len()).collect::<Vec<_>>(),
+                            "snapshot_mib": engine.snapshot_bytes() as f64 / (1024.0 * 1024.0),
+                        },
+                        "kv_max_ctx": max_lane_ctx,
+                        "kv_vram_gib": engine.kv_vram_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+                        "vram_free_gib": vram_info.as_ref().map(|d| d.free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
+                        "vram_total_gib": vram_info.as_ref().map(|d| d.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
+                    });
+                    let _ = reply_tx.send(stats);
+                }
+                EngineCommand::UpdateConfig { rescue_policy, reply_tx } => {
+                    engine.tide.scheduler.tide_cfg.rescue_policy = rescue_policy;
+                    let _ = reply_tx.send(json!({
+                        "ok": true,
+                        "rescue_policy": format!("{:?}", engine.tide.scheduler.tide_cfg.rescue_policy),
+                    }));
+                }
+                g @ EngineCommand::Generate { .. } => queue.push_back(g),
+            }
+        }
+
+        // 2. Admission: at most one queued request per round (its prefill pauses the others).
+        if let Some(EngineCommand::Generate { .. }) = queue.front() {
+            let free: Vec<usize> = (0..n_lanes).filter(|&l| active[l].is_none()).collect();
+            if !free.is_empty() {
+                let Some(EngineCommand::Generate {
+                    prompt_text,
+                    is_chat,
+                    forced_tool,
+                    single_tool_call,
+                    max_tokens,
+                    sampling,
+                    stop_strings,
+                    cache_prompt,
+                    event_tx,
+                }) = queue.pop_front()
+                else {
+                    unreachable!()
                 };
-                let stats = json!({
-                    "model": SERVED_MODEL_NAME,
-                    "rescue_policy": format!("{:?}", engine.tide.scheduler.tide_cfg.rescue_policy),
-                    "last_prefill_tok_s": last_prefill_tok_s,
-                    "last_decode_tok_s": last_decode_tok_s,
-                    "vram_hit_rate_pct": tel.total_vram_hit_rate() * 100.0,
-                    "prelude_hit_rate_pct": pct(tel.vram_hits_prelude, tel.vram_misses_prelude),
-                    "loop_core_hit_rate_pct": pct(tel.vram_hits_loop, tel.vram_misses_loop),
-                    "coda_hit_rate_pct": pct(tel.vram_hits_coda, tel.vram_misses_coda),
-                    "stage1_sync_rescues": tel.stage1_sync_rescues,
-                    "stage1_async_promotions": tel.stage1_async_promotions,
-                    "stage1_skipped_tail_misses": tel.stage1_skipped_tail_misses,
-                    "stage2_disk_reads": tel.stage2_disk_reads,
-                    "stage1_bytes_transferred": tel.stage1_bytes_transferred,
-                    "routed_weight_total": tel.routed_weight_total,
-                    "routed_weight_skipped": tel.routed_weight_skipped,
-                    "prefill_weight_total": tel.prefill_weight_total,
-                    "prefill_weight_skipped": tel.prefill_weight_skipped,
-                    "decode_async_promotions": tel.decode_async_promotions,
-                    "experts_vram_resident": { "prelude": pre, "loop_core": core, "coda": coda },
-                    "experts_ram_warm": ram,
-                    "prefix_cache": {
-                        "requests": pc.stats.requests,
-                        "extend_hits": pc.stats.extend_hits,
-                        "restore_hits": pc.stats.restore_hits,
-                        "cross_restores": pc.stats.cross_restores,
-                        "evictions": pc.stats.evictions,
-                        "snapshot_tokens": pc.snapshot_tokens(),
-                        "misses": pc.stats.misses,
-                        "reused_tokens": pc.stats.reused_tokens,
-                        "prefilled_tokens": pc.stats.prefilled_tokens,
-                        "snapshots_taken": pc.stats.snapshots_taken,
-                        "snapshot_positions": pc.snapshot_positions(),
-                        "live_tokens": pc.cached.len(),
-                        "snapshot_mib": engine.snapshot_bytes() as f64 / (1024.0 * 1024.0),
-                    },
-                    "kv_max_ctx": engine.global_max_seq,
-                    "kv_vram_gib": engine.kv_vram_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-                    "vram_free_gib": vram_info.as_ref().map(|d| d.free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
-                    "vram_total_gib": vram_info.as_ref().map(|d| d.total_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
-                });
-                let _ = reply_tx.send(stats);
-            }
-            EngineCommand::UpdateConfig {
-                rescue_policy,
-                reply_tx,
-            } => {
-                engine.tide.scheduler.tide_cfg.rescue_policy = rescue_policy;
-                let _ = reply_tx.send(json!({
-                    "ok": true,
-                    "rescue_policy": format!("{:?}", engine.tide.scheduler.tide_cfg.rescue_policy),
-                }));
-            }
-            EngineCommand::Generate {
-                prompt_text,
-                is_chat,
-                forced_tool,
-                single_tool_call,
-                max_tokens,
-                sampling,
-                stop_strings,
-                cache_prompt,
-                event_tx,
-            } => {
                 let prompt_ids = tok.encode(&prompt_text);
                 if prompt_ids.is_empty() {
                     let _ = event_tx.send(StreamEvent::Error("empty prompt".into()));
-                    continue;
-                }
-                if prompt_ids.len() >= engine.global_max_seq {
+                } else if prompt_ids.len() >= max_lane_ctx {
                     let _ = event_tx.send(StreamEvent::Error(format!(
                         "prompt length {} exceeds max_ctx {}",
                         prompt_ids.len(),
-                        engine.global_max_seq
+                        max_lane_ctx
                     )));
-                    continue;
-                }
-
-                let t_pf = Instant::now();
-                let plan = if cache_prompt { pc.plan(&prompt_ids) } else { PrefixPlan::Reset };
-                if std::env::var_os("SMALLTIDE_PREFIX_DEBUG").is_some() {
-                    let lcp = pc.cached.iter().zip(&prompt_ids).take_while(|(a, b)| a == b).count();
-                    let show = |ids: &[u32]| -> String {
-                        let end = (lcp + 6).min(ids.len());
-                        format!("{:?}", ids[lcp.min(end)..end].iter().map(|&t| tok.decode(&[t])).collect::<Vec<_>>())
-                    };
-                    eprintln!(
-                        "[prefix] plan={plan:?} live={} prompt={} lcp={lcp} live_next={} prompt_next={}",
-                        pc.cached.len(),
-                        prompt_ids.len(),
-                        show(&pc.cached),
-                        show(&prompt_ids)
-                    );
-                }
-                let rewind = match &plan {
-                    PrefixPlan::Extend { from } => Ok(*from),
-                    PrefixPlan::Restore { snap_idx, pos, global } => {
-                        engine.restore_state(pc.snapshot(*snap_idx), *global).map(|_| *pos)
-                    }
-                    PrefixPlan::Reset => engine.reset_sequence().map(|_| 0),
-                };
-                let reuse_len = match rewind {
-                    Ok(p) => p,
-                    Err(e) => {
-                        pc.invalidate();
-                        let _ = event_tx.send(StreamEvent::Error(format!("prefix restore: {e}")));
-                        continue;
-                    }
-                };
-                pc.rewound_to(&plan, reuse_len);
-
-                // Snapshot points: the first user-message boundary (shared system/tool prefix) and
-                // one token before the prompt end (the last token is always re-processed, so this
-                // serves exact repeats and follow-up turns alike). Prefill runs in segments so each
-                // snapshot lands exactly on its point.
-                let end = prompt_ids.len();
-                let mut points: Vec<usize> = Vec::new();
-                if let Some(bd) = prompt_ids.iter().position(|&t| t == TOK_MESSAGE_USER) {
-                    if bd > reuse_len && bd >= 16 {
-                        points.push(bd);
-                    }
-                }
-                if end >= 2 && end - 1 > reuse_len {
-                    points.push(end - 1);
-                }
-                points.sort_unstable();
-                points.dedup();
-                let mut cuts = vec![reuse_len];
-                cuts.extend(points.iter().copied());
-                cuts.push(end);
-                let mut pf_err = None;
-                for w in cuts.windows(2) {
-                    let (a, b) = (w[0], w[1]);
-                    if a >= b {
-                        continue;
-                    }
-                    if cache_prompt && points.contains(&a) && !pc.has_snapshot_of(&prompt_ids[..a]) {
-                        let mut slot = pc.take_payload(a);
-                        match engine.snapshot_state(a, &mut slot) {
-                            Ok(()) => pc.insert(a, slot.unwrap()),
-                            Err(e) => eprintln!("[prefix-cache] snapshot at {a} failed: {e}"),
-                        }
-                    }
-                    let is_last = b == end;
-                    if let Err(e) = engine.prefill(&prompt_ids[a..b], a, is_last) {
-                        pf_err = Some(format!("prefill error at pos {a}..{b}: {e}"));
-                        break;
-                    }
-                    pc.cached.extend_from_slice(&prompt_ids[a..b]);
-                }
-                if let Some(err) = pf_err {
-                    pc.invalidate();
-                    let _ = event_tx.send(StreamEvent::Error(err));
-                    continue;
-                }
-                let pf_secs = t_pf.elapsed().as_secs_f64();
-                let new_pf_toks = prompt_ids.len() - reuse_len;
-                pc.stats.prefilled_tokens += new_pf_toks as u64;
-                if new_pf_toks > 0 {
-                    last_prefill_tok_s = new_pf_toks as f64 / pf_secs.max(1e-6);
-                }
-                let _ = engine.rebalance_after_prefill(128);
-
-                let t_dec = Instant::now();
-                let mut generated: Vec<u32> = Vec::with_capacity(max_tokens.min(4096));
-                let mut pos = prompt_ids.len();
-                let mut finish_reason: &'static str = "length";
-                let mut parser = match &forced_tool {
-                    Some(n) => AnswerParser::new_forced_tool(n),
-                    None => AnswerParser::new(),
-                };
-                let mut raw_utf8 = Utf8Stream::default();
-                let mut stopper = StopMatcher::new(stop_strings);
-                let req_tag = REQ_COUNTER.load(Ordering::Relaxed);
-                let mut n_tool_calls = 0usize;
-
-                // Routes parsed answer events to the client. Returns false to stop generating.
-                let mut emit = |evs: Vec<AnswerEvent>, finish: &mut &'static str| -> bool {
-                    for ev in evs {
-                        let sent = match ev {
-                            AnswerEvent::Text(t) => {
-                                let (out, stopped) = stopper.push(&t);
-                                let ok = out.is_empty()
-                                    || event_tx.send(StreamEvent::Delta { channel: OutputChannel::Text, text: out }).is_ok();
-                                if stopped {
-                                    *finish = "stop";
-                                    return false;
-                                }
-                                ok
-                            }
-                            AnswerEvent::Thinking(t) => event_tx
-                                .send(StreamEvent::Delta { channel: OutputChannel::Thinking, text: t })
-                                .is_ok(),
-                            AnswerEvent::ToolCall { name, arguments } => {
-                                let index = n_tool_calls;
-                                n_tool_calls += 1;
-                                let ok = event_tx
-                                    .send(StreamEvent::ToolCall {
-                                        index,
-                                        id: format!("call_{req_tag:x}_{index}"),
-                                        name,
-                                        arguments,
-                                    })
-                                    .is_ok();
-                                if ok && single_tool_call {
-                                    // A single call was requested: the answer ends here.
-                                    *finish = "stop";
-                                    return false;
-                                }
-                                ok
-                            }
-                            AnswerEvent::EndOfAnswer => {
-                                *finish = "stop";
-                                return false;
-                            }
-                        };
-                        if !sent {
-                            // Client disconnected: abort generation.
-                            *finish = "stop";
-                            return false;
-                        }
-                    }
-                    true
-                };
-
-                let mut next_tok = match engine.sample_next_token(&sampling, &generated) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = event_tx.send(StreamEvent::Error(format!("sample error: {e}")));
-                        continue;
-                    }
-                };
-
-                for step in 0..max_tokens {
-                    if next_tok == TOK_EOS || next_tok == TOK_EOT {
-                        finish_reason = "stop";
-                        break;
-                    }
-                    generated.push(next_tok);
-                    let bytes = tok.token_bytes(next_tok);
-                    let evs = if is_chat {
-                        parser.feed(next_tok, bytes, tok.is_special(next_tok))
-                    } else {
-                        let t = raw_utf8.push(bytes);
-                        if t.is_empty() { Vec::new() } else { vec![AnswerEvent::Text(t)] }
-                    };
-                    if !emit(evs, &mut finish_reason) {
-                        break;
-                    }
-
-                    if step + 1 >= max_tokens || pos >= engine.global_max_seq {
-                        break;
-                    }
-                    if let Err(e) = engine.forward_token(next_tok, pos, false, true) {
-                        let _ = event_tx.send(StreamEvent::Error(format!("decode error: {e}")));
-                        pc.invalidate();
-                        break;
-                    }
-                    let _ = engine.post_decode_tide_step();
-                    pc.cached.push(next_tok);
-                    pos += 1;
-                    next_tok = match engine.sample_next_token(&sampling, &generated) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            let _ = event_tx.send(StreamEvent::Error(format!("sample error: {e}")));
-                            break;
-                        }
-                    };
-                }
-                // Flush held-back UTF-8, partial stop-string prefixes and an unterminated call.
-                let tail = if is_chat {
-                    parser.finish()
                 } else {
-                    let t = raw_utf8.finish();
-                    if t.is_empty() { Vec::new() } else { vec![AnswerEvent::Text(t)] }
-                };
-                let mut fr = finish_reason;
-                let tail_ok = emit(tail, &mut fr);
-                drop(emit);
-                if tail_ok && fr != "stop" {
-                    let held = stopper.finish();
-                    if !held.is_empty() {
-                        let _ = event_tx.send(StreamEvent::Delta { channel: OutputChannel::Text, text: held });
+                    let fits: Vec<usize> = free.iter().copied().filter(|&l| engine.lane_max_seq(l) > prompt_ids.len()).collect();
+                    if fits.is_empty() {
+                        // Only a busy (larger) lane can hold this prompt: wait for it.
+                        queue.push_front(EngineCommand::Generate {
+                            prompt_text,
+                            is_chat,
+                            forced_tool,
+                            single_tool_call,
+                            max_tokens,
+                            sampling,
+                            stop_strings,
+                            cache_prompt,
+                            event_tx,
+                        });
+                    } else {
+                        let (lane, plan) = if cache_prompt {
+                            pc.best_lane(&fits, &prompt_ids).unwrap()
+                        } else {
+                            (fits[0], PrefixPlan::Reset)
+                        };
+                        if let Some(req) = admit(
+                            &mut engine, &tok, &mut pc, lane, plan, prompt_ids, is_chat, forced_tool,
+                            single_tool_call, max_tokens, sampling, stop_strings, cache_prompt, event_tx,
+                            &mut last_prefill_tok_s,
+                        ) {
+                            let mut req = req;
+                            if req.accept(&tok, engine.lane_max_seq(lane)) {
+                                active[lane] = Some(req);
+                            } else {
+                                let hit = engine.telemetry().total_vram_hit_rate();
+                                last_decode_tok_s = req.finish(hit);
+                                if let Some(line) = engine.tide.scheduler.finish_request() {
+                                    println!("{line}");
+                                }
+                            }
+                        }
                     }
                 }
-                finish_reason = fr;
-                if n_tool_calls > 0 && finish_reason == "stop" {
-                    finish_reason = "tool_calls";
-                }
+            }
+        }
 
-                let dec_secs = t_dec.elapsed().as_secs_f64();
-                if !generated.is_empty() {
-                    last_decode_tok_s = generated.len() as f64 / dec_secs.max(1e-6);
+        // 3. Decode: one token for every active lane.
+        for l in 0..n_lanes {
+            let Some(req) = active[l].as_mut() else { continue };
+            engine.select_lane(l);
+            let mut done = false;
+            if let Err(e) = engine.forward_token(req.next_tok, req.pos, false, true) {
+                let _ = req.event_tx.send(StreamEvent::Error(format!("decode error: {e}")));
+                pc.invalidate(l);
+                done = true;
+            } else {
+                let _ = engine.post_decode_tide_step();
+                pc.live[l].push(req.next_tok);
+                req.pos += 1;
+                match engine.sample_next_token(&req.sampling, &req.generated) {
+                    Ok(t) => {
+                        req.next_tok = t;
+                        if !req.accept(&tok, engine.lane_max_seq(l)) {
+                            done = true;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = req.event_tx.send(StreamEvent::Error(format!("sample error: {e}")));
+                        done = true;
+                    }
                 }
-                let hit_rate = engine.telemetry().total_vram_hit_rate();
+            }
+            if done {
+                let req = active[l].take().unwrap();
+                let hit = engine.telemetry().total_vram_hit_rate();
+                last_decode_tok_s = req.finish(hit);
                 if let Some(line) = engine.tide.scheduler.finish_request() {
                     println!("{line}");
                 }
-                let _ = event_tx.send(StreamEvent::Done {
-                    finish_reason,
-                    cached_tokens: reuse_len,
-                    prompt_tokens: prompt_ids.len(),
-                    completion_tokens: generated.len(),
-                    prefill_secs: pf_secs,
-                    decode_secs: dec_secs,
-                    vram_hit_rate: hit_rate,
-                });
             }
         }
     }
+}
+
+/// Prefills a request's prompt on `lane` (reusing the prefix cache per `plan`) and samples its
+/// first token. `None` if it failed (the error was sent to the client).
+#[allow(clippy::too_many_arguments)]
+fn admit(
+    engine: &mut Inkling2Engine<HipBackend>,
+    tok: &BpeTokenizer,
+    pc: &mut PrefixCache<SeqSnapshot>,
+    lane: usize,
+    plan: PrefixPlan,
+    prompt_ids: Vec<u32>,
+    is_chat: bool,
+    forced_tool: Option<String>,
+    single_tool_call: bool,
+    max_tokens: usize,
+    sampling: SamplingParams,
+    stop_strings: Vec<String>,
+    cache_prompt: bool,
+    event_tx: Sender<StreamEvent>,
+    last_prefill_tok_s: &mut f64,
+) -> Option<ActiveReq> {
+    engine.select_lane(lane);
+    let t_pf = Instant::now();
+    if std::env::var_os("SMALLTIDE_PREFIX_DEBUG").is_some() {
+        let cached = &pc.live[lane];
+        let lcp = cached.iter().zip(&prompt_ids).take_while(|(a, b)| a == b).count();
+        let show = |ids: &[u32]| -> String {
+            let end = (lcp + 6).min(ids.len());
+            format!("{:?}", ids[lcp.min(end)..end].iter().map(|&t| tok.decode(&[t])).collect::<Vec<_>>())
+        };
+        eprintln!(
+            "[prefix] lane={lane} plan={plan:?} live={} prompt={} lcp={lcp} live_next={} prompt_next={}",
+            cached.len(),
+            prompt_ids.len(),
+            show(cached),
+            show(&prompt_ids)
+        );
+    }
+    let rewind = match &plan {
+        PrefixPlan::Extend { from } => Ok(*from),
+        PrefixPlan::Restore { snap_idx, pos, global } => engine.restore_state(pc.snapshot(*snap_idx), *global).map(|_| *pos),
+        PrefixPlan::Reset => engine.reset_sequence().map(|_| 0),
+    };
+    let reuse_len = match rewind {
+        Ok(p) => p,
+        Err(e) => {
+            pc.invalidate(lane);
+            let _ = event_tx.send(StreamEvent::Error(format!("prefix restore: {e}")));
+            return None;
+        }
+    };
+    pc.rewound_to(lane, &plan, reuse_len);
+
+    // Snapshot points: the first user-message boundary (shared system/tool prefix) and one
+    // token before the prompt end (the last token is always re-processed, so this serves exact
+    // repeats and follow-up turns alike). Prefill runs in segments so each snapshot lands
+    // exactly on its point.
+    let end = prompt_ids.len();
+    let mut points: Vec<usize> = Vec::new();
+    if let Some(bd) = prompt_ids.iter().position(|&t| t == TOK_MESSAGE_USER) {
+        if bd > reuse_len && bd >= 16 {
+            points.push(bd);
+        }
+    }
+    if end >= 2 && end - 1 > reuse_len {
+        points.push(end - 1);
+    }
+    points.sort_unstable();
+    points.dedup();
+    let mut cuts = vec![reuse_len];
+    cuts.extend(points.iter().copied());
+    cuts.push(end);
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            continue;
+        }
+        if cache_prompt && points.contains(&a) && !pc.has_snapshot_of(&prompt_ids[..a]) {
+            let mut slot = pc.take_payload(a);
+            match engine.snapshot_state(a, &mut slot) {
+                Ok(()) => pc.insert(lane, a, slot.unwrap()),
+                Err(e) => eprintln!("[prefix-cache] snapshot at {a} failed: {e}"),
+            }
+        }
+        if let Err(e) = engine.prefill(&prompt_ids[a..b], a, b == end) {
+            pc.invalidate(lane);
+            let _ = event_tx.send(StreamEvent::Error(format!("prefill error at pos {a}..{b}: {e}")));
+            return None;
+        }
+        pc.live[lane].extend_from_slice(&prompt_ids[a..b]);
+    }
+    let pf_secs = t_pf.elapsed().as_secs_f64();
+    let new_pf_toks = end - reuse_len;
+    pc.stats.prefilled_tokens += new_pf_toks as u64;
+    if new_pf_toks > 0 {
+        *last_prefill_tok_s = new_pf_toks as f64 / pf_secs.max(1e-6);
+    }
+    let _ = engine.rebalance_after_prefill(128);
+
+    let next_tok = match engine.sample_next_token(&sampling, &[]) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = event_tx.send(StreamEvent::Error(format!("sample error: {e}")));
+            return None;
+        }
+    };
+    Some(ActiveReq {
+        is_chat,
+        single_tool_call,
+        max_tokens,
+        sampling,
+        parser: match &forced_tool {
+            Some(n) => AnswerParser::new_forced_tool(n),
+            None => AnswerParser::new(),
+        },
+        raw_utf8: Utf8Stream::default(),
+        stopper: StopMatcher::new(stop_strings),
+        event_tx,
+        req_tag: REQ_COUNTER.load(Ordering::Relaxed),
+        n_tool_calls: 0,
+        prompt_len: end,
+        reuse_len,
+        pf_secs,
+        t_dec: Instant::now(),
+        generated: Vec::with_capacity(max_tokens.min(4096)),
+        pos: end,
+        next_tok,
+        finish_reason: "length",
+    })
 }
 
 fn write_json_response(stream: &mut TcpStream, status: &str, body: &Value) {

@@ -88,6 +88,8 @@ impl SeqSnapshot {
 /// Per-logical-layer FP8 KV cache + 4-channel causal short-convolution state (`k = 4`, history `3`).
 pub(crate) struct LogicalLayerState {
     pub(crate) _is_local: bool,
+    /// True when V cache is packed Q4_asym32 (global layers under K8/V4 mode).
+    pub(crate) v_q4: bool,
     /// KV buffer length (ring size for local layers).
     pub(crate) max_seq: usize,
     /// Attention window (local layers; == max_seq for global layers).
@@ -253,6 +255,8 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     lane_store: Vec<Option<ParkedLane>>,
     lane_max_seq: Vec<usize>,
     active_lane: usize,
+    /// True when global KV layers store V as Q4_asym32 (K8/V4 mode).
+    global_v_q4: bool,
     /// Batched decode: `[MAX_BATCH_ROWS][unpadded_vocab]` logits and `[logical][MAX_BATCH_ROWS][16]`
     /// routing log (allocated on first use).
     pub(crate) batch_logits: Option<DeviceBuf>,
@@ -303,9 +307,11 @@ pub(crate) struct ParkedLane {
 
 
 /// Allocates the shared global-KV pool of `pages` pages.
-fn alloc_kv_pool<B: ComputeBackend>(backend: &B, cfg: &Inkling2Config, pages: usize) -> Result<KvPoolBufs> {
+fn alloc_kv_pool<B: ComputeBackend>(backend: &B, cfg: &Inkling2Config, pages: usize, v_q4: bool) -> Result<KvPoolBufs> {
     let (n, hd) = (cfg.num_key_value_heads, cfg.head_dim);
     let pos = pages * crate::kv_pager::PAGE_POS;
+    let vc_per_pos = n * if v_q4 { hd / 2 } else { hd };
+    let vs_per_pos = n * if v_q4 { 16 } else { 4 };
     let mut layers = Vec::new();
     for il in 0..cfg.num_logical_layers() {
         let (phys, _) = crate::map_logical_to_physical(cfg, smalltide_core::LogicalLayerId(il as u16));
@@ -313,8 +319,8 @@ fn alloc_kv_pool<B: ComputeBackend>(backend: &B, cfg: &Inkling2Config, pages: us
             layers.push((
                 backend.alloc_device(pos * n * hd)?,
                 backend.alloc_device(pos * n * 4)?,
-                backend.alloc_device(pos * n * hd)?,
-                backend.alloc_device(pos * n * 4)?,
+                backend.alloc_device(pos * vc_per_pos)?,
+                backend.alloc_device(pos * vs_per_pos)?,
             ));
         }
     }
@@ -329,6 +335,7 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
     global_max_seq: usize,
     stream: smalltide_core::Stream,
     paged: Option<(&KvPoolBufs, DeviceBuf)>,
+    global_v_q4: bool,
 ) -> Result<Vec<LogicalLayerState>> {
     let mut global_i = 0usize;
     let h = cfg.hidden_size;
@@ -338,6 +345,7 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
     for il in 0..num_logical {
         let (phys, _) = crate::map_logical_to_physical(&cfg, smalltide_core::LogicalLayerId(il as u16));
         let is_local = cfg.is_local_layer(phys.0 as usize);
+        let v_q4 = !is_local && global_v_q4;
         let (max_seq, window) = if is_local {
             (cfg.local_window_size + PREFILL_CHUNK, cfg.local_window_size)
         } else {
@@ -346,6 +354,8 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
         };
         let kv_bytes = cfg.num_key_value_heads * max_seq * cfg.head_dim;
         let sc_bytes = cfg.num_key_value_heads * max_seq * 4;
+        let vc_bytes = cfg.num_key_value_heads * max_seq * if v_q4 { cfg.head_dim / 2 } else { cfg.head_dim };
+        let vs_bytes = cfg.num_key_value_heads * max_seq * if v_q4 { 16 } else { 4 };
         // Paged global layers point at the shared pool; local rings are the lane's own.
         let pooled = match paged {
             Some((pool, table)) if !is_local => {
@@ -365,12 +375,13 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
         backend.zero_f32(sconv_mlp, 3 * h, stream)?;
         layer_states.push(LogicalLayerState {
             _is_local: is_local,
+            v_q4,
             max_seq,
             window,
             k_cache: match pooled { Some((l, _)) => l.0, None => backend.alloc_device(kv_bytes)? },
             k_scales: match pooled { Some((l, _)) => l.1, None => backend.alloc_device(sc_bytes)? },
-            v_cache: match pooled { Some((l, _)) => l.2, None => backend.alloc_device(kv_bytes)? },
-            v_scales: match pooled { Some((l, _)) => l.3, None => backend.alloc_device(sc_bytes)? },
+            v_cache: match pooled { Some((l, _)) => l.2, None => backend.alloc_device(vc_bytes)? },
+            v_scales: match pooled { Some((l, _)) => l.3, None => backend.alloc_device(vs_bytes)? },
             page_table: pooled.map(|(_, t)| t),
             sconv_k,
             sconv_v,
@@ -390,6 +401,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         tide: TideExecutor<B>,
         global_max_seq: usize,
         kv_pool_pages: Option<usize>,
+        global_v_q4: bool,
     ) -> Result<Self> {
         let backend = dense.backend.clone();
         let stream = tide.compute_stream;
@@ -400,13 +412,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
         let (layer_states, kv_pool) = match kv_pool_pages {
             Some(pages) => {
-                let bufs = alloc_kv_pool(&*backend, &cfg, pages)?;
+                let bufs = alloc_kv_pool(&*backend, &cfg, pages, global_v_q4)?;
                 let mut pool = crate::kv_pager::KvPool::new(pages, global_max_seq.max(cfg.local_window_size));
                 let table = pool.add_lane(&*backend)?;
-                let st = alloc_layer_states(&*backend, &cfg, global_max_seq, stream, Some((&bufs, table)))?;
+                let st = alloc_layer_states(&*backend, &cfg, global_max_seq, stream, Some((&bufs, table)), global_v_q4)?;
                 (st, Some((pool, bufs)))
             }
-            None => (alloc_layer_states(&*backend, &cfg, global_max_seq, stream, None)?, None),
+            None => (alloc_layer_states(&*backend, &cfg, global_max_seq, stream, None, global_v_q4)?, None),
         };
 
         let alloc_f32 = |n: usize| backend.alloc_device(n * 4);
@@ -495,6 +507,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             lane_store: vec![None],
             lane_max_seq: vec![global_max_seq],
             active_lane: 0,
+            global_v_q4,
             batch_logits: None,
             batch_route_log: None,
             batch_pending_rows: 0,
@@ -573,8 +586,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             if !st._is_local {
                 v.push((st.k_cache, heads * hd));
                 v.push((st.k_scales, heads * 4));
-                v.push((st.v_cache, heads * hd));
-                v.push((st.v_scales, heads * 4));
+                v.push((st.v_cache, heads * if st.v_q4 { hd / 2 } else { hd }));
+                v.push((st.v_scales, heads * if st.v_q4 { 16 } else { 4 }));
             }
         }
         v
@@ -919,9 +932,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 Some((pool, bufs)) => {
                     let table = pool.add_lane(&*self.backend)?;
                     let bufs = bufs.clone();
-                    alloc_layer_states(&*self.backend, &self.cfg, max_seq, s, Some((&bufs, table)))?
+                    alloc_layer_states(&*self.backend, &self.cfg, max_seq, s, Some((&bufs, table)), self.global_v_q4)?
                 }
-                None => alloc_layer_states(&*self.backend, &self.cfg, max_seq, s, None)?,
+                None => alloc_layer_states(&*self.backend, &self.cfg, max_seq, s, None, self.global_v_q4)?,
             };
             self.lane_store.push(Some(ParkedLane { layer_states: states, rng_state: 0x9E37_79B9_7F4A_7C15 ^ (self.lane_store.len() as u64) }));
             self.lane_max_seq.push(max_seq.max(self.cfg.local_window_size));
@@ -1788,7 +1801,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let mut k = vec![0u8; 8];
             self.backend.memcpy_d2h_sync(&mut k, st.k_cache.slice(q * n * hd, 8), 0, s)?;
             let mut v = vec![0u8; 8];
-            self.backend.memcpy_d2h_sync(&mut v, st.v_cache.slice(q * n * hd, 8), 0, s)?;
+            let v_stride = if st.v_q4 { n * (hd / 2) } else { n * hd };
+            self.backend.memcpy_d2h_sync(&mut v, st.v_cache.slice(q * v_stride, 8), 0, s)?;
             let mut sc = [0u8; 4];
             self.backend.memcpy_d2h_sync(&mut sc, st.k_scales.slice(q * n * 4, 4), 0, s)?;
             out.push((k, f32::from_le_bytes(sc), v));
@@ -2394,6 +2408,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 rel_threshold: self.cfg.rel_l2_clip_threshold,
                 tau,
                 eps,
+                v_q4: st.v_q4,
             },
             s,
         )?;
@@ -2432,6 +2447,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 num_splits,
                 inv_sqrt_d: 1.0 / (self.cfg.head_dim as f32).sqrt(),
                 window: if is_local { st.window } else { 0 },
+                v_q4: st.v_q4,
             },
             s,
         )?;

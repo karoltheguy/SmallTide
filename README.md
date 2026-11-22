@@ -89,7 +89,7 @@ curl.exe -s http://127.0.0.1:8000/v1/chat/completions `
 2. **Windows DXGI residency-aware sizing.** On Windows WDDM, `hipMemGetInfo` reports shared system RAM as free VRAM, causing oversized allocations to silently drop ~10× in bandwidth over PCIe. With `SMALLTIDE_POOL_BUDGET=resident` (default), SmallTide queries DXGI's local residency budget and probes copy bandwidth across every 256 MiB window at startup (`fit_pools_to_resident`) so 100% of active expert slots stay on dedicated GDDR6.
 3. **2-Stage Miss Handling + Fused GPU Spin-Wait Rescue.** Non-VRAM experts live warm in pinned/host RAM (`SMALLTIDE_RAM_GB=16`) backed by 4 KB-aligned Win32 `FILE_FLAG_NO_BUFFERING` NVMe reads (`experts.stide`). High-weight misses (`>= 0.15` in Prelude/Coda, `>= 0.10` in Loop Core, per-zone budgets `8/6/10`) are copied over PCIe on a dedicated DMA stream and synchronized on-GPU by a fused HIP spin-wait + route-patch kernel (`SMALLTIDE_RESCUE_WAIT=spin`), while lower-weight misses are skipped and renormalized and hot misses promote asynchronously in the background.
 4. **Lossless DSpark Speculative Decoding.** Inkling-2-Mini's 3-layer DSpark drafter (`mtp.safetensors`, ~418 MiB VRAM at 49K ctx) drafts up to 7 tokens per step with confidence-gated adaptive depth. Verification uses GPU-side top-k/top-p filtering (`smalltide_logits_filter_rows`) and exact stochastic rejection sampling, accelerating both `temperature = 0` and `temperature > 0` without altering the target distribution.
-5. **Paged Global KV & Prefix Caching.** Global-attention KV (8 layers, FP8 E4M3) is paged from a shared `SMALLTIDE_KV_TOKENS` pool across lanes; multi-turn conversations restore prefix snapshots (including drafter KV state) from pinned host RAM without re-prefilling.
+5. **Paged K8/V4 Global KV & Prefix Caching.** Global-attention KV (8 target layers + 1 drafter layer) is paged from a shared `SMALLTIDE_KV_TOKENS` pool across lanes with asymmetric **`k8v4`** quantization (`SMALLTIDE_KV_FMT=k8v4`: FP8 E4M3 keys for exact attention scores + per-32-group asymmetric INT4 values, saving ~472 MiB at 128K for +115 more resident experts). Multi-turn conversations restore prefix snapshots (including drafter KV state) from pinned host RAM without re-prefilling.
 
 ---
 
@@ -99,7 +99,9 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 
 | Setting | Default | What it controls |
 | --- | --- | --- |
-| `SMALLTIDE_MAX_CTX` / `SMALLTIDE_KV_TOKENS` | `49152` | Context length & shared paged global-KV pool. Lowering to `16384` frees ~0.5 GiB for ~120 more resident experts; raising to `81920` supports longer contexts with ~110 fewer experts. |
+| `SMALLTIDE_MAX_CTX` / `SMALLTIDE_KV_TOKENS` | `131072` | Context length & shared paged global-KV pool (128K default with `k8v4` across 2 lanes; raise to `196608` or lower to `65536` to trade context for experts). |
+| `SMALLTIDE_KV_FMT` | `k8v4` | Global KV format: `k8v4` (FP8 keys + Q4 values, saves ~472 MiB @ 128K) or `fp8` (full FP8 K/V). |
+| `SMALLTIDE_LANES` | `2` | Concurrent serving lanes (each extra lane reserves ~124 MiB of local KV rings + slack page). |
 | `SMALLTIDE_RESCUE_MODE` | `threshold` | `threshold` (balanced), `exact` (copy every miss, bit-exact MoE), or `disabled` (fastest, skip inline misses). |
 | `SMALLTIDE_RESCUE_THRESHOLD` / `..._CORE` | `0.15` / `0.1` | Routing-weight gate for inline rescues (Prelude & Coda / Loop Core). |
 | `SMALLTIDE_RESCUE_BUDGET_PRELUDE` / `_CORE` / `_CODA` | `8` / `6` / `10` | Per-token inline rescue caps per architectural zone. |

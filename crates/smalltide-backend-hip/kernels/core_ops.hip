@@ -45,6 +45,61 @@ __device__ __forceinline__ float4 decode_fp8x4(uint32_t w) {
     return make_float4(lo[0], lo[1], hi[0], hi[1]);
 }
 
+/// Packed asymmetric 4-bit KV value scale for one 32-element group: (min, (max-min)/15) as f16x2.
+struct KvV4Scale {
+    _Float16 lo;
+    _Float16 sc;
+};
+
+/// Stores one 128-dim KV value head as per-32-group asymmetric INT4 (64B nibbles + 16B scales).
+/// Must be called by a 128-thread block (4 Wave32 warps, d = 0..127); needs no __syncthreads().
+__device__ __forceinline__ void kv_store_v_q4(
+    uint8_t* __restrict__ v_cache,
+    float* __restrict__ v_scales,
+    size_t si,
+    uint32_t d,
+    float vv
+) {
+    float lo = vv, hi = vv;
+    for (int o = 16; o > 0; o >>= 1) {
+        lo = fminf(lo, __shfl_xor(lo, o, 32));
+        hi = fmaxf(hi, __shfl_xor(hi, o, 32));
+    }
+    float span = hi - lo;
+    float sc = (span > 1e-12f) ? (span * (1.0f / 15.0f)) : 0.0f;
+    float inv_sc = (span > 1e-12f) ? (15.0f / span) : 0.0f;
+    uint32_t q = static_cast<uint32_t>(fminf(fmaxf(rintf((vv - lo) * inv_sc), 0.0f), 15.0f));
+    uint32_t q_hi = __shfl_down(q, 1, 32);
+    if ((d & 1u) == 0u) {
+        v_cache[si * 64u + (d >> 1)] = static_cast<uint8_t>(q | (q_hi << 4));
+    }
+    if ((d & 31u) == 0u) {
+        KvV4Scale pk;
+        pk.lo = (_Float16)lo;
+        pk.sc = (_Float16)sc;
+        reinterpret_cast<KvV4Scale*>(v_scales)[si * 4u + (d >> 5)] = pk;
+    }
+}
+
+/// Loads 4 consecutive dims (`lane*4 .. lane*4+3`) of a Q4_asym32 KV value head.
+__device__ __forceinline__ float4 kv_load_v_q4(
+    const uint8_t* __restrict__ v_cache,
+    const float* __restrict__ v_scales,
+    size_t si,
+    uint32_t lane
+) {
+    uint32_t v2 = reinterpret_cast<const uint16_t*>(v_cache + si * 64u)[lane];
+    KvV4Scale pk = reinterpret_cast<const KvV4Scale*>(v_scales)[si * 4u + (lane >> 3)];
+    float lo = static_cast<float>(pk.lo);
+    float sc = static_cast<float>(pk.sc);
+    return make_float4(
+        fmaf(static_cast<float>(v2 & 0xFu), sc, lo),
+        fmaf(static_cast<float>((v2 >> 4) & 0xFu), sc, lo),
+        fmaf(static_cast<float>((v2 >> 8) & 0xFu), sc, lo),
+        fmaf(static_cast<float>((v2 >> 12) & 0xFu), sc, lo)
+    );
+}
+
 /// FP4 E2M1 magnitude x2 from a packed register LUT (no memory lookup): {0,1,2,3,4,6,8,12}.
 __device__ __forceinline__ float fp4x2(uint32_t n) {
     float v = static_cast<float>((0xC8643210u >> ((n & 7u) << 2)) & 0xFu);
@@ -413,6 +468,7 @@ struct AttnPrepArgs {
     float tau;
     float eps;
     const uint32_t* page_table; // nullable (see kv_phys)
+    uint32_t v_q4;              // 0 = FP8 V, 1 = Q4_asym32 V
 };
 
 __device__ __forceinline__ float block128_sum(float v, float* sh) {
@@ -460,15 +516,20 @@ extern "C" __global__ void smalltide_attn_prep_decode(AttnPrepArgs a) {
         // V: unit RMS norm (no gamma)
         float vs = block128_sum(v * v, sh);
         v *= rsqrtf(vs / 128.0f + a.eps);
-        // FP8 store with per-(head, token) absmax scales
+        // K: FP8 store with per-(head, token) absmax scale; V: FP8 or Q4_asym32
         float km = block128_max(fabsf(k), sh);
-        float vm = block128_max(fabsf(v), sh);
         float ks = (km > 0.0f) ? km / 448.0f : 1.0f;
-        float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
         size_t si = static_cast<size_t>(kv_phys(a.page_table, a.slot)) * a.n_kv + h;
-        if (t == 0u) { a.k_scales[si] = ks; a.v_scales[si] = vsc; }
+        if (t == 0u) a.k_scales[si] = ks;
         a.k_cache[si * 128u + t] = encode_fp8_e4m3fn(k / ks);
-        a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);
+        if (a.v_q4 != 0u) {
+            kv_store_v_q4(a.v_cache, a.v_scales, si, t, v);
+        } else {
+            float vm = block128_max(fabsf(v), sh);
+            float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
+            if (t == 0u) a.v_scales[si] = vsc;
+            a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);
+        }
         return;
     }
     b -= a.n_kv;
@@ -853,15 +914,20 @@ extern "C" __global__ void smalltide_attn_prep_rows(AttnPrepArgs a, AttnPrepRows
             float vs = block128_sum(v * v, sh);
             v *= rsqrtf(vs / 128.0f + a.eps);
             float km = block128_max(fabsf(k), sh);
-            float vm = block128_max(fabsf(v), sh);
             float ks = (km > 0.0f) ? km / 448.0f : 1.0f;
-            float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
             uint32_t pos = e.pos0 + r;
             uint32_t slot = (e.is_local != 0u) ? (pos % a.max_seq) : pos;
             size_t si = static_cast<size_t>(kv_phys(a.page_table, slot)) * a.n_kv + h;
-            if (t == 0u) { a.k_scales[si] = ks; a.v_scales[si] = vsc; }
+            if (t == 0u) a.k_scales[si] = ks;
             a.k_cache[si * 128u + t] = encode_fp8_e4m3fn(k / ks);
-            a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);
+            if (a.v_q4 != 0u) {
+                kv_store_v_q4(a.v_cache, a.v_scales, si, t, v);
+            } else {
+                float vm = block128_max(fabsf(v), sh);
+                float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
+                if (t == 0u) a.v_scales[si] = vsc;
+                a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);
+            }
         }
         return;
     }

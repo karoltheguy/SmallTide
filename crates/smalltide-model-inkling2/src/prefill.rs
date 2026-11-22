@@ -736,6 +736,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     rel_threshold: cfg.rel_l2_clip_threshold,
                     tau: 1.0,
                     eps,
+                    v_q4: st.v_q4,
                 },
                 hist(0).zip(hist(1)),
                 pos0,
@@ -817,7 +818,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         match lanes {
             None => {
                 if !prepped {
-                    b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, st.page_table, s)?;
+                    b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, st.page_table, st.v_q4, s)?;
                 }
                 let attn_params = PrefillAttnParams {
                     page_table: st.page_table,
@@ -829,6 +830,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     rows: m,
                     rel_extent: cfg.rel_extent,
                     inv_sqrt_d: 1.0 / (hd as f32).sqrt(),
+                    v_q4: st.v_q4,
                 };
                 if verify && m <= crate::engine::MAX_BATCH_ROWS {
                     b.attn_prefill_fp8_split(
@@ -848,7 +850,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 for (r, &(lane, p)) in rows.iter().enumerate() {
                     let ls = self.lane_layer_state(lane, il);
                     b.kv_store_fp8_rows(ls.k_cache, ls.k_scales, ls.v_cache, ls.v_scales, row(pf.k, r, kv_dim), row(pf.v, r, kv_dim),
-                        nkv, ls.max_seq, hd, p, 1, is_local, ls.page_table, s)?;
+                        nkv, ls.max_seq, hd, p, 1, is_local, ls.page_table, ls.v_q4, s)?;
                     let n_valid = if is_local { (p + 1).min(ls.window) } else { p + 1 };
                     let num_splits = n_valid.div_ceil(128).clamp(1, crate::engine::MAX_FLASH_SPLITS);
                     b.flash_decode_fp8(
@@ -874,6 +876,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                             num_splits,
                             inv_sqrt_d: 1.0 / (hd as f32).sqrt(),
                             window: if is_local { ls.window } else { 0 },
+                            v_q4: ls.v_q4,
                         },
                         s,
                     )?;

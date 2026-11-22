@@ -96,6 +96,8 @@ pub struct FlashDecodeParams {
     pub inv_sqrt_d: f32,
     /// Local layers: attention window when the ring (`max_seq`) is larger; 0 = `max_seq`.
     pub window: usize,
+    /// True when V cache is packed Q4_asym32 (64B nibbles + 16B scales per head) instead of FP8.
+    pub v_q4: bool,
 }
 
 /// Parameters for the multi-row causal prefill attention.
@@ -113,6 +115,8 @@ pub struct PrefillAttnParams {
     pub rows: usize,
     pub rel_extent: usize,
     pub inv_sqrt_d: f32,
+    /// True when V cache is packed Q4_asym32 instead of FP8.
+    pub v_q4: bool,
 }
 
 /// Expert-grouped MoE launch for prefill (see `moe_grouped`).
@@ -171,6 +175,8 @@ pub struct AttnPrepParams {
     pub rel_threshold: f32,
     pub tau: f32,
     pub eps: f32,
+    /// True to store V in Q4_asym32 (64B nibbles + 16B scales per head) instead of FP8.
+    pub v_q4: bool,
 }
 
 /// Rows residual / attention-residual mix / RMSNorm (see `ComputeBackend::mix_rows`).
@@ -796,20 +802,20 @@ pub trait ComputeBackend: Send + Sync {
         self.attn_prefill_fp8(out, q, k_cache, k_scales, v_cache, v_scales, rel_table, sinks, params, stream)
     }
 
-    /// FP8 context K/V store of `rows` rows at positions `pos0..` (`ring` = 0: linear).
+    /// FP8/K8V4 context K/V store of `rows` rows at positions `pos0..` (`ring` = 0: linear).
     #[allow(clippy::too_many_arguments)]
     fn dspark_ctx_store_fp8(&self, _kc: DeviceBuf, _ks: DeviceBuf, _vc: DeviceBuf, _vs: DeviceBuf,
         _k: DeviceBuf, _v: DeviceBuf, _pos0: usize, _rows: usize, _ring: usize, _nkv: usize,
-        _stream: Stream) -> Result<()> {
+        _v_q4: bool, _stream: Stream) -> Result<()> {
         Err(crate::SmallTideError::Unsupported("dspark_ctx_store_fp8".into()))
     }
 
-    /// Grouped Split-K FP8 drafter attention (`rows == nblk == 8`, `nh == 3 * nkv`).
+    /// Grouped Split-K FP8/K8V4 drafter attention (`rows == nblk == 8`, `nh == 3 * nkv`).
     #[allow(clippy::too_many_arguments)]
     fn dspark_attn_fp8(&self, _out: DeviceBuf, _part_o: DeviceBuf, _part_m: DeviceBuf, _part_l: DeviceBuf,
         _q: DeviceBuf, _kb: DeviceBuf, _vb: DeviceBuf, _kc: DeviceBuf, _ks: DeviceBuf,
         _vc: DeviceBuf, _vs: DeviceBuf, _rows: usize, _p: usize, _lo: usize, _ring: usize,
-        _nh: usize, _nkv: usize, _nblk: usize, _scale: f32, _stream: Stream) -> Result<()> {
+        _nh: usize, _nkv: usize, _nblk: usize, _scale: f32, _v_q4: bool, _stream: Stream) -> Result<()> {
         Err(crate::SmallTideError::Unsupported("dspark_attn_fp8".into()))
     }
 
@@ -848,11 +854,12 @@ pub trait ComputeBackend: Send + Sync {
         dyn_taps: Option<DeviceBuf>, dim: usize, head_dim: usize, rows: usize, dyn_stride: usize,
         stream: Stream) -> Result<()>;
 
-    /// FP8 KV store of `rows` tokens at positions `pos0..` (`is_local`: ring of `max_seq`).
+    /// FP8/K8V4 KV store of `rows` tokens at positions `pos0..` (`is_local`: ring of `max_seq`).
     #[allow(clippy::too_many_arguments)]
     fn kv_store_fp8_rows(&self, k_cache: DeviceBuf, k_scales: DeviceBuf, v_cache: DeviceBuf,
         v_scales: DeviceBuf, k_in: DeviceBuf, v_in: DeviceBuf, n_kv_heads: usize, max_seq: usize,
-        head_dim: usize, pos0: usize, rows: usize, is_local: bool, page_table: Option<DeviceBuf>, stream: Stream) -> Result<()>;
+        head_dim: usize, pos0: usize, rows: usize, is_local: bool, page_table: Option<DeviceBuf>,
+        v_q4: bool, stream: Stream) -> Result<()>;
 
     /// Multi-row causal attention over the FP8 KV cache (relative bias + sinks).
     #[allow(clippy::too_many_arguments)]

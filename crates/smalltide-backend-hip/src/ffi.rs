@@ -1399,11 +1399,12 @@ impl HipRuntime {
             let mut splits_arg = num_splits;
             let mut inv_sqrt_d: f32 = 1.0 / (hd as f32).sqrt();
             let mut window_arg: u32 = 0;
+            let mut vq4_arg: u32 = 0;
             let mut null_rel: *mut c_void = ptr::null_mut();
             let mut null_page_table: *mut c_void = ptr::null_mut();
             let mut null_sink: *mut c_void = ptr::null_mut();
 
-            let mut p1: [*mut c_void; 19] = [
+            let mut p1: [*mut c_void; 20] = [
                 &mut d_po as *mut _ as *mut c_void,
                 &mut d_pm as *mut _ as *mut c_void,
                 &mut d_pl as *mut _ as *mut c_void,
@@ -1423,6 +1424,7 @@ impl HipRuntime {
                 &mut inv_sqrt_d as *mut _ as *mut c_void,
                 &mut window_arg as *mut _ as *mut c_void,
                 &mut null_page_table as *mut _ as *mut c_void,
+                &mut vq4_arg as *mut _ as *mut c_void,
             ];
             let mut p2: [*mut c_void; 7] = [
                 &mut d_out as *mut _ as *mut c_void,

@@ -185,6 +185,7 @@ fn main() {
         layers: Vec::new(),
     };
 
+    let v_q4 = std::env::var("SMALLTIDE_KV_FMT").map(|v| v.eq_ignore_ascii_case("k8v4")).unwrap_or(false);
     let mut drafter = Drafter::load(
         backend.clone(),
         &model_dir.join("mtp.safetensors"),
@@ -192,6 +193,7 @@ fn main() {
         vocab,
         max_seq,
         chunk,
+        v_q4,
     )
     .expect("Drafter::load");
     println!(

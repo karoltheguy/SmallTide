@@ -36,6 +36,7 @@ const EPS: f32 = 1e-6;
 
 struct DrafterLayer {
     local: bool,
+    v_q4: bool,
     in_ln: DeviceBuf,
     post_ln: DeviceBuf,
     dflare: DeviceBuf,
@@ -146,7 +147,7 @@ impl<B: ComputeBackend> Drafter<B> {
     /// Loads `mtp.safetensors` (dense projections quantized to FP8 per row), keeps `w1` in
     /// host-mapped pinned memory, splits `rnn_proj` into dynamic/static blocks, uses FP8 context
     /// KV, and folds `U @ hidden_out` into padded FP8 E4M3FN.
-    pub fn load(backend: Arc<B>, path: &Path, dense: &Inkling2DenseGpu<B>, vocab: usize, max_seq: usize, chunk: usize) -> Result<Self> {
+    pub fn load(backend: Arc<B>, path: &Path, dense: &Inkling2DenseGpu<B>, vocab: usize, max_seq: usize, chunk: usize, global_v_q4: bool) -> Result<Self> {
         let hdr = inspect_safetensors_header(path)?;
         let base = 8u64 + hdr.header_len;
         let mut f = File::open(path)?;
@@ -181,14 +182,17 @@ impl<B: ComputeBackend> Drafter<B> {
                 let k_norm = vec(&mut f, "self_attn.k_norm.weight")?;
                 let k_norm_ctx = vec(&mut f, "self_attn.k_norm_ctx.weight")?;
                 let local = l != 1;
+                let v_q4 = !local && global_v_q4;
                 let slots = if local { RING } else { max_seq };
                 let kc = backend.alloc_device(slots * HK * HD)?;
                 let ks = backend.alloc_device(slots * HK * 4)?;
-                let vc = backend.alloc_device(slots * HK * HD)?;
-                let vs = backend.alloc_device(slots * HK * 4)?;
-                bytes += 2 * slots * HK * (HD + 4);
+                let vc_bytes = slots * HK * if v_q4 { HD / 2 } else { HD };
+                let vs_bytes = slots * HK * if v_q4 { 16 } else { 4 };
+                let vc = backend.alloc_device(vc_bytes)?;
+                let vs = backend.alloc_device(vs_bytes)?;
+                bytes += slots * HK * (HD + 4) + vc_bytes + vs_bytes;
                 layers.push(DrafterLayer {
-                    local, in_ln, post_ln, dflare, q, k, v, k_ctx, v_ctx, o, gate, up: upm, down,
+                    local, v_q4, in_ln, post_ln, dflare, q, k, v, k_ctx, v_ctx, o, gate, up: upm, down,
                     q_norm, k_norm, k_norm_ctx, kc, ks, vc, vs,
                 });
             }
@@ -353,7 +357,7 @@ impl<B: ComputeBackend> Drafter<B> {
                 b.gemm_fp8_rows(sc.ctx_v, sc.ctx_c, ly.v_ctx.data, ly.v_ctx.row_scales, m, kvd, D, s)?;
             }
             b.dspark_head_norm_rope(sc.ctx_k, ly.k_norm_ctx, HK, m, pos0, THETA, EPS, s)?;
-            b.dspark_ctx_store_fp8(ly.kc, ly.ks, ly.vc, ly.vs, sc.ctx_k, sc.ctx_v, pos0, m, if ly.local { RING } else { 0 }, HK, s)?;
+            b.dspark_ctx_store_fp8(ly.kc, ly.ks, ly.vc, ly.vs, sc.ctx_k, sc.ctx_v, pos0, m, if ly.local { RING } else { 0 }, HK, ly.v_q4, s)?;
         }
         Ok(())
     }
@@ -396,7 +400,7 @@ impl<B: ComputeBackend> Drafter<B> {
             b.dspark_attn_fp8(
                 sc.att, sc.part_o, sc.part_m, sc.part_l,
                 sc.q, sc.kb, sc.vb, ly.kc, ly.ks, ly.vc, ly.vs,
-                BLOCK, p, lo, ring, HQ, HK, BLOCK, scale, s,
+                BLOCK, p, lo, ring, HQ, HK, BLOCK, scale, ly.v_q4, s,
             )?;
             b.gemv_multi_rows(&[seg(&ly.o, sc.att, sc.tmp)], BLOCK, s)?;
             b.add_rmsnorm_rows(sc.res, sc.xn, sc.tmp, ly.post_ln, BLOCK, D, EPS, s)?;
@@ -456,8 +460,8 @@ impl<B: ComputeBackend> Drafter<B> {
             if !ly.local {
                 v.push((ly.kc, HK * HD));
                 v.push((ly.ks, HK * 4));
-                v.push((ly.vc, HK * HD));
-                v.push((ly.vs, HK * 4));
+                v.push((ly.vc, HK * if ly.v_q4 { HD / 2 } else { HD }));
+                v.push((ly.vs, HK * if ly.v_q4 { 16 } else { 4 }));
             }
         }
         v

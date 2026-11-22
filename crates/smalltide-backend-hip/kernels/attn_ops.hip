@@ -241,7 +241,8 @@ extern "C" __global__ void smalltide_flash_decode_fp8_split(
     uint32_t num_splits,
     float inv_sqrt_d,
     uint32_t window,                     // local layers: attention window (<= max_seq ring size)
-    const uint32_t* __restrict__ page_table // nullable: paged KV pool (see kv_phys)
+    const uint32_t* __restrict__ page_table, // nullable: paged KV pool (see kv_phys)
+    uint32_t v_q4                        // 0 = FP8 V, 1 = Q4_asym32 V
 ) {
     uint32_t kvh = blockIdx.x;
     uint32_t split = blockIdx.y;
@@ -298,13 +299,19 @@ extern "C" __global__ void smalltide_flash_decode_fp8_split(
         float kw = decode_fp8_e4m3fn((k4 >> 24) & 0xFFu);
         float k_scale = ks_base[static_cast<size_t>(slot) * n_kv_heads] * inv_sqrt_d_log2;
 
-        // Read V[slot] ONCE from GDDR6 and decode 4 FP8 elements in registers
-        uint32_t v4 = reinterpret_cast<const uint32_t*>(v_base + static_cast<size_t>(slot) * kv_stride)[lane];
-        float v_scale = vs_base[static_cast<size_t>(slot) * n_kv_heads];
-        float vx = decode_fp8_e4m3fn(v4 & 0xFFu) * v_scale;
-        float vy = decode_fp8_e4m3fn((v4 >> 8) & 0xFFu) * v_scale;
-        float vz = decode_fp8_e4m3fn((v4 >> 16) & 0xFFu) * v_scale;
-        float vw = decode_fp8_e4m3fn((v4 >> 24) & 0xFFu) * v_scale;
+        // Read V[slot] ONCE from GDDR6 (FP8 or Q4_asym32)
+        float vx, vy, vz, vw;
+        if (v_q4 != 0u) {
+            float4 vv = kv_load_v_q4(v_cache, v_scales, static_cast<size_t>(slot) * n_kv_heads + kvh, lane);
+            vx = vv.x; vy = vv.y; vz = vv.z; vw = vv.w;
+        } else {
+            uint32_t v4 = reinterpret_cast<const uint32_t*>(v_base + static_cast<size_t>(slot) * kv_stride)[lane];
+            float v_scale = vs_base[static_cast<size_t>(slot) * n_kv_heads];
+            vx = decode_fp8_e4m3fn(v4 & 0xFFu) * v_scale;
+            vy = decode_fp8_e4m3fn((v4 >> 8) & 0xFFu) * v_scale;
+            vz = decode_fp8_e4m3fn((v4 >> 16) & 0xFFu) * v_scale;
+            vw = decode_fp8_e4m3fn((v4 >> 24) & 0xFFu) * v_scale;
+        }
 
         // Update Q head 0 (all scores in log2 domain -> single-cycle v_exp_f32!)
         {

@@ -123,6 +123,8 @@ pub struct Settings {
     /// Concurrent sequences served by `serve` (lane 0 has `max_ctx`, the others `lane_ctx`).
     pub lanes: usize,
     pub lane_ctx: usize,
+    /// Global KV format: false = FP8 K + FP8 V (`fp8`), true = FP8 K + Q4_asym32 V (`k8v4`).
+    pub kv_v_q4: bool,
 }
 
 impl Settings {
@@ -150,6 +152,11 @@ impl Settings {
             "token" => false,
             other => bad("SMALLTIDE_PREFILL", other, "batched | token"),
         };
+        let kv_v_q4 = match var("SMALLTIDE_KV_FMT").as_deref().unwrap_or("fp8") {
+            "fp8" | "k8v8" => false,
+            "k8v4" | "v4" => true,
+            other => bad("SMALLTIDE_KV_FMT", other, "fp8 | k8v4"),
+        };
         let model_dir = PathBuf::from(var("SMALLTIDE_MODEL_DIR").unwrap_or_else(|| "models/Inkling-2-Mini".into()));
         let priors_path = match var("SMALLTIDE_PRIORS").as_deref() {
             Some("off") | Some("0") => None,
@@ -159,6 +166,7 @@ impl Settings {
         Self {
             lanes: parse("SMALLTIDE_LANES", 4usize, "a lane count >= 1").max(1),
             lane_ctx: parse("SMALLTIDE_LANE_CTX", 8192usize, "a token count"),
+            kv_v_q4,
             priors_path,
             priors_update: parse::<u8>("SMALLTIDE_PRIORS_UPDATE", 1, "0 or 1") != 0,
             prior_weight: parse("SMALLTIDE_PRIOR_WEIGHT", 1.0f32, "a number >= 0"),
@@ -230,8 +238,9 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
         let path = dir.join("mtp.safetensors");
         let t = Instant::now();
         let d = smalltide_model_inkling2::drafter::Drafter::load(backend.clone(), &path, &dense_gpu, cfg.unpadded_vocab_size, s.max_ctx,
-            smalltide_model_inkling2::engine::PREFILL_CHUNK).expect("load drafter (mtp.safetensors)");
-        println!("[spec] DSpark drafter loaded ({:.0} MiB VRAM, {:.1}s)", d.vram_bytes as f64 / (1u64 << 20) as f64, t.elapsed().as_secs_f64());
+            smalltide_model_inkling2::engine::PREFILL_CHUNK, s.kv_v_q4).expect("load drafter (mtp.safetensors)");
+        println!("[spec] DSpark drafter loaded ({:.0} MiB VRAM, kv={}, {:.1}s)", d.vram_bytes as f64 / (1u64 << 20) as f64,
+            if s.kv_v_q4 { "k8v4" } else { "fp8" }, t.elapsed().as_secs_f64());
         Some(d)
     } else {
         None
@@ -241,8 +250,10 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     // Auto-size expert pools from free device memory after dense + KV + headroom.
     let nvfp4_slab = ExpertSlabLayout::for_inkling2(&cfg, DType::NVFP4).aligned_slab_bytes;
     let mxfp8_slab = ExpertSlabLayout::for_inkling2(&cfg, DType::MXFP8).aligned_slab_bytes;
-    let est_kv_bytes = 40 * (2 * 8 * cfg.local_window_size * 128 + 2 * 8 * cfg.local_window_size * 4)
-        + 8 * (2 * 8 * s.max_ctx * 128 + 2 * 8 * s.max_ctx * 4)
+    let global_head_bytes = if s.kv_v_q4 { (128 + 4) + (64 + 16) } else { 2 * (128 + 4) };
+    let global_per_pos = 8 * 8 * global_head_bytes;
+    let est_kv_bytes = 40 * (2 * 8 * cfg.local_window_size * 132)
+        + s.max_ctx * global_per_pos
         + 64 * 1024 * 1024;
     // Extra lanes: their own KV (local rings + global KV of `lane_ctx`), allocated before the pools.
     let extra_lanes = lanes.max(1) - 1;
@@ -254,12 +265,10 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     let kv_tokens = parse("SMALLTIDE_KV_TOKENS", s.max_ctx + extra_lanes * lane_ctx, "a token count");
     let kv_pool_pages = (std::env::var("SMALLTIDE_KV_PAGED").map_or(true, |v| v.trim() != "0"))
         .then(|| kv_tokens.div_ceil(page) + lanes.max(1));
-    let global_per_pos = 8 * (2 * 8 * 128 + 2 * 8 * 4);
     let est_kv_bytes = match kv_pool_pages {
         Some(p) => 40 * (2 * 8 * (cfg.local_window_size + 128) * 132) * lanes.max(1) + p * page * global_per_pos + 64 * 1024 * 1024,
         None => est_kv_bytes
-            + extra_lanes * (40 * (2 * 8 * (cfg.local_window_size + 128) * 128 + 2 * 8 * (cfg.local_window_size + 128) * 4)
-                + 8 * (2 * 8 * lane_ctx * 128 + 2 * 8 * lane_ctx * 4)),
+            + extra_lanes * (40 * (2 * 8 * (cfg.local_window_size + 128) * 132) + lane_ctx * global_per_pos),
     };
     let headroom_bytes = 900 * 1024 * 1024usize;
     let scratch_ring_bytes = 8 * (nvfp4_slab + mxfp8_slab);
@@ -355,19 +364,20 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
 
     // Engine buffers (activations, KV, prefill scratch) before the expert pools: on Windows the
     // driver backs allocations beyond the resident budget with system memory, in order.
-    let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, s.max_ctx, kv_pool_pages).expect("create Inkling2Engine");
+    let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, s.max_ctx, kv_pool_pages, s.kv_v_q4).expect("create Inkling2Engine");
     if let Some(d) = drafter {
         engine.attach_drafter(d).expect("attach drafter");
     }
     if extra_lanes > 0 {
         engine.add_lanes(extra_lanes, lane_ctx).expect("allocate lanes");
     }
+    let kv_fmt = if s.kv_v_q4 { "k8v4" } else { "fp8" };
     match engine.kv_pool_info() {
         Some((pages, _, per, bytes)) => {
-            println!("[kv] paged: {} concurrent sequences share {} pages x {} positions ({:.2} GiB, {} positions); any sequence up to {} ctx",
+            println!("[kv] paged ({kv_fmt}): {} concurrent sequences share {} pages x {} positions ({:.2} GiB, {} positions); any sequence up to {} ctx",
                 lanes.max(1), pages, per, (pages * bytes) as f64 / (1u64 << 30) as f64, pages * per, s.max_ctx);
         }
-        None if extra_lanes > 0 => println!("[lanes] {} concurrent sequences (lane 0: {} ctx, lanes 1..: {} ctx)", lanes, s.max_ctx, lane_ctx),
+        None if extra_lanes > 0 => println!("[lanes] ({kv_fmt}) {} concurrent sequences (lane 0: {} ctx, lanes 1..: {} ctx)", lanes, s.max_ctx, lane_ctx),
         None => {}
     }
     engine.preallocate_rows_buffers().expect("allocate rows buffers");

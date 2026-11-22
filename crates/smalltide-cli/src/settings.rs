@@ -109,6 +109,8 @@ pub struct Settings {
     pub priors_update: bool,
     pub prior_weight: f32,
     pub priors_newest_share: f32,
+    /// Load the DSpark drafter (`mtp.safetensors`) for speculative decoding (greedy requests).
+    pub spec: bool,
     /// Concurrent sequences served by `serve` (lane 0 has `max_ctx`, the others `lane_ctx`).
     pub lanes: usize,
     pub lane_ctx: usize,
@@ -152,6 +154,7 @@ impl Settings {
             priors_update: parse::<u8>("SMALLTIDE_PRIORS_UPDATE", 1, "0 or 1") != 0,
             prior_weight: parse("SMALLTIDE_PRIOR_WEIGHT", 1.0f32, "a number >= 0"),
             priors_newest_share: parse("SMALLTIDE_PRIORS_NEWEST", 0.1f32, "a number in [0, 0.5)"),
+            spec: parse::<u8>("SMALLTIDE_SPEC", 0, "0 or 1") != 0,
             model_dir,
             max_ctx: parse("SMALLTIDE_MAX_CTX", 16_384, "a token count"),
             rescue_policy,
@@ -189,6 +192,17 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     let pack = StidePackReader::open(&dir.join("experts.stide")).expect("open experts.stide");
     let backend = Arc::new(HipBackend::new_auto().expect("init HipBackend"));
     let dense_gpu = Inkling2DenseGpu::upload(backend.clone(), dense_host).expect("upload dense GPU");
+    // The drafter goes before the VRAM measurement so the pool budget accounts for it.
+    let drafter = if s.spec {
+        let path = dir.join("mtp.safetensors");
+        let t = Instant::now();
+        let d = smalltide_model_inkling2::drafter::Drafter::load(backend.clone(), &path, &dense_gpu, cfg.unpadded_vocab_size, s.max_ctx,
+            smalltide_model_inkling2::engine::PREFILL_CHUNK).expect("load drafter (mtp.safetensors)");
+        println!("[spec] DSpark drafter loaded ({:.0} MiB VRAM, {:.1}s)", d.vram_bytes as f64 / (1u64 << 20) as f64, t.elapsed().as_secs_f64());
+        Some(d)
+    } else {
+        None
+    };
     let info_after_dense = backend.device_info().expect("device_info");
 
     // Auto-size expert pools from free device memory after dense + KV + headroom.
@@ -290,11 +304,32 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     // Engine buffers (activations, KV, prefill scratch) before the expert pools: on Windows the
     // driver backs allocations beyond the resident budget with system memory, in order.
     let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, s.max_ctx).expect("create Inkling2Engine");
+    if let Some(d) = drafter {
+        engine.attach_drafter(d).expect("attach drafter");
+    }
     if extra_lanes > 0 {
         engine.add_lanes(extra_lanes, lane_ctx).expect("allocate lanes");
         println!("[lanes] {} concurrent sequences (lane 0: {} ctx, lanes 1..: {} ctx)", lanes, s.max_ctx, lane_ctx);
     }
+    engine.preallocate_rows_buffers().expect("allocate rows buffers");
+    // Re-measure now that every engine buffer exists (lanes, rows scratch, drafter): pools that
+    // would push the process past the resident budget make Windows demote *some* allocation
+    // (dense weights, KV, scratch) to system memory - shrink them before they are allocated.
+    if resident_fit && s.nvfp4_slots.is_none() && s.mxfp8_slots.is_none() {
+        if let Some((usage, resident)) = backend.resident_vram_info() {
+            let tail = std::env::var("SMALLTIDE_RESIDENT_TAIL_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(384) << 20;
+            let left = (resident as usize).saturating_sub(usage as usize + scratch_ring_bytes + tail);
+            let planned = nvfp4_slots * nvfp4_slab + mxfp8_slots * mxfp8_slab;
+            if planned > left {
+                let (n4, m8) = resident_split(left);
+                engine.tide.resize_pools(n4, m8).expect("shrink expert pools");
+                println!("[pools] re-measured after engine buffers: {:.2} GiB left -> slots nvfp4 {} -> {}, mxfp8 {} -> {}",
+                    left as f64 / (1u64 << 30) as f64, nvfp4_slots, n4, mxfp8_slots, m8);
+            }
+        }
+    }
     engine.tide.allocate_pools().expect("allocate expert pools");
+    backend.set_touch_on_alloc(false);
     // Measure instead of trusting the budget estimate: only the part of each pool that the OS
     // keeps in VRAM is used (Windows silently backs the excess with system memory).
     let (nvfp4_slots, mxfp8_slots) = if resident_fit || std::env::var_os("SMALLTIDE_POOL_CHECK").is_some() {

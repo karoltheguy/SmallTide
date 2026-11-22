@@ -1423,3 +1423,296 @@ extern "C" __global__ void smalltide_moe_group_rows2(
     }
     if (p >= s_nw) { work[p * 4u] = 0u; work[p * 4u + 1u] = 0u; work[p * 4u + 2u] = 0u; work[p * 4u + 3u] = 0u; }
 }
+
+// ===========================================================================
+// DSpark drafter (Inkling-2 mtp.safetensors) kernels.
+// ===========================================================================
+
+// out[r][d] = RMSNorm(sum_t a_t * taps[t][r][d]) * w[d]   (taps: [4][tap_stride][D])
+//   Grid: rows, Block: 1024 (D <= 3072)
+extern "C" __global__ void smalltide_dspark_mix_rms(
+    float* __restrict__ out, const float* __restrict__ taps, uint32_t tap_stride, float a0, float a1, float a2, float a3,
+    const float* __restrict__ w, uint32_t D, float eps
+) {
+    __shared__ float red[32];
+    uint32_t r = blockIdx.x, t = threadIdx.x;
+    float v[3];
+    float sq = 0.0f;
+    #pragma unroll
+    for (uint32_t e = 0u; e < 3u; ++e) {
+        uint32_t d = t + e * blockDim.x;
+        float m = 0.0f;
+        if (d < D) {
+            size_t base = static_cast<size_t>(r) * D + d, ts = static_cast<size_t>(tap_stride) * D;
+            m = taps[base] * a0 + taps[ts + base] * a1 + taps[2u * ts + base] * a2 + taps[3u * ts + base] * a3;
+        }
+        v[e] = m;
+        sq = fmaf(m, m, sq);
+    }
+    sq = wave32_sum(sq);
+    if ((t & 31u) == 0u) red[t >> 5] = sq;
+    __syncthreads();
+    if (t < 32u) {
+        float s = (t < (blockDim.x >> 5)) ? red[t] : 0.0f;
+        s = wave32_sum(s);
+        if (t == 0u) red[0] = s;
+    }
+    __syncthreads();
+    float inv = rsqrtf(red[0] / static_cast<float>(D) + eps);
+    #pragma unroll
+    for (uint32_t e = 0u; e < 3u; ++e) {
+        uint32_t d = t + e * blockDim.x;
+        if (d < D) out[static_cast<size_t>(r) * D + d] = v[e] * inv * w[d];
+    }
+}
+
+// Per-head RMSNorm (weight w[128]) + RoPE (neox halves, theta), in place: x[rows][nh][128] at
+// positions pos0 + row.   Grid: (nh, rows), Block: 64
+extern "C" __global__ void smalltide_dspark_head_norm_rope(
+    float* __restrict__ x, const float* __restrict__ w, uint32_t nh, uint32_t pos0, float log2_theta, float eps
+) {
+    __shared__ float red[2];
+    uint32_t h = blockIdx.x, r = blockIdx.y, i = threadIdx.x;
+    float* p = x + (static_cast<size_t>(r) * nh + h) * 128u;
+    float a = p[i], b = p[i + 64u];
+    float sq = wave32_sum(a * a + b * b);
+    if ((i & 31u) == 0u) red[i >> 5] = sq;
+    __syncthreads();
+    float inv = rsqrtf((red[0] + red[1]) / 128.0f + eps);
+    a = a * inv * w[i];
+    b = b * inv * w[i + 64u];
+    float inv_freq = exp2f(-log2_theta * (2.0f * static_cast<float>(i)) / 128.0f);
+    float ang = static_cast<float>(pos0 + r) * inv_freq;
+    float sn, cs;
+    sincosf(ang, &sn, &cs);
+    p[i] = a * cs - b * sn;
+    p[i + 64u] = b * cs + a * sn;
+}
+
+// Context K/V store (f16): rows of k / v [rows][dim] at positions pos0.. (ring: slot = pos % ring).
+//   Grid: rows, Block: 256
+extern "C" __global__ void smalltide_dspark_ctx_store(
+    _Float16* __restrict__ kc, _Float16* __restrict__ vc, const float* __restrict__ k, const float* __restrict__ v,
+    uint32_t pos0, uint32_t ring, uint32_t dim
+) {
+    uint32_t r = blockIdx.x;
+    uint32_t pos = pos0 + r;
+    uint32_t slot = (ring != 0u) ? (pos % ring) : pos;
+    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
+        kc[static_cast<size_t>(slot) * dim + d] = (_Float16)k[static_cast<size_t>(r) * dim + d];
+        vc[static_cast<size_t>(slot) * dim + d] = (_Float16)v[static_cast<size_t>(r) * dim + d];
+    }
+}
+
+// Drafter attention: query row r, head h over [context positions lo..P) | the nblk block rows
+// (non-causal). q [rows][nh*128], kb / vb [nblk][nkv*128], kc / vc f16 [slots][nkv*128].
+//   Grid: (nh, rows), Block: 256 (8 warps split the keys)
+extern "C" __global__ void smalltide_dspark_attn(
+    float* __restrict__ out, const float* __restrict__ q, const float* __restrict__ kb, const float* __restrict__ vb,
+    const _Float16* __restrict__ kc, const _Float16* __restrict__ vc, uint32_t P, uint32_t lo, uint32_t ring,
+    uint32_t nh, uint32_t nkv, uint32_t nblk, float scale
+) {
+    uint32_t h = blockIdx.x, r = blockIdx.y;
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t kvh = h / (nh / nkv);
+    uint32_t kvd = nkv * 128u;
+    float4 qv = reinterpret_cast<const float4*>(q + (static_cast<size_t>(r) * nh + h) * 128u)[lane];
+    uint32_t nctx = (P > lo) ? (P - lo) : 0u;
+    uint32_t total = nctx + nblk;
+    float m = -1e30f, l = 0.0f;
+    float4 o = make_float4(0, 0, 0, 0);
+    for (uint32_t j = warp; j < total; j += 8u) {
+        float4 kv4, vv4;
+        if (j < nctx) {
+            uint32_t pos = lo + j;
+            uint32_t slot = (ring != 0u) ? (pos % ring) : pos;
+            const _Float16* kp = kc + static_cast<size_t>(slot) * kvd + kvh * 128u + lane * 4u;
+            const _Float16* vp = vc + static_cast<size_t>(slot) * kvd + kvh * 128u + lane * 4u;
+            kv4 = make_float4((float)kp[0], (float)kp[1], (float)kp[2], (float)kp[3]);
+            vv4 = make_float4((float)vp[0], (float)vp[1], (float)vp[2], (float)vp[3]);
+        } else {
+            uint32_t br = j - nctx;
+            kv4 = reinterpret_cast<const float4*>(kb + static_cast<size_t>(br) * kvd + kvh * 128u)[lane];
+            vv4 = reinterpret_cast<const float4*>(vb + static_cast<size_t>(br) * kvd + kvh * 128u)[lane];
+        }
+        float sc = wave32_sum(qv.x * kv4.x + qv.y * kv4.y + qv.z * kv4.z + qv.w * kv4.w) * scale;
+        float mn = fmaxf(m, sc);
+        float al = __expf(m - mn), pr = __expf(sc - mn);
+        l = l * al + pr;
+        m = mn;
+        o.x = fmaf(vv4.x, pr, o.x * al); o.y = fmaf(vv4.y, pr, o.y * al);
+        o.z = fmaf(vv4.z, pr, o.z * al); o.w = fmaf(vv4.w, pr, o.w * al);
+    }
+    __shared__ float s_m[8], s_l[8];
+    __shared__ float4 s_o[8][32];
+    if (lane == 0u) { s_m[warp] = m; s_l[warp] = l; }
+    s_o[warp][lane] = o;
+    __syncthreads();
+    if (warp == 0u) {
+        float mb = -1e30f;
+        for (uint32_t w = 0u; w < 8u; ++w) if (s_l[w] > 0.0f) mb = fmaxf(mb, s_m[w]);
+        float lb = 0.0f;
+        float4 ob = make_float4(0, 0, 0, 0);
+        for (uint32_t w = 0u; w < 8u; ++w) {
+            if (s_l[w] > 0.0f) {
+                float f = __expf(s_m[w] - mb);
+                lb += s_l[w] * f;
+                float4 ow = s_o[w][lane];
+                ob.x = fmaf(ow.x, f, ob.x); ob.y = fmaf(ow.y, f, ob.y); ob.z = fmaf(ow.z, f, ob.z); ob.w = fmaf(ow.w, f, ob.w);
+            }
+        }
+        float inv = (lb > 0.0f) ? 1.0f / lb : 0.0f;
+        reinterpret_cast<float4*>(out + (static_cast<size_t>(r) * nh + h) * 128u)[lane] = make_float4(ob.x * inv, ob.y * inv, ob.z * inv, ob.w * inv);
+    }
+}
+
+// out[i] = silu(g[i]) * u[i].   Grid: ceil(n / 256), Block: 256
+extern "C" __global__ void smalltide_silu_mul(float* __restrict__ out, const float* __restrict__ g, const float* __restrict__ u, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float x = g[i];
+    out[i] = x / (1.0f + __expf(-x)) * u[i];
+}
+
+// Markov head input: z = [state(R) | w1[prev](R, bf16) | h(D) | f_rnn(D)]; prev = anchor at step 0,
+// else drafts[step - 1].   Grid: ceil((2R + 2D) / 256), Block: 256
+extern "C" __global__ void smalltide_dspark_z(
+    float* __restrict__ z, const float* __restrict__ state, const uint16_t* __restrict__ w1, const uint32_t* __restrict__ drafts,
+    uint32_t step, uint32_t anchor, const float* __restrict__ h, const float* __restrict__ frnn, uint32_t R, uint32_t D
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n = 2u * R + 2u * D;
+    if (i >= n) return;
+    float v;
+    if (i < R) {
+        v = state[i];
+    } else if (i < 2u * R) {
+        uint32_t prev = (step == 0u) ? anchor : drafts[step - 1u];
+        v = __uint_as_float(static_cast<uint32_t>(w1[static_cast<size_t>(prev) * R + (i - R)]) << 16);
+    } else if (i < 2u * R + D) {
+        v = h[i - 2u * R];
+    } else {
+        v = frnn[i - 2u * R - D];
+    }
+    z[i] = v;
+}
+
+// Markov cell: raw = rnn_proj(z) (no bias yet): gate / cand / out chunks of R.
+//   Grid: ceil(R / 256), Block: 256
+extern "C" __global__ void smalltide_dspark_cell(
+    float* __restrict__ state, float* __restrict__ latent, const float* __restrict__ raw, const float* __restrict__ bias, uint32_t R
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= R) return;
+    float g = raw[i] + bias[i], c = raw[R + i] + bias[R + i], o = raw[2u * R + i] + bias[2u * R + i];
+    float gate = 1.0f / (1.0f + __expf(-g));
+    latent[i] = tanhf(o);
+    state[i] = gate * state[i] + (1.0f - gate) * tanhf(c);
+}
+
+// Step logits y[v] = cap * tanh((base[v] + fold_b[v] + sum_r latent[r] fold[r][v]) / cap) for v < V,
+// block-wise argmax partials.   Grid: ceil(V / 256), Block: 256
+extern "C" __global__ void smalltide_dspark_logits_argmax(
+    float* __restrict__ pmax, uint32_t* __restrict__ pidx, const float* __restrict__ base, const float* __restrict__ fold_b,
+    const _Float16* __restrict__ fold, const float* __restrict__ latent, uint32_t V, uint32_t R, float cap
+) {
+    __shared__ float s_lat[256];
+    __shared__ float s_v[8];
+    __shared__ uint32_t s_i[8];
+    for (uint32_t i = threadIdx.x; i < R; i += blockDim.x) s_lat[i] = latent[i];
+    __syncthreads();
+    uint32_t v = blockIdx.x * blockDim.x + threadIdx.x;
+    float y = -INFINITY;
+    if (v < V) {
+        float acc = base[v] + fold_b[v];
+        for (uint32_t r = 0u; r < R; ++r) acc = fmaf(s_lat[r], (float)fold[static_cast<size_t>(r) * V + v], acc);
+        y = cap * tanhf(acc / cap);
+    }
+    uint32_t bi = (v < V) ? v : 0xFFFFFFFFu;
+    for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_xor(y, o, 32);
+        uint32_t oi = __shfl_xor(bi, o, 32);
+        if (ov > y || (ov == y && oi < bi)) { y = ov; bi = oi; }
+    }
+    uint32_t w = threadIdx.x >> 5;
+    if ((threadIdx.x & 31u) == 0u) { s_v[w] = y; s_i[w] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float bv = s_v[0];
+        uint32_t bb = s_i[0];
+        for (uint32_t k = 1u; k < (blockDim.x >> 5); ++k) if (s_v[k] > bv || (s_v[k] == bv && s_i[k] < bb)) { bv = s_v[k]; bb = s_i[k]; }
+        pmax[blockIdx.x] = bv;
+        pidx[blockIdx.x] = bb;
+    }
+}
+
+// drafts[step] = argmax over the partials.   Grid: 1, Block: 1024
+extern "C" __global__ void smalltide_dspark_argmax_final(
+    uint32_t* __restrict__ drafts, uint32_t step, const float* __restrict__ pmax, const uint32_t* __restrict__ pidx, uint32_t n
+) {
+    float bv = -INFINITY;
+    uint32_t bi = 0xFFFFFFFFu;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = pmax[i];
+        uint32_t ix = pidx[i];
+        if (v > bv || (v == bv && ix < bi)) { bv = v; bi = ix; }
+    }
+    __shared__ float sv[32];
+    __shared__ uint32_t si[32];
+    for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_xor(bv, o, 32);
+        uint32_t oi = __shfl_xor(bi, o, 32);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    uint32_t w = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    if (l == 0u) { sv[w] = bv; si[w] = bi; }
+    __syncthreads();
+    if (w == 0u) {
+        bv = (l < (blockDim.x >> 5)) ? sv[l] : -INFINITY;
+        bi = (l < (blockDim.x >> 5)) ? si[l] : 0xFFFFFFFFu;
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor(bv, o, 32);
+            uint32_t oi = __shfl_xor(bi, o, 32);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (l == 0u) drafts[step] = bi;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verify MoE epilogue for `rows` consecutive positions: per row the renormalized expert sum
+// (tmp [rows*8][H], skipped experts excluded), the MLP short conv run row by row (+ history
+// [3 + rows][H]) and the residual: cur[r] = ffn_inp[r] + sconv(sum_r).
+//   Grid: ceil(H / 256), Block: 256
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_moe_post_sconv_rows(
+    float* __restrict__ cur, const float* __restrict__ ffn_inp, const float* __restrict__ tmp,
+    const uint32_t* __restrict__ slot_table, const uint32_t* __restrict__ route, float* __restrict__ state,
+    const float* __restrict__ weight, float* __restrict__ hist, uint32_t hidden, uint32_t rows
+) {
+    uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= hidden) return;
+    float s0 = state[c], s1 = state[hidden + c], s2 = state[2u * hidden + c];
+    if (hist != nullptr) { hist[c] = s0; hist[hidden + c] = s1; hist[2u * hidden + c] = s2; }
+    const float4 w = reinterpret_cast<const float4*>(weight)[c];
+    for (uint32_t r = 0u; r < rows; ++r) {
+        const uint32_t* ids = route + r * 16u;
+        const float* wts = reinterpret_cast<const float*>(route + r * 16u + 8u);
+        float tot = 0.0f, ex = 0.0f;
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            tot += wts[k];
+            if (slot_table[ids[k]] != 0xFFFFFFFFu) ex += wts[k];
+        }
+        float renorm = (ex > 1e-8f) ? (tot / ex) : 0.0f;
+        float acc = 0.0f;
+        for (uint32_t k = 0u; k < 8u; ++k) {
+            if (slot_table[ids[k]] != 0xFFFFFFFFu) acc = fmaf(wts[k] * renorm, tmp[(static_cast<size_t>(r) * 8u + k) * hidden + c], acc);
+        }
+        if (hist != nullptr) hist[static_cast<size_t>(3u + r) * hidden + c] = acc;
+        float y = fmaf(s0, w.x, fmaf(s1, w.y, fmaf(s2, w.z, acc * w.w)));
+        y = (acc + y) * 0.4472135954999579f;
+        cur[static_cast<size_t>(r) * hidden + c] = ffn_inp[static_cast<size_t>(r) * hidden + c] + y;
+        s0 = s1; s1 = s2; s2 = acc;
+    }
+    state[c] = s0; state[hidden + c] = s1; state[2u * hidden + c] = s2;
+}

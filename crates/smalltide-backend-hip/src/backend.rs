@@ -63,6 +63,9 @@ pub struct HipBackend {
     stat_syncs: AtomicU64,
     kernel_timer: Mutex<Option<KernelTimer>>,
     seg_timer: Mutex<Option<SegTimer>>,
+    /// Zero (touch) every new device allocation so it is committed - and counted by the
+    /// residency query - right away (load phase; see `set_touch_on_alloc`).
+    touch_on_alloc: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     wddm: Option<crate::wddm::Adapter>,
 }
@@ -97,6 +100,12 @@ unsafe impl Send for HipBackend {}
 unsafe impl Sync for HipBackend {}
 
 impl HipBackend {
+    /// Whether new device allocations are zeroed (committed) immediately. On during model load
+    /// so residency measurements see every buffer; turn off once the engine is built.
+    pub fn set_touch_on_alloc(&self, on: bool) {
+        self.touch_on_alloc.store(on, Ordering::Relaxed);
+    }
+
     fn gemv_multi_impl(&self, segs: &[GemvSegment], rows: Option<u32>, stream: Stream) -> Result<()> {
         #[repr(C)]
         #[derive(Clone, Copy)]
@@ -222,6 +231,7 @@ impl HipBackend {
             stat_syncs: AtomicU64::new(0),
             kernel_timer: Mutex::new(None),
             seg_timer: Mutex::new(None),
+            touch_on_alloc: std::sync::atomic::AtomicBool::new(true),
             #[cfg(windows)]
             wddm: {
                 let a = crate::wddm::Adapter::open_amd();
@@ -320,7 +330,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, moe_w2_rows)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, attn_prep_rows, moe_post_sconv_rows, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, moe_w2_rows)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -572,7 +582,12 @@ impl ComputeBackend for HipBackend {
             .lock()
             .unwrap()
             .insert(id, DeviceAlloc { ptr, size_bytes, borrowed: false });
-        Ok(DeviceBuf { id, offset_bytes: 0, size_bytes })
+        let buf = DeviceBuf { id, offset_bytes: 0, size_bytes };
+        if size_bytes >= 4 && self.touch_on_alloc.load(Ordering::Relaxed) {
+            self.zero_f32(buf, size_bytes / 4, Stream(0))?;
+            unsafe { check_hip((self.rt.hip_stream_synchronize)(ptr::null_mut()), "hipStreamSynchronize(touch)")? };
+        }
+        Ok(buf)
     }
 
     fn free_device(&self, buf: DeviceBuf) -> Result<()> {
@@ -1833,6 +1848,84 @@ impl ComputeBackend for HipBackend {
         self.launch(self.kernels.moe_post_rows, (h.div_ceil(256), rows as u32, 1), 256, &mut args, stream, "launch(moe_post_rows)")
     }
 
+    fn dspark_mix_rms(&self, out: DeviceBuf, taps: DeviceBuf, tap_stride: usize, alpha: [f32; 4], w: DeviceBuf,
+        rows: usize, d: usize, eps: f32, stream: Stream) -> Result<()> {
+        let (mut o, mut t, mut ts, mut a0, mut a1, mut a2, mut a3, mut ww, mut dd, mut e) = (self.dev_ptr(out)?, self.dev_ptr(taps)?,
+            tap_stride as u32, alpha[0], alpha[1], alpha[2], alpha[3], self.dev_ptr(w)?, d as u32, eps);
+        let mut args = [p(&mut o), p(&mut t), p(&mut ts), p(&mut a0), p(&mut a1), p(&mut a2), p(&mut a3), p(&mut ww), p(&mut dd), p(&mut e)];
+        self.launch(self.kernels.dspark_mix_rms, (rows as u32, 1, 1), 1024, &mut args, stream, "launch(dspark_mix_rms)")
+    }
+
+    fn dspark_head_norm_rope(&self, x: DeviceBuf, w: DeviceBuf, nh: usize, rows: usize, pos0: usize, theta: f32,
+        eps: f32, stream: Stream) -> Result<()> {
+        let (mut xx, mut ww, mut n, mut p0, mut lt, mut e) = (self.dev_ptr(x)?, self.dev_ptr(w)?, nh as u32, pos0 as u32, theta.log2(), eps);
+        let mut args = [p(&mut xx), p(&mut ww), p(&mut n), p(&mut p0), p(&mut lt), p(&mut e)];
+        self.launch(self.kernels.dspark_head_norm_rope, (nh as u32, rows as u32, 1), 64, &mut args, stream, "launch(dspark_head_norm_rope)")
+    }
+
+    fn dspark_ctx_store(&self, kc: DeviceBuf, vc: DeviceBuf, k: DeviceBuf, v: DeviceBuf, pos0: usize, rows: usize,
+        ring: usize, dim: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c, mut d, mut p0, mut rg, mut dm) = (self.dev_ptr(kc)?, self.dev_ptr(vc)?, self.dev_ptr(k)?,
+            self.dev_ptr(v)?, pos0 as u32, ring as u32, dim as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut p0), p(&mut rg), p(&mut dm)];
+        self.launch(self.kernels.dspark_ctx_store, (rows as u32, 1, 1), 256, &mut args, stream, "launch(dspark_ctx_store)")
+    }
+
+    fn dspark_attn(&self, out: DeviceBuf, q: DeviceBuf, kb: DeviceBuf, vb: DeviceBuf, kc: DeviceBuf, vc: DeviceBuf,
+        rows: usize, pp: usize, lo: usize, ring: usize, nh: usize, nkv: usize, nblk: usize, scale: f32,
+        stream: Stream) -> Result<()> {
+        let (mut o, mut qq, mut a, mut b, mut c, mut d) = (self.dev_ptr(out)?, self.dev_ptr(q)?, self.dev_ptr(kb)?, self.dev_ptr(vb)?,
+            self.dev_ptr(kc)?, self.dev_ptr(vc)?);
+        let (mut pv, mut lv, mut rg, mut n1, mut n2, mut nb, mut sc) = (pp as u32, lo as u32, ring as u32, nh as u32, nkv as u32, nblk as u32, scale);
+        let mut args = [p(&mut o), p(&mut qq), p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut pv), p(&mut lv), p(&mut rg),
+            p(&mut n1), p(&mut n2), p(&mut nb), p(&mut sc)];
+        self.launch(self.kernels.dspark_attn, (nh as u32, rows as u32, 1), 256, &mut args, stream, "launch(dspark_attn)")
+    }
+
+    fn moe_post_sconv_rows(&self, cur: DeviceBuf, ffn_inp: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, route: DeviceBuf,
+        state: DeviceBuf, weight: DeviceBuf, hist: Option<DeviceBuf>, hidden: usize, rows: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c, mut d, mut e) = (self.dev_ptr(cur)?, self.dev_ptr(ffn_inp)?, self.dev_ptr(tmp)?, self.dev_ptr(slot_table)?, self.dev_ptr(route)?);
+        let (mut f, mut g, mut hh) = (self.dev_ptr(state)?, self.dev_ptr(weight)?, self.opt_dev_ptr(hist)?);
+        let (mut hd, mut r) = (hidden as u32, rows as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut g), p(&mut hh), p(&mut hd), p(&mut r)];
+        self.launch(self.kernels.moe_post_sconv_rows, (hd.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(moe_post_sconv_rows)")
+    }
+
+    fn f32_to_f16(&self, out: DeviceBuf, x: DeviceBuf, n: usize, stream: Stream) -> Result<()> {
+        let (mut xo, mut xi, mut nn) = (self.dev_ptr(out)?, self.dev_ptr(x)?, n as u32);
+        let mut args = [p(&mut xo), p(&mut xi), p(&mut nn)];
+        self.launch(self.kernels.f32_to_f16, (nn.div_ceil(1024), 1, 1), 256, &mut args, stream, "launch(f32_to_f16)")
+    }
+
+    fn silu_mul(&self, out: DeviceBuf, g: DeviceBuf, u: DeviceBuf, n: usize, stream: Stream) -> Result<()> {
+        let (mut o, mut gg, mut uu, mut nn) = (self.dev_ptr(out)?, self.dev_ptr(g)?, self.dev_ptr(u)?, n as u32);
+        let mut args = [p(&mut o), p(&mut gg), p(&mut uu), p(&mut nn)];
+        self.launch(self.kernels.silu_mul, (nn.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(silu_mul)")
+    }
+
+    fn dspark_markov_step(&self, z: DeviceBuf, raw: DeviceBuf, state: DeviceBuf, latent: DeviceBuf, w1: DeviceBuf,
+        drafts: DeviceBuf, step: usize, anchor: u32, h: DeviceBuf, frnn: DeviceBuf, rnn_w: DeviceBuf, rnn_b: DeviceBuf,
+        base: DeviceBuf, fold_b: DeviceBuf, fold16: DeviceBuf, pmax: DeviceBuf, pidx: DeviceBuf, r: usize, d: usize,
+        v: usize, cap: f32, stream: Stream) -> Result<()> {
+        let (mut zz, mut st, mut w1p, mut dr, mut sp, mut an, mut hh, mut fr, mut rr, mut dd) = (self.dev_ptr(z)?, self.dev_ptr(state)?,
+            self.dev_ptr(w1)?, self.dev_ptr(drafts)?, step as u32, anchor, self.dev_ptr(h)?, self.dev_ptr(frnn)?, r as u32, d as u32);
+        let nz = (2 * r + 2 * d) as u32;
+        let mut args = [p(&mut zz), p(&mut st), p(&mut w1p), p(&mut dr), p(&mut sp), p(&mut an), p(&mut hh), p(&mut fr), p(&mut rr), p(&mut dd)];
+        self.launch(self.kernels.dspark_z, (nz.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(dspark_z)")?;
+        self.gemv_f32(raw, z, rnn_w, 3 * r, 2 * r + 2 * d, stream)?;
+        let (mut st2, mut la, mut rw, mut rb, mut r2) = (self.dev_ptr(state)?, self.dev_ptr(latent)?, self.dev_ptr(raw)?, self.dev_ptr(rnn_b)?, r as u32);
+        let mut args = [p(&mut st2), p(&mut la), p(&mut rw), p(&mut rb), p(&mut r2)];
+        self.launch(self.kernels.dspark_cell, ((r as u32).div_ceil(256), 1, 1), 256, &mut args, stream, "launch(dspark_cell)")?;
+        let nparts = (v as u32).div_ceil(256);
+        let (mut pm, mut pi, mut bs, mut fb, mut f16p, mut la2, mut vv, mut r3, mut cp) = (self.dev_ptr(pmax)?, self.dev_ptr(pidx)?,
+            self.dev_ptr(base)?, self.dev_ptr(fold_b)?, self.dev_ptr(fold16)?, self.dev_ptr(latent)?, v as u32, r as u32, cap);
+        let mut args = [p(&mut pm), p(&mut pi), p(&mut bs), p(&mut fb), p(&mut f16p), p(&mut la2), p(&mut vv), p(&mut r3), p(&mut cp)];
+        self.launch(self.kernels.dspark_logits_argmax, (nparts, 1, 1), 256, &mut args, stream, "launch(dspark_logits_argmax)")?;
+        let (mut dr2, mut sp2, mut pm2, mut pi2, mut np) = (self.dev_ptr(drafts)?, step as u32, self.dev_ptr(pmax)?, self.dev_ptr(pidx)?, nparts);
+        let mut args = [p(&mut dr2), p(&mut sp2), p(&mut pm2), p(&mut pi2), p(&mut np)];
+        self.launch(self.kernels.dspark_argmax_final, (1, 1, 1), 1024, &mut args, stream, "launch(dspark_argmax_final)")
+    }
+
     fn device_address(&self, buf: DeviceBuf) -> Result<u64> {
         Ok(self.dev_ptr(buf)? as u64)
     }
@@ -2071,6 +2164,95 @@ impl ComputeBackend for HipBackend {
         let blocks = (pp.n_kv_heads + 2 * pp.n_q_heads) as u32;
         let mut args = [p(&mut a)];
         self.launch(self.kernels.attn_prep_decode, (blocks, 1, 1), 128, &mut args, stream, "launch(attn_prep_decode)")
+    }
+
+    fn attn_prep_rows(&self, pp: AttnPrepParams, hist: Option<(DeviceBuf, DeviceBuf)>, pos0: usize, is_local: bool,
+        rows: usize, tau: Option<(f32, f32)>, stream: Stream) -> Result<()> {
+        #[repr(C)]
+        struct ExtC {
+            hist_k: *mut c_void,
+            hist_v: *mut c_void,
+            pos0: u32,
+            is_local: u32,
+            rows: u32,
+            tau_alpha: f32,
+            tau_floor: f32,
+        }
+        #[repr(C)]
+        struct ArgsC {
+            q: *mut c_void,
+            r: *mut c_void,
+            k_raw: *mut c_void,
+            v_raw: *mut c_void,
+            k_dyn: *mut c_void,
+            v_dyn: *mut c_void,
+            sconv_k: *mut c_void,
+            sconv_v: *mut c_void,
+            k_w: *mut c_void,
+            v_w: *mut c_void,
+            q_scale: *mut c_void,
+            r_scale: *mut c_void,
+            rel_proj: *mut c_void,
+            rel_table: *mut c_void,
+            k_cache: *mut c_void,
+            k_scales: *mut c_void,
+            v_cache: *mut c_void,
+            v_scales: *mut c_void,
+            n_q: u32,
+            n_kv: u32,
+            max_seq: u32,
+            slot: u32,
+            rel_extent: u32,
+            qk_thr: f32,
+            rel_thr: f32,
+            tau: f32,
+            eps: f32,
+        }
+        if pp.n_q_heads == 0 || pp.n_kv_heads == 0 {
+            return Err(SmallTideError::Backend { backend: "hip", message: "attn_prep_decode: bad head counts".into() });
+        }
+        let mut a = ArgsC {
+            q: self.dev_ptr(pp.q)?,
+            r: self.dev_ptr(pp.r)?,
+            k_raw: self.dev_ptr(pp.k_raw)?,
+            v_raw: self.dev_ptr(pp.v_raw)?,
+            k_dyn: self.opt_dev_ptr(pp.k_dyn)?,
+            v_dyn: self.opt_dev_ptr(pp.v_dyn)?,
+            sconv_k: self.dev_ptr(pp.sconv_k)?,
+            sconv_v: self.dev_ptr(pp.sconv_v)?,
+            k_w: self.dev_ptr(pp.k_w)?,
+            v_w: self.dev_ptr(pp.v_w)?,
+            q_scale: self.dev_ptr(pp.q_scale)?,
+            r_scale: self.dev_ptr(pp.r_scale)?,
+            rel_proj: self.dev_ptr(pp.rel_proj)?,
+            rel_table: self.dev_ptr(pp.rel_table)?,
+            k_cache: self.dev_ptr(pp.k_cache)?,
+            k_scales: self.dev_ptr(pp.k_scales)?,
+            v_cache: self.dev_ptr(pp.v_cache)?,
+            v_scales: self.dev_ptr(pp.v_scales)?,
+            n_q: pp.n_q_heads as u32,
+            n_kv: pp.n_kv_heads as u32,
+            max_seq: pp.max_seq as u32,
+            slot: pp.slot as u32,
+            rel_extent: pp.rel_extent as u32,
+            qk_thr: pp.qk_threshold,
+            rel_thr: pp.rel_threshold,
+            tau: pp.tau,
+            eps: pp.eps,
+        };
+        let (ta, tf) = tau.unwrap_or((0.0, 1.0));
+        let mut e = ExtC {
+            hist_k: match hist { Some((k, _)) => self.dev_ptr(k)?, None => std::ptr::null_mut() },
+            hist_v: match hist { Some((_, v)) => self.dev_ptr(v)?, None => std::ptr::null_mut() },
+            pos0: pos0 as u32,
+            is_local: is_local as u32,
+            rows: rows as u32,
+            tau_alpha: ta,
+            tau_floor: tf,
+        };
+        let blocks = (pp.n_kv_heads + 2 * pp.n_q_heads * rows) as u32;
+        let mut args = [p(&mut a), p(&mut e)];
+        self.launch(self.kernels.attn_prep_rows, (blocks, 1, 1), 128, &mut args, stream, "launch(attn_prep_rows)")
     }
 
     fn fused_mix_decode(&self, pp: FusedMixParams, stream: Stream) -> Result<()> {

@@ -606,6 +606,42 @@ pub trait ComputeBackend: Send + Sync {
     fn moe_post_rows(&self, out: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, route: DeviceBuf,
         rows: usize, hidden: usize, stream: Stream) -> Result<()>;
 
+    /// Verify MoE epilogue: per row renormalized expert sum, MLP short conv row by row (+ history),
+    /// residual `cur = ffn_inp + conv(sum)`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_post_sconv_rows(&self, cur: DeviceBuf, ffn_inp: DeviceBuf, tmp: DeviceBuf, slot_table: DeviceBuf, route: DeviceBuf,
+        state: DeviceBuf, weight: DeviceBuf, hist: Option<DeviceBuf>, hidden: usize, rows: usize, stream: Stream) -> Result<()>;
+
+    /// `out` (f16) = `x` (f32) over `n` elements.
+    fn f32_to_f16(&self, out: DeviceBuf, x: DeviceBuf, n: usize, stream: Stream) -> Result<()>;
+
+    // ---- DSpark drafter ----
+    /// `out[r] = RMSNorm(sum_t alpha[t] * taps[t][r]) * w` over `rows`; taps `[4][tap_stride][d]`.
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_mix_rms(&self, out: DeviceBuf, taps: DeviceBuf, tap_stride: usize, alpha: [f32; 4], w: DeviceBuf,
+        rows: usize, d: usize, eps: f32, stream: Stream) -> Result<()>;
+    /// Per-head RMSNorm (w `[128]`) + neox RoPE at positions `pos0 + row`, in place on `[rows][nh][128]`.
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_head_norm_rope(&self, x: DeviceBuf, w: DeviceBuf, nh: usize, rows: usize, pos0: usize, theta: f32,
+        eps: f32, stream: Stream) -> Result<()>;
+    /// f16 context K/V store of `rows` rows at positions `pos0..` (`ring` = 0: linear).
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_ctx_store(&self, kc: DeviceBuf, vc: DeviceBuf, k: DeviceBuf, v: DeviceBuf, pos0: usize, rows: usize,
+        ring: usize, dim: usize, stream: Stream) -> Result<()>;
+    /// Drafter attention of `rows` query rows over context `[lo, p)` plus `nblk` block keys.
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_attn(&self, out: DeviceBuf, q: DeviceBuf, kb: DeviceBuf, vb: DeviceBuf, kc: DeviceBuf, vc: DeviceBuf,
+        rows: usize, p: usize, lo: usize, ring: usize, nh: usize, nkv: usize, nblk: usize, scale: f32,
+        stream: Stream) -> Result<()>;
+    /// `out = silu(g) * u` over `n` elements.
+    fn silu_mul(&self, out: DeviceBuf, g: DeviceBuf, u: DeviceBuf, n: usize, stream: Stream) -> Result<()>;
+    /// One Markov-head step: z assembly, rnn GEMV, cell, folded logits + argmax into `drafts[step]`.
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_markov_step(&self, z: DeviceBuf, raw: DeviceBuf, state: DeviceBuf, latent: DeviceBuf, w1: DeviceBuf,
+        drafts: DeviceBuf, step: usize, anchor: u32, h: DeviceBuf, frnn: DeviceBuf, rnn_w: DeviceBuf, rnn_b: DeviceBuf,
+        base: DeviceBuf, fold_b: DeviceBuf, fold16: DeviceBuf, pmax: DeviceBuf, pidx: DeviceBuf, r: usize, d: usize,
+        v: usize, cap: f32, stream: Stream) -> Result<()>;
+
     /// Device address of `buf` (for pointer tables consumed by kernels).
     fn device_address(&self, buf: DeviceBuf) -> Result<u64>;
 
@@ -669,6 +705,13 @@ pub trait ComputeBackend: Send + Sync {
     /// One decode token's attention prep: K/V short convs (+dynamic taps), K L2 clip, V unit
     /// RMS norm, FP8 KV store at `slot`, Q/R scaled L2 clip (+tau) and the relative-bias table.
     fn attn_prep_decode(&self, p: AttnPrepParams, stream: Stream) -> Result<()>;
+
+    /// `attn_prep_decode` over `rows` consecutive positions `pos0..` of one sequence (short convs
+    /// row by row; `hist` = (k, v) verify histories `[3 + rows][dim]`; `tau` = (alpha, floor) for
+    /// global layers; `p.slot` / `p.tau` unused).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_prep_rows(&self, p: AttnPrepParams, hist: Option<(DeviceBuf, DeviceBuf)>, pos0: usize, is_local: bool,
+        rows: usize, tau: Option<(f32, f32)>, stream: Stream) -> Result<()>;
 
     /// One-workgroup decode fusion of: attention-output short conv + residual / block boundary,
     /// copy of the residual, attention-residual mix with up to 3 queries, per-query RMSNorm.

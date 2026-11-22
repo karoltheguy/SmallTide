@@ -737,3 +737,96 @@ extern "C" __global__ void smalltide_gemv_multi_rows(GemvMultiArgs a, uint32_t m
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Attention prep for `rows` consecutive positions of one sequence (speculative verify): the
+// decode fusion with the K/V short convs run row by row (+ verify histories), FP8 KV store at
+// positions pos0.., Q/R clips with each row's own tau, relative-bias tables.
+//   Grid: n_kv + 2 * n_q * rows, Block: 128
+// ---------------------------------------------------------------------------
+struct AttnPrepRowsExt {
+    float* hist_k; // nullable [3 + rows][n_kv*128]
+    float* hist_v;
+    uint32_t pos0;
+    uint32_t is_local;
+    uint32_t rows;
+    float tau_alpha;
+    float tau_floor;
+};
+
+__device__ __forceinline__ float prep_tau(const AttnPrepRowsExt& e, uint32_t row) {
+    if (e.tau_alpha == 0.0f) return 1.0f;
+    float p = static_cast<float>(e.pos0 + row) + 1.0f;
+    return 1.0f + e.tau_alpha * logf(fmaxf(p / e.tau_floor, 1.0f));
+}
+
+extern "C" __global__ void smalltide_attn_prep_rows(AttnPrepArgs a, AttnPrepRowsExt e) {
+    __shared__ float sh[4];
+    uint32_t b = blockIdx.x, t = threadIdx.x;
+    if (b < a.n_kv) {
+        uint32_t h = b, dim = a.n_kv * 128u, c = h * 128u + t;
+        if (e.hist_k != nullptr) {
+            #pragma unroll
+            for (uint32_t j = 0u; j < 3u; ++j) {
+                e.hist_k[j * dim + c] = a.sconv_k[j * dim + c];
+                e.hist_v[j * dim + c] = a.sconv_v[j * dim + c];
+            }
+        }
+        for (uint32_t r = 0u; r < e.rows; ++r) {
+            float kr = a.k_raw[static_cast<size_t>(r) * dim + c], vr = a.v_raw[static_cast<size_t>(r) * dim + c];
+            if (e.hist_k != nullptr) {
+                e.hist_k[static_cast<size_t>(3u + r) * dim + c] = kr;
+                e.hist_v[static_cast<size_t>(3u + r) * dim + c] = vr;
+            }
+            const float* kd = (a.k_dyn != nullptr) ? a.k_dyn + static_cast<size_t>(r) * a.n_kv * 4u : nullptr;
+            const float* vd = (a.v_dyn != nullptr) ? a.v_dyn + static_cast<size_t>(r) * a.n_kv * 4u : nullptr;
+            float k = sconv_step(a.sconv_k, a.k_w, kd, c, dim, kr, h);
+            float v = sconv_step(a.sconv_v, a.v_w, vd, c, dim, vr, h);
+            float kn = sqrtf(block128_sum(k * k, sh)) + 1e-6f;
+            k *= fminf(a.qk_thr / kn, 1.0f);
+            float vs = block128_sum(v * v, sh);
+            v *= rsqrtf(vs / 128.0f + a.eps);
+            float km = block128_max(fabsf(k), sh);
+            float vm = block128_max(fabsf(v), sh);
+            float ks = (km > 0.0f) ? km / 448.0f : 1.0f;
+            float vsc = (vm > 0.0f) ? vm / 448.0f : 1.0f;
+            uint32_t pos = e.pos0 + r;
+            uint32_t slot = (e.is_local != 0u) ? (pos % a.max_seq) : pos;
+            size_t si = static_cast<size_t>(h) * a.max_seq + slot;
+            if (t == 0u) { a.k_scales[si] = ks; a.v_scales[si] = vsc; }
+            a.k_cache[si * 128u + t] = encode_fp8_e4m3fn(k / ks);
+            a.v_cache[si * 128u + t] = encode_fp8_e4m3fn(v / vsc);
+        }
+        return;
+    }
+    b -= a.n_kv;
+    uint32_t nqr = a.n_q * e.rows;
+    if (b < nqr) {
+        uint32_t row = b / a.n_q, head = b % a.n_q;
+        float* p = a.q + static_cast<size_t>(b) * 128u;
+        float x = p[t] * a.q_scale[head * 128u + t];
+        float n = sqrtf(block128_sum(x * x, sh)) + 1e-6f;
+        p[t] = x * (fminf(a.qk_thr / n, 1.0f) * prep_tau(e, row));
+        return;
+    }
+    b -= nqr;
+    if (b < nqr) {
+        uint32_t row = b / a.n_q, head = b % a.n_q;
+        __shared__ float rr[16];
+        float x = (t < 16u) ? a.r[static_cast<size_t>(b) * 16u + t] * a.r_scale[head * 16u + t] : 0.0f;
+        float n = sqrtf(block128_sum(x * x, sh)) + 1e-6f;
+        float y = x * (fminf(a.rel_thr / n, 1.0f) * prep_tau(e, row));
+        if (t < 16u) { a.r[static_cast<size_t>(b) * 16u + t] = y; rr[t] = y; }
+        __syncthreads();
+        for (uint32_t d = t; d < a.rel_extent; d += 128u) {
+            const float4* pr = reinterpret_cast<const float4*>(a.rel_proj + static_cast<size_t>(d) * 16u);
+            float acc = 0.0f;
+            #pragma unroll
+            for (uint32_t i = 0u; i < 4u; ++i) {
+                float4 pv = pr[i];
+                acc = fmaf(pv.x, rr[4u * i], fmaf(pv.y, rr[4u * i + 1u], fmaf(pv.z, rr[4u * i + 2u], fmaf(pv.w, rr[4u * i + 3u], acc))));
+            }
+            a.rel_table[static_cast<size_t>(b) * a.rel_extent + d] = acc;
+        }
+    }
+}

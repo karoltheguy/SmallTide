@@ -205,6 +205,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 }
             }
             self.rows_forward(&tokens[off..off + m], RowsMode::Prefill { pos0: pos0 + off }, need_logits && last)?;
+            if self.capture_taps {
+                self.drafter_ingest(pos0 + off, m)?;
+            }
             off += m;
         }
         Ok(())
@@ -250,7 +253,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.backend.rms_norm(cur, embed, self.dense.embed_norm, m, h, eps, s)?;
 
         let n_log = self.layer_states.len();
-        let dumping = self.dump.is_some() && !decode;
+        let dumping = self.dump.is_some() && !matches!(mode, RowsMode::Decode { .. });
         let mut dump_hidden = dumping.then(|| vec![0f32; n_log * m * h]);
         let mut dump_routes = dumping.then(|| vec![0u32; n_log * m * 8]);
 
@@ -279,7 +282,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                         dh[(il * m + r) * h + i] = f32::from_le_bytes([hb[o], hb[o + 1], hb[o + 2], hb[o + 3]]);
                     }
                     for k in 0..8 {
-                        dr[(il * m + r) * 8 + k] = routes[r * 8 + k];
+                        dr[(il * m + r) * 8 + k] = routes.get(r * 8 + k).copied().unwrap_or(0);
                     }
                 }
             }
@@ -344,6 +347,18 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.backend.gemm_fp8_rows_decode(logits, moe_norm, self.dense.unembed_fp8.data, self.dense.unembed_fp8.row_scales, m, vocab, h, s)?;
             if self.cfg.final_logit_softcapping > 0.0 {
                 self.backend.final_logit_softcap(logits, m * vocab, self.cfg.final_logit_softcapping, s)?;
+            }
+            if let (Some(dh), Some(dr)) = (dump_hidden, dump_routes) {
+                for r in 0..m {
+                    self.write_dump_final(pos0 + r, moe_norm.slice(r * h * 4, h * 4))?;
+                    let d = self.dump.as_mut().unwrap();
+                    for il in 0..n_log {
+                        d.hidden[il * h..(il + 1) * h].copy_from_slice(&dh[(il * m + r) * h..(il * m + r + 1) * h]);
+                        d.routes[il * 8..(il + 1) * 8].copy_from_slice(&dr[(il * m + r) * 8..(il * m + r + 1) * 8]);
+                    }
+                    self.dump_token = (tokens[r], pos0 + r);
+                    self.write_dump(false)?;
+                }
             }
             return Ok(());
         }
@@ -582,6 +597,49 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.mm_rows(pf.r, nq, &layer.wr, m, s)?;
         }
         let st = &self.layer_states[il];
+        // Speculative verify: one fused launch for the K/V convs (+histories), clips, value norm,
+        // relative tables and the KV store.
+        let prepped = verify && fused_proj && std::env::var_os("SMALLTIDE_VERIFY_UNFUSED").is_none();
+        if prepped {
+            let tau = (!is_local).then_some((cfg.log_scaling_alpha, cfg.log_scaling_n_floor as f32));
+            b.attn_prep_rows(
+                smalltide_core::backend::AttnPrepParams {
+                    q: pf.q,
+                    r: pf.r,
+                    k_raw: pf.k_raw,
+                    v_raw: pf.v_raw,
+                    k_dyn: layer.k_sconv_dyn_proj.map(|_| pf.k_dyn),
+                    v_dyn: layer.v_sconv_dyn_proj.map(|_| pf.v_dyn),
+                    sconv_k: st.sconv_k,
+                    sconv_v: st.sconv_v,
+                    k_w: layer.k_sconv_static,
+                    v_w: layer.v_sconv_static,
+                    q_scale: layer.q_l2_clip_scale,
+                    r_scale: layer.rel_l2_clip_scale,
+                    rel_proj: layer.rel_logits_proj,
+                    rel_table: pf.rel_table,
+                    k_cache: st.k_cache,
+                    k_scales: st.k_scales,
+                    v_cache: st.v_cache,
+                    v_scales: st.v_scales,
+                    n_q_heads: nqh,
+                    n_kv_heads: nkv,
+                    max_seq: st.max_seq,
+                    slot: 0,
+                    rel_extent: cfg.rel_extent,
+                    qk_threshold: cfg.qk_l2_clip_threshold,
+                    rel_threshold: cfg.rel_l2_clip_threshold,
+                    tau: 1.0,
+                    eps,
+                },
+                hist(0).zip(hist(1)),
+                pos0,
+                is_local,
+                m,
+                tau,
+                s,
+            )?;
+        }
         let k_dyn = match layer.k_sconv_dyn_proj {
             Some(w) => {
                 if !fused_proj {
@@ -592,6 +650,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             None => None,
         };
         match lanes {
+            None if prepped => {}
             None => b.sconv_k4_rows_hist(pf.k, st.sconv_k, pf.k_raw, layer.k_sconv_static, k_dyn, kv_dim, hd, m, taps, hist(0), s)?,
             Some(rows) => {
                 for (r, &(lane, _)) in rows.iter().enumerate() {
@@ -611,6 +670,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             None => None,
         };
         match lanes {
+            None if prepped => {}
             None => b.sconv_k4_rows_hist(pf.v, st.sconv_v, pf.v_raw, layer.v_sconv_static, v_dyn, kv_dim, hd, m, taps, hist(1), s)?,
             Some(rows) => {
                 for (r, &(lane, _)) in rows.iter().enumerate() {
@@ -631,22 +691,29 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                         cfg.rel_l2_clip_threshold, tau_at(p), s)?;
                 }
             }
+            _ if prepped => {}
             _ => {
                 b.head_l2_clip_rows(pf.q, Some(layer.q_l2_clip_scale), m * nqh, hd, nqh, cfg.qk_l2_clip_threshold, tau_at(pos0), s)?;
                 b.head_l2_clip_rows(pf.r, Some(layer.rel_l2_clip_scale), m * nqh, cfg.d_rel, nqh, cfg.rel_l2_clip_threshold, tau_at(pos0), s)?;
             }
         }
-        b.head_l2_clip_rows(pf.k, None, m * nkv, hd, nkv, cfg.qk_l2_clip_threshold, None, s)?;
-        b.value_norm_no_gamma(pf.v, m * nkv, hd, eps, s)?;
+        if !prepped {
+            b.head_l2_clip_rows(pf.k, None, m * nkv, hd, nkv, cfg.qk_l2_clip_threshold, None, s)?;
+            b.value_norm_no_gamma(pf.v, m * nkv, hd, eps, s)?;
+        }
         // 6. sinks, relative bias, KV store, attention
         b.seg_mark("pf: sinks,rel,kv,attention", s);
         if !fused_proj {
             b.gemm_f32_rows(pf.sinks, nq, layer.attn_sink, m, nqh, h, s)?;
         }
-        b.rel_table(pf.rel_table, pf.r, layer.rel_logits_proj, m * nqh, cfg.rel_extent, s)?;
+        if !prepped {
+            b.rel_table(pf.rel_table, pf.r, layer.rel_logits_proj, m * nqh, cfg.rel_extent, s)?;
+        }
         match lanes {
             None => {
-                b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, s)?;
+                if !prepped {
+                    b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, s)?;
+                }
                 b.attn_prefill_fp8(
                     pf.attn_out, pf.q, st.k_cache, st.k_scales, st.v_cache, st.v_scales,
                     Some(pf.rel_table), Some(pf.sinks),
@@ -813,6 +880,14 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             b.moe_rows_grouped(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pf.moe_out, pf.route, slot_table, pool, pf.desc, m, params, s)?;
             let log = self.batch_route_log.expect("batch route log");
             b.vec_copy(log.slice(il * crate::engine::MAX_BATCH_ROWS * 64, m * 64), pf.route.slice(0, m * 64), m * 16, s)?;
+            if std::env::var_os("SMALLTIDE_VERIFY_UNFUSED").is_none() {
+                // Fused epilogue: weighted sum + MLP conv (+history) + residual; done here.
+                let st = &self.layer_states[il];
+                let layer = &self.dense.layers[ip];
+                b.moe_post_sconv_rows(pf.cur, pf.ffn_inp, pf.moe_tmp, slot_table, pf.route, st.sconv_mlp, layer.mlp_sconv, hist(3), h, m, s)?;
+                b.seg_mark("pf: moe post", s);
+                return Ok(Vec::new());
+            }
             b.moe_post_rows(pf.moe_out, pf.moe_tmp, slot_table, pf.route, m, h, s)?;
             Vec::new()
         } else {

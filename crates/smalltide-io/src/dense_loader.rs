@@ -389,7 +389,7 @@ impl Inkling2DenseHost {
     }
 }
 
-fn read_raw_bytes(
+pub fn read_raw_bytes(
     file: &mut File,
     hdr: &SafetensorsHeader,
     data_base: u64,
@@ -406,7 +406,7 @@ fn read_raw_bytes(
     Ok(buf)
 }
 
-fn read_f32_vec(
+pub fn read_f32_vec(
     file: &mut File,
     hdr: &SafetensorsHeader,
     data_base: u64,
@@ -432,7 +432,7 @@ fn read_f32_vec(
     }
 }
 
-fn read_fp8_matrix(
+pub fn read_fp8_matrix(
     file: &mut File,
     hdr: &SafetensorsHeader,
     data_base: u64,

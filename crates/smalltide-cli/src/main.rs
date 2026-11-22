@@ -839,11 +839,86 @@ fn run_generate(args: &[String]) {
         .sample_next_token(&sampling, &generated)
         .expect("sample first token");
 
+    if std::env::var_os("SMALLTIDE_ROWS_CMP").is_some() {
+        // Dev: one token from the same state through forward_token, a 1-row batched round and a
+        // 1-row verify; max |logit| differences.
+        engine.tide.wait_and_publish_all_pending().expect("drain pending");
+        let vocab = engine.cfg.unpadded_vocab_size;
+        let p0 = prompt_ids.len();
+        let read = |eng: &smalltide_model_inkling2::engine::Inkling2Engine<smalltide_backend_hip::HipBackend>, buf: smalltide_core::DeviceBuf| -> Vec<f32> {
+            let mut b = vec![0u8; vocab * 4];
+            eng.backend.memcpy_d2h_sync(&mut b, buf.slice(0, vocab * 4), 0, eng.tide.compute_stream).expect("d2h");
+            b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        };
+        let mut snap = None;
+        engine.snapshot_state(p0, &mut snap).expect("snapshot");
+        let mut t = next_tok;
+        for step in 0..4 {
+            engine.forward_token(t, p0 + step, false, true).expect("single");
+            let a = read(&engine, engine.logits_buf());
+            engine.restore_state(snap.as_ref().unwrap(), false).expect("restore");
+            for _ in 0..step { /* state at p0 only: compare the first step from the snapshot */ }
+            engine.forward_batch(&[(engine.active_lane(), t, p0 + step)]).expect("batch");
+            let b = read(&engine, engine.batch_logits_buf().unwrap());
+            engine.post_batch_tide_step().expect("post");
+            engine.restore_state(snap.as_ref().unwrap(), false).expect("restore");
+            if let Ok(d) = std::env::var("SMALLTIDE_DUMP_DIR") {
+                let v = std::path::PathBuf::from(d).join("verify");
+                let _ = std::fs::create_dir_all(&v);
+                engine.set_dump_dir(v);
+            }
+            engine.verify(&[t], p0 + step).expect("verify");
+            let c = read(&engine, engine.batch_logits_buf().unwrap());
+            engine.post_batch_tide_step().expect("post");
+            engine.restore_state(snap.as_ref().unwrap(), false).expect("restore");
+            let d = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+            let am = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0;
+            if let Ok(dir) = std::env::var("SMALLTIDE_ROWS_CMP") {
+                if dir.len() > 1 {
+                    for (name, v) in [("single", &a), ("batch", &b), ("verify", &c)] {
+                        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.f32")), bytes);
+                    }
+                }
+            }
+            println!("[rows-cmp] token {t}: single-batch {:.4} single-verify {:.4} batch-verify {:.4} | argmax {} {} {}", d(&a, &b), d(&a, &c), d(&b, &c), am(&a), am(&b), am(&c));
+            // Causality: rows must not depend on the drafts after them.
+            for off in [0usize, 3, 7, 13] {
+                let mut outs = Vec::new();
+                for tail in [[11u32, 22, 33, 44, 55, 66, 77], [11u32, 22, 33, 999, 1234, 4321, 8888]] {
+                    engine.restore_state(snap.as_ref().unwrap(), false).expect("restore");
+                    // advance `off` positions with plain decode so pos0 % 16 varies
+                    let mut tt = t;
+                    for j in 0..off {
+                        engine.forward_token(tt, p0 + j, false, true).expect("adv");
+                        tt = 100 + j as u32;
+                    }
+                    let mut blk = vec![tt];
+                    blk.extend_from_slice(&tail);
+                    engine.verify(&blk, p0 + off).expect("verify");
+                    let bl = engine.batch_logits_buf().unwrap();
+                    let rows: Vec<Vec<f32>> = (0..8).map(|r| read(&engine, bl.slice(r * vocab * 4, vocab * 4))).collect();
+                    engine.post_batch_tide_step().expect("post");
+                    outs.push(rows);
+                }
+                let diffs: Vec<String> = (0..8).map(|r| format!("{:.3}", d(&outs[0][r], &outs[1][r]))).collect();
+                println!("[rows-cmp] causality pos0={} (mod16 {}): row diffs (tails differ from row 3 on) {}", p0 + off, (p0 + off) % 16, diffs.join(" "));
+            }
+            engine.restore_state(snap.as_ref().unwrap(), false).expect("restore");
+            t = am(&a) as u32;
+            if step == 0 { break; }
+        }
+        return;
+    }
+
     if let Some(n) = std::env::var("SMALLTIDE_VERIFY_SELFTEST").ok().and_then(|v| v.parse::<usize>().ok()) {
         // Speculative verify + rewind vs plain greedy decode: reference tokens from forward_token;
         // then the same span through 8-row verify steps whose drafts are the reference tokens with
         // one corrupted per block (forces a rejection and a short-conv rewind every step).
         let p0 = prompt_ids.len();
+        // Same resident experts for both runs: land every queued swap first (run with
+        // SMALLTIDE_ASYNC_PER_TOKEN=0 so no new ones are queued).
+        engine.tide.wait_and_publish_all_pending().expect("drain pending");
         let mut snap = None;
         engine.snapshot_state(p0, &mut snap).expect("snapshot");
         let mut refs = vec![next_tok];
@@ -876,12 +951,12 @@ fn run_generate(args: &[String]) {
             block[corrupt] = (block[corrupt] + 7) % 100_000;
             engine.verify(&block, p0 + i).expect("verify");
             let am = engine.rows_argmax(width).expect("argmax");
-            engine.post_batch_tide_step().expect("post batch");
             let mut c = 0usize;
             while c < width - 1 && block[c + 1] == am[c] {
                 c += 1;
             }
             engine.verify_rewind(width, c + 1).expect("rewind");
+            engine.post_batch_tide_step().expect("post batch");
             out.extend_from_slice(&block[1..=c]);
             out.push(am[c]);
             i += c + 1;
@@ -896,7 +971,7 @@ fn run_generate(args: &[String]) {
         if vkt {
             let mut kt = backend.take_kernel_times();
             kt.sort_by(|a, b| b.2.total_cmp(&a.2));
-            for (name, cnt, ms) in kt.iter().take(12) {
+            for (name, cnt, ms) in kt.iter().take(40) {
                 println!("    {:<32} {:>6.1}x {:>8.3} ms/step ({:.1} us avg)", name, *cnt as f64 / steps.max(1) as f64, ms / steps.max(1) as f64, ms * 1000.0 / *cnt as f64);
             }
             backend.set_kernel_timing(false).expect("kt off");
@@ -908,6 +983,10 @@ fn run_generate(args: &[String]) {
             }
             backend.set_segment_timing(false).expect("seg off");
         }
+        if let Some((u, r)) = backend.resident_vram_info() {
+            println!("[verify-selftest] process VRAM usage now {:.2} GiB of resident {:.2} GiB", u as f64 / (1u64 << 30) as f64, r as f64 / (1u64 << 30) as f64);
+        }
+        println!("[verify-selftest] distinct resident experts per verify step {:.1} (all layers)", engine.dev_unique_resident as f64 / engine.dev_rounds.max(1) as f64);
         println!("[verify-selftest] plain decode {ref_ms:.2} ms/token | 8-row verify {ver_ms:.2} ms/step ({:.2}x a decode step)", ver_ms / ref_ms);
         let cmp = out.len().min(refs.len());
         let same = (0..cmp).filter(|&k| out[k] == refs[k]).count();
@@ -972,6 +1051,7 @@ fn run_generate(args: &[String]) {
         // (lanes 1 and 2), teacher-forced on the reference tokens.
         let other = tok.encode("<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Write a haiku about winter rain on a tin roof.<|end_message|><|message_model|>");
         let prompts = [prompt_ids.clone(), other];
+        engine.tide.wait_and_publish_all_pending().expect("drain pending");
         let mut refs: Vec<(Vec<u32>, Vec<Vec<f32>>)> = Vec::new();
         for pr in &prompts {
             engine.select_lane(0);
@@ -1067,7 +1147,67 @@ fn run_generate(args: &[String]) {
     const EOS_ID: u32 = 200_006;
     const EOT_ID: u32 = 199_999;
 
+    // Speculative decoding (greedy): the drafter proposes width - 1 tokens, one verify pass
+    // checks them; accepted drafts plus the target's next token are emitted per step.
+    let spec = engine.drafter.is_some() && temperature <= 0.0;
+    let spec_width = std::env::var("SMALLTIDE_SPEC_WIDTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).clamp(2, 8);
+    let (mut spec_steps, mut spec_accepted, mut draft_ms, mut verify_ms) = (0usize, 0usize, 0f64, 0f64);
+    let mut spec_hist = [0usize; 8];
+    if spec {
+        let mut tap_row = engine.last_tap_rows.max(1) - 1;
+        let mut done = false;
+        let emit = |t: u32, generated: &mut Vec<u32>| -> bool {
+            if t == EOS_ID || t == EOT_ID {
+                return false;
+            }
+            generated.push(t);
+            print!("{}", tok.decode(&[t]));
+            let _ = std::io::stdout().flush();
+            generated.len() < max_tokens
+        };
+        if !emit(next_tok, &mut generated) {
+            done = true;
+        }
+        while !done && pos + spec_width <= max_ctx {
+            let n = spec_width - 1;
+            let td = Instant::now();
+            let drafts = engine.draft(next_tok, pos, tap_row, n).expect("draft");
+            draft_ms += td.elapsed().as_secs_f64() * 1000.0;
+            let mut block = Vec::with_capacity(spec_width);
+            block.push(next_tok);
+            block.extend_from_slice(&drafts);
+            let tv = Instant::now();
+            engine.verify(&block, pos).expect("verify");
+            let am = engine.rows_argmax(spec_width).expect("verify argmax");
+            let mut c = 0usize;
+            while c < n && block[c + 1] == am[c] {
+                c += 1;
+            }
+            engine.verify_rewind(spec_width, c + 1).expect("verify rewind");
+            engine.post_batch_tide_step().expect("post verify");
+            verify_ms += tv.elapsed().as_secs_f64() * 1000.0;
+            spec_steps += 1;
+            spec_accepted += c;
+            spec_hist[c] += 1;
+            for &t in &block[1..=c] {
+                if !emit(t, &mut generated) {
+                    done = true;
+                    break;
+                }
+            }
+            pos += c + 1;
+            tap_row = c;
+            next_tok = am[c];
+            if !done && !emit(next_tok, &mut generated) {
+                done = true;
+            }
+        }
+    }
+
     for step in 0..max_tokens {
+        if spec {
+            break;
+        }
         if next_tok == EOS_ID || next_tok == EOT_ID {
             break;
         }
@@ -1092,6 +1232,18 @@ fn run_generate(args: &[String]) {
     }
     let dec_secs = t_dec.elapsed().as_secs_f64();
     let dec_toks = generated.len();
+    if spec && spec_steps > 0 {
+        let hist: Vec<String> = spec_hist[..spec_width].iter().enumerate().map(|(i, c)| format!("{i}:{c}")).collect();
+        println!(
+            "\n[spec] distinct resident experts per verify step {:.1} | width {spec_width}: {spec_steps} steps, mean accepted {:.2} -> {:.2} tokens/step | draft {:.2} ms + verify {:.2} ms per step | accepted per step {}",
+            engine.dev_unique_resident as f64 / engine.dev_rounds.max(1) as f64,
+            spec_accepted as f64 / spec_steps as f64,
+            1.0 + spec_accepted as f64 / spec_steps as f64,
+            draft_ms / spec_steps as f64,
+            verify_ms / spec_steps as f64,
+            hist.join(" ")
+        );
+    }
     let hs = backend.take_host_stats();
     let tel = engine.telemetry();
     println!("\n--------------");

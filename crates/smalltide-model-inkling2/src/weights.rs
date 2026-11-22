@@ -70,14 +70,14 @@ pub struct Inkling2DenseGpu<B: ComputeBackend> {
     pub layers: Vec<DenseLayerGpu>,
 }
 
-struct Uploader<'a, B: ComputeBackend> {
-    backend: &'a B,
-    staging: PinnedBuf,
-    stream: Stream,
+pub(crate) struct Uploader<'a, B: ComputeBackend> {
+    pub(crate) backend: &'a B,
+    pub(crate) staging: PinnedBuf,
+    pub(crate) stream: Stream,
 }
 
 impl<'a, B: ComputeBackend> Uploader<'a, B> {
-    fn upload_bytes(&self, bytes: &[u8]) -> Result<DeviceBuf> {
+    pub(crate) fn upload_bytes(&self, bytes: &[u8]) -> Result<DeviceBuf> {
         let dev = self.backend.alloc_device(bytes.len().max(4))?;
         let chunk_cap = self.staging.size_bytes;
         let mut off = 0usize;
@@ -95,13 +95,13 @@ impl<'a, B: ComputeBackend> Uploader<'a, B> {
         Ok(dev)
     }
 
-    fn upload_f32(&self, v: &[f32]) -> Result<DeviceBuf> {
+    pub(crate) fn upload_f32(&self, v: &[f32]) -> Result<DeviceBuf> {
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
         self.upload_bytes(bytes)
     }
 
-    fn upload_fp8(&self, m: &Fp8MatrixHost) -> Result<Fp8MatrixGpu> {
+    pub(crate) fn upload_fp8(&self, m: &Fp8MatrixHost) -> Result<Fp8MatrixGpu> {
         Ok(Fp8MatrixGpu {
             n_rows: m.n_rows,
             k_cols: m.k_cols,

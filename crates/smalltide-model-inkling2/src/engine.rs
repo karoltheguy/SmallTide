@@ -220,6 +220,16 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     pub anticipate_swaps: usize,
     /// Wait for the anticipated swaps before prefill (the prompt itself then hits them).
     pub anticipate_wait: bool,
+    /// DSpark drafter (speculative decoding); its context follows the active lane's prefill /
+    /// verify rows.
+    pub drafter: Option<crate::drafter::Drafter<B>>,
+    /// Rows of the last tap-capturing rows forward (the last one is the newest position).
+    pub last_tap_rows: usize,
+    /// Dev stats: rows run by the last batched / verify forward, and the summed number of
+    /// distinct resident experts those rounds touched (all layers).
+    batch_rows_run: usize,
+    pub dev_rounds: u64,
+    pub dev_unique_resident: u64,
 }
 
 /// Most rows (concurrent sequences) one batched decode round can carry.
@@ -391,6 +401,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             rewind_tables: Vec::new(),
             taps_buf: None,
             capture_taps: false,
+            drafter: None,
+            last_tap_rows: 0,
+            batch_rows_run: 0,
+            dev_rounds: 0,
+            dev_unique_resident: 0,
             argmax_rows_buf: None,
             prefill_chunk_swaps: 96,
             anticipate_swaps: 256,
@@ -828,6 +843,12 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.verify_hist.expect("verify hist").slice((il * per_layer + off) * 4, rows * dim * 4)
     }
 
+    /// Allocates the rows-batched buffers (prefill chunks, batched decode, verify) now, e.g.
+    /// before the expert pools so they are placed in VRAM first.
+    pub fn preallocate_rows_buffers(&mut self) -> Result<()> {
+        self.ensure_rows_buffers()
+    }
+
     fn ensure_rows_buffers(&mut self) -> Result<()> {
         if self.pf.is_none() {
             self.pf = Some(crate::prefill::PrefillScratch::new(&*self.backend, &self.cfg)?);
@@ -853,6 +874,38 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.ensure_rows_buffers()
     }
 
+    /// Dev: redirect the per-token dump (`SMALLTIDE_DUMP_DIR`) to `dir`.
+    pub fn set_dump_dir(&mut self, dir: std::path::PathBuf) {
+        if let Some(d) = self.dump.as_mut() {
+            d.dir = dir;
+        }
+    }
+
+    /// Attaches the DSpark drafter: taps are captured from now on (speculative buffers allocated).
+    pub fn attach_drafter(&mut self, d: crate::drafter::Drafter<B>) -> Result<()> {
+        self.drafter = Some(d);
+        self.capture_taps = true;
+        self.enable_speculative_buffers()
+    }
+
+    /// Context K/V of the drafter for the `m` rows just run at `pos0..` (no-op without drafter).
+    pub(crate) fn drafter_ingest(&mut self, pos0: usize, m: usize) -> Result<()> {
+        self.last_tap_rows = m;
+        if let (Some(d), Some(taps)) = (self.drafter.as_ref(), self.taps_buf) {
+            d.ingest(taps, PREFILL_CHUNK, pos0, m, self.tide.compute_stream)?;
+        }
+        Ok(())
+    }
+
+    /// Drafts `n` tokens after `anchor` (at position `p`); `tap_row`: row of position `p - 1` in
+    /// the last tap-capturing forward (prefill chunk or verify).
+    pub fn draft(&mut self, anchor: u32, p: usize, tap_row: usize, n: usize) -> Result<Vec<u32>> {
+        let taps = self.taps_buf.expect("taps buffer");
+        let s = self.tide.compute_stream;
+        let d = self.drafter.as_mut().expect("drafter attached");
+        d.draft(&self.dense, anchor, p, taps, PREFILL_CHUNK, tap_row, n, s)
+    }
+
     /// Speculative verify: runs `tokens` (<= 8, the anchor then the drafts) of the active lane at
     /// positions `pos0..` in one pass; logits of every row land in the batch logits buffer and the
     /// drafter taps in `taps_buf` (if `capture_taps`). Then `verify_argmax`, `verify_rewind`.
@@ -870,7 +923,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let published = self.tide.poll_pending()?;
         self.tide.scheduler.telemetry.stage1_async_published += published as u64;
         self.rows_forward(tokens, crate::prefill::RowsMode::Verify { pos0 }, true)?;
+        if self.capture_taps {
+            self.drafter_ingest(pos0, m)?;
+        }
         self.batch_pending_rows = m;
+        self.batch_rows_run = m;
         self.batch_lanes = vec![self.active_lane; m];
         Ok(())
     }
@@ -892,6 +949,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// active lane to its state after `keep` rows (the KV of later positions is simply overwritten
     /// by the next tokens).
     pub fn verify_rewind(&mut self, m: usize, keep: usize) -> Result<()> {
+        // Only committed rows count for Tide (heat / demand); call before post_batch_tide_step.
+        self.batch_pending_rows = self.batch_pending_rows.min(keep);
         if keep >= m {
             return Ok(());
         }
@@ -950,6 +1009,21 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let mut bytes = vec![0u8; n_log * MAX_BATCH_ROWS * 64];
         self.backend.memcpy_d2h_sync(&mut bytes, log, 0, self.tide.compute_stream)?;
         let word = |i: usize| u32::from_le_bytes([bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]]);
+        let run = std::mem::take(&mut self.batch_rows_run).max(m);
+        self.dev_rounds += 1;
+        for il in 0..n_log {
+            let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
+            let mut seen: Vec<u16> = Vec::with_capacity(64);
+            for r in 0..run {
+                for k in 0..8 {
+                    let e = word((il * MAX_BATCH_ROWS + r) * 16 + k) as u16;
+                    if !seen.contains(&e) && self.tide.scheduler.cache.is_vram_hit(smalltide_core::ExpertId { layer: phys, expert: e }) {
+                        seen.push(e);
+                    }
+                }
+            }
+            self.dev_unique_resident += seen.len() as u64;
+        }
         for il in 0..n_log {
             let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
             for r in 0..m {

@@ -72,8 +72,8 @@ enum StreamEvent {
     Error(String),
 }
 
-/// `max_tokens` when a request gives none: bounded by the lane's context instead.
-const UNLIMITED_TOKENS: usize = 1 << 24;
+/// `max_tokens` when a request gives none (48K; the lane's context still bounds it).
+const UNLIMITED_TOKENS: usize = 48 * 1024;
 
 enum EngineCommand {
     Generate {

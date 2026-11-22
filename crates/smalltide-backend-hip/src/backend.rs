@@ -267,7 +267,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, moe_w2_rows)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, moe_w2_rows)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -1679,10 +1679,26 @@ impl ComputeBackend for HipBackend {
         let (mut a, mut b, mut c, mut d) = (self.dev_ptr(y)?, self.dev_ptr(x)?, self.dev_ptr(w_fp8)?, self.dev_ptr(row_scales)?);
         let (mut m, mut n, mut k) = (rows as u32, n_rows as u32, k_cols as u32);
         let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut m), p(&mut n), p(&mut k)];
-        if rows >= 16 && k_cols % 32 == 0 && std::env::var_os("SMALLTIDE_GEMM_SCALAR").is_none() {
+        if k_cols % 32 == 0 && std::env::var_os("SMALLTIDE_GEMM_SCALAR").is_none() {
+            // Both WMMA kernels compute every output element identically, so a row's result does
+            // not depend on how many rows share the call (prefill segmentation invariance).
+            if rows <= 16 {
+                return self.launch(self.kernels.gemm_fp8_rows_wmma_small, (n.div_ceil(128), 1, 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma_small)");
+            }
             return self.launch(self.kernels.gemm_fp8_rows_wmma, (n.div_ceil(64), m.div_ceil(128), 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma)");
         }
         self.launch(self.kernels.gemm_fp8_e4m3_batched_f32, (n.div_ceil(4), m.div_ceil(8), 1), 128, &mut args, stream, "launch(gemm_fp8_rows)")
+    }
+
+    fn gemm_fp8_rows_decode(&self, y: DeviceBuf, x: DeviceBuf, w_fp8: DeviceBuf, row_scales: DeviceBuf,
+        rows: usize, n_rows: usize, k_cols: usize, stream: Stream) -> Result<()> {
+        if rows > 8 || k_cols % 16 != 0 {
+            return self.gemm_fp8_rows(y, x, w_fp8, row_scales, rows, n_rows, k_cols, stream);
+        }
+        let (mut a, mut b, mut c, mut d) = (self.dev_ptr(y)?, self.dev_ptr(x)?, self.dev_ptr(w_fp8)?, self.dev_ptr(row_scales)?);
+        let (mut m, mut n, mut k) = (rows as u32, n_rows as u32, k_cols as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut m), p(&mut n), p(&mut k)];
+        self.launch(self.kernels.gemv_fp8_rows, (n.div_ceil(4), 1, 1), 128, &mut args, stream, "launch(gemv_fp8_rows)")
     }
 
     fn gemm_f32_rows(&self, y: DeviceBuf, x: DeviceBuf, w: DeviceBuf, rows: usize, n_rows: usize,

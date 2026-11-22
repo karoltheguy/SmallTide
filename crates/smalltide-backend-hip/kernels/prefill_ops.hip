@@ -875,9 +875,13 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
     uint32_t t_first, qh_x, p_first, lo_first, t_last, p_last, lo_last;
     qinfo(0u, t_first, qh_x, p_first, lo_first);
     qinfo(15u, t_last, qh_x, p_last, lo_last);
-    uint32_t key_lo = lo_first;            // smallest window start (positions grow with m)
+    // Key tiles are aligned to absolute multiples of 16 and owned by warp (tile index % 4), so a
+    // query's result does not depend on which other queries share its block (prefill segmentation
+    // invariance: prefix-cache restores must reproduce a cold prefill bit for bit).
+    uint32_t key_lo = lo_first & ~15u;     // smallest window start (positions grow with m)
     uint32_t key_hi = p_last;              // inclusive
     uint32_t n_tiles = (key_hi - key_lo) / 16u + 1u;
+    uint32_t tile0 = key_lo / 16u;
 
     // A fragment of Q (row m = l % 16, dims half*8 + 16c .. +8), pre-scaled to the log2 domain.
     uint32_t tA, qhA, pA, loA;
@@ -910,7 +914,8 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
     #pragma unroll
     for (uint32_t c = 0u; c < 8u; ++c) o[c] = (st_float8){};
 
-    for (uint32_t tile = warp; tile < n_tiles; tile += AW_WARPS) {
+    uint32_t first = (warp + AW_WARPS - (tile0 % AW_WARPS)) % AW_WARPS;
+    for (uint32_t tile = first; tile < n_tiles; tile += AW_WARPS) {
         uint32_t k0 = key_lo + tile * 16u;
         // This lane's key (column n = l % 16) for S and its cache slot.
         uint32_t kp = k0 + nl;
@@ -1083,6 +1088,95 @@ extern "C" __global__ void smalltide_gemm_fp8_rows_wmma(
         for (uint32_t i = 0u; i < 8u; ++i) {
             uint32_t mm = m0 + (l >> 4) * 8u + i;
             if (mm < m_rows) y[static_cast<size_t>(mm) * n_rows + n] = c[j][i] * sc;
+        }
+    }
+}
+
+// Same arithmetic per output element as smalltide_gemm_fp8_rows_wmma (k order and WMMA steps
+// identical), for m_rows <= 16: one warp per 16-column tile.  Grid: (ceil(N / 128)), Block: 256
+extern "C" __global__ void smalltide_gemm_fp8_rows_wmma_small(
+    float* __restrict__ y, const float* __restrict__ x, const uint8_t* __restrict__ w_fp8,
+    const float* __restrict__ row_scale, uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) {
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t n0 = (blockIdx.x * 8u + warp) * 16u;
+    if (n0 >= n_rows) return;
+    uint32_t am = l & 15u;
+    bool a_ok = am < m_rows;
+    const float* xr = x + static_cast<size_t>(a_ok ? am : 0u) * k_cols;
+    uint32_t n = n0 + (l & 15u);
+    bool b_ok = n < n_rows;
+    const uint8_t* wr = w_fp8 + static_cast<size_t>(b_ok ? n : 0u) * k_cols;
+    st_float8 c = {};
+    uint32_t hoff = (l >> 4) * 16u;
+    for (uint32_t k = 0u; k < k_cols; k += 32u) {
+        uint32_t base = k + hoff;
+        const float4* xp = reinterpret_cast<const float4*>(xr + base);
+        float4 x0 = a_ok ? xp[0] : make_float4(0, 0, 0, 0), x1 = a_ok ? xp[1] : make_float4(0, 0, 0, 0);
+        float4 x2 = a_ok ? xp[2] : make_float4(0, 0, 0, 0), x3 = a_ok ? xp[3] : make_float4(0, 0, 0, 0);
+        uint4 wv = b_ok ? *reinterpret_cast<const uint4*>(wr + base) : make_uint4(0u, 0u, 0u, 0u);
+        st_half8 a0, a1;
+        a0[0] = (_Float16)x0.x; a0[1] = (_Float16)x0.y; a0[2] = (_Float16)x0.z; a0[3] = (_Float16)x0.w;
+        a0[4] = (_Float16)x1.x; a0[5] = (_Float16)x1.y; a0[6] = (_Float16)x1.z; a0[7] = (_Float16)x1.w;
+        a1[0] = (_Float16)x2.x; a1[1] = (_Float16)x2.y; a1[2] = (_Float16)x2.z; a1[3] = (_Float16)x2.w;
+        a1[4] = (_Float16)x3.x; a1[5] = (_Float16)x3.y; a1[6] = (_Float16)x3.z; a1[7] = (_Float16)x3.w;
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, fp8x8_to_half8(make_uint2(wv.x, wv.y)), c);
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, fp8x8_to_half8(make_uint2(wv.z, wv.w)), c);
+    }
+    if (!b_ok) return;
+    float sc = (row_scale != nullptr) ? row_scale[n] : 1.0f;
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        uint32_t mm = (l >> 4) * 8u + i;
+        if (mm < m_rows) y[static_cast<size_t>(mm) * n_rows + n] = c[i] * sc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batched-decode FP8 GEMV for up to 8 rows: one warp per output row, two 16-byte weight loads in
+// flight, packed FP8 decode, each decoded weight applied to every row (bandwidth-bound like the
+// single-row GEMV).   Grid: (ceil(N / 4)), Block: 128
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_gemv_fp8_rows(
+    float* __restrict__ y, const float* __restrict__ x, const uint8_t* __restrict__ w_fp8,
+    const float* __restrict__ row_scale, uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) {
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t row = blockIdx.x * 4u + warp;
+    if (row >= n_rows) return;
+    const uint4* wv = reinterpret_cast<const uint4*>(w_fp8 + static_cast<size_t>(row) * k_cols);
+    uint32_t k16 = k_cols >> 4;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    auto dot16 = [&](uint4 w16, uint32_t c) {
+        float4 d0 = decode_fp8x4(w16.x), d1 = decode_fp8x4(w16.y), d2 = decode_fp8x4(w16.z), d3 = decode_fp8x4(w16.w);
+        #pragma unroll
+        for (uint32_t m = 0u; m < 8u; ++m) {
+            if (m < m_rows) {
+                const float4* xv = reinterpret_cast<const float4*>(x + static_cast<size_t>(m) * k_cols) + (c << 2);
+                float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+                float a = acc[m];
+                a = fmaf(d0.x, x0.x, a); a = fmaf(d0.y, x0.y, a); a = fmaf(d0.z, x0.z, a); a = fmaf(d0.w, x0.w, a);
+                a = fmaf(d1.x, x1.x, a); a = fmaf(d1.y, x1.y, a); a = fmaf(d1.z, x1.z, a); a = fmaf(d1.w, x1.w, a);
+                a = fmaf(d2.x, x2.x, a); a = fmaf(d2.y, x2.y, a); a = fmaf(d2.z, x2.z, a); a = fmaf(d2.w, x2.w, a);
+                a = fmaf(d3.x, x3.x, a); a = fmaf(d3.y, x3.y, a); a = fmaf(d3.z, x3.z, a); a = fmaf(d3.w, x3.w, a);
+                acc[m] = a;
+            }
+        }
+    };
+    uint32_t c = lane;
+    for (; c + 32u < k16; c += 64u) {
+        uint4 wa = wv[c];
+        uint4 wb = wv[c + 32u];
+        dot16(wa, c);
+        dot16(wb, c + 32u);
+    }
+    if (c < k16) dot16(wv[c], c);
+    float sc = (row_scale != nullptr) ? row_scale[row] : 1.0f;
+    #pragma unroll
+    for (uint32_t m = 0u; m < 8u; ++m) {
+        if (m < m_rows) {
+            float sum = wave32_sum(acc[m]);
+            if (lane == 0u) y[static_cast<size_t>(m) * n_rows + row] = sum * sc;
         }
     }
 }

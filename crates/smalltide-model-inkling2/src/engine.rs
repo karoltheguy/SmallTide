@@ -23,7 +23,7 @@ use std::time::Instant;
 pub(crate) const MAX_FLASH_SPLITS: usize = 64;
 /// Maximum tokens per batched prefill chunk. Local KV rings hold `window + PREFILL_CHUNK` slots so
 /// a chunk's own keys never overwrite keys an earlier row of the same chunk still attends to.
-pub const PREFILL_CHUNK: usize = 128;
+pub const PREFILL_CHUNK: usize = 256;
 const MAX_ATTN_RES_BLOCKS: usize = 8;
 
 /// Optional per-component wall-clock breakdown (accumulated across steps when profiling is enabled).
@@ -201,6 +201,8 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     pub(crate) batch_route_log: Option<DeviceBuf>,
     /// Rows of the batched round whose routing log awaits `post_batch_tide_step`.
     batch_pending_rows: usize,
+    /// The rows forward in progress is a batched decode round (GEMV-style kernels for <= 8 rows).
+    pub(crate) rows_decode: bool,
 }
 
 /// Most rows (concurrent sequences) one batched decode round can carry.
@@ -366,6 +368,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             batch_logits: None,
             batch_route_log: None,
             batch_pending_rows: 0,
+            rows_decode: false,
             profile: StepProfile::default(),
         })
     }

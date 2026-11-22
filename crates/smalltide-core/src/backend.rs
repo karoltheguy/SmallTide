@@ -558,6 +558,11 @@ pub trait ComputeBackend: Send + Sync {
 
     /// `y[m, n] = (W_fp8[n, :] . x[m, :]) * row_scales[n]` for `rows` rows.
     #[allow(clippy::too_many_arguments)]
+    /// `gemm_fp8_rows` for batched decode (<= 8 rows): a bandwidth-bound GEMV over all rows.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_fp8_rows_decode(&self, y: DeviceBuf, x: DeviceBuf, w_fp8: DeviceBuf, row_scales: DeviceBuf,
+        rows: usize, n_rows: usize, k_cols: usize, stream: Stream) -> Result<()>;
+
     fn gemm_fp8_rows(&self, y: DeviceBuf, x: DeviceBuf, w_fp8: DeviceBuf, row_scales: DeviceBuf,
         rows: usize, n_rows: usize, k_cols: usize, stream: Stream) -> Result<()>;
 

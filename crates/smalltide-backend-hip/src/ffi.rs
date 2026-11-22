@@ -181,6 +181,8 @@ pub struct CoreKernels {
     pub f32_to_f16: HipFunction,
     pub attn_prefill_wmma: HipFunction,
     pub gemm_fp8_rows_wmma: HipFunction,
+    pub gemm_fp8_rows_wmma_small: HipFunction,
+    pub gemv_fp8_rows: HipFunction,
     pub moe_w2_rows: HipFunction,
 }
 
@@ -395,6 +397,8 @@ impl HipRuntime {
             f32_to_f16: get_fn("smalltide_f32_to_f16")?,
             attn_prefill_wmma: get_fn("smalltide_attn_prefill_wmma")?,
             gemm_fp8_rows_wmma: get_fn("smalltide_gemm_fp8_rows_wmma")?,
+            gemm_fp8_rows_wmma_small: get_fn("smalltide_gemm_fp8_rows_wmma_small")?,
+            gemv_fp8_rows: get_fn("smalltide_gemv_fp8_rows")?,
             moe_w2_rows: get_fn("smalltide_moe_w2_rows")?,
         })
     }

@@ -19,7 +19,7 @@ use smalltide_tide::cache::ExpertClass;
 
 const MAX_BLOCKS: usize = 8;
 const MOE_PAIRS_PER_ITEM: usize = 16;
-const DESC_BYTES: usize = 64 * 1024;
+const DESC_BYTES: usize = 160 * 1024;
 const DESC_RING: usize = 4;
 
 /// Rows-batched activation buffers (sized for `PREFILL_CHUNK` rows).
@@ -201,6 +201,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             RowsMode::Decode { .. } => 0,
         };
         let decode = matches!(mode, RowsMode::Decode { .. });
+        self.rows_decode = decode;
         let s = self.tide.compute_stream;
         let h = self.cfg.hidden_size;
         let eps = self.cfg.rms_norm_eps;
@@ -305,7 +306,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.backend.rms_norm(moe_norm, moe_in, self.dense.final_norm, m, h, eps, s)?;
             let vocab = self.cfg.unpadded_vocab_size;
             let logits = self.batch_logits.expect("batch logits");
-            self.backend.gemm_fp8_rows(logits, moe_norm, self.dense.unembed_fp8.data, self.dense.unembed_fp8.row_scales, m, vocab, h, s)?;
+            self.backend.gemm_fp8_rows_decode(logits, moe_norm, self.dense.unembed_fp8.data, self.dense.unembed_fp8.row_scales, m, vocab, h, s)?;
             if self.cfg.final_logit_softcapping > 0.0 {
                 self.backend.final_logit_softcap(logits, m * vocab, self.cfg.final_logit_softcapping, s)?;
             }
@@ -354,7 +355,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     }
 
     fn mm_rows(&self, y: DeviceBuf, x: DeviceBuf, w: &Fp8MatrixGpu, m: usize, s: Stream) -> Result<()> {
-        self.backend.gemm_fp8_rows(y, x, w.data, w.row_scales, m, w.n_rows, w.k_cols, s)
+        if self.rows_decode {
+            self.backend.gemm_fp8_rows_decode(y, x, w.data, w.row_scales, m, w.n_rows, w.k_cols, s)
+        } else {
+            self.backend.gemm_fp8_rows(y, x, w.data, w.row_scales, m, w.n_rows, w.k_cols, s)
+        }
     }
 
     fn control_rows(

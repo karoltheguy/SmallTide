@@ -143,24 +143,39 @@ extern "C" __global__ void smalltide_head_l2_clip_rows_f32(
 // Causal short conv (k=4) over M consecutive tokens, continuing from / updating `state`.
 //    out, x: [M][dim]; state: [3][dim] = (t-3, t-2, t-1); weight: [dim][4];
 //    dyn: nullable [M][dyn_stride] with 4 lag taps per head (lag0 = current token).
-//    Grid: ceil(dim / 256), Block: 256 (one thread per channel, sequential over rows)
+//    An output row depends on its own and the three previous INPUT rows only, so the rows are
+//    independent: one block per (256 channels, ST_SCONV_ROWS rows), each thread one channel.
+//    `out` must not alias `x`.
+//    Grid: (ceil(dim / 256), ceil(M / ST_SCONV_ROWS)), Block: 256
 // ---------------------------------------------------------------------------
+#define ST_SCONV_ROWS 16u
 extern "C" __global__ void smalltide_sconv_k4_rows_f32(
     float* __restrict__ out, float* __restrict__ state, const float* __restrict__ x,
     const float* __restrict__ weight, const float* __restrict__ dyn, uint32_t dim, uint32_t head_dim,
     uint32_t m_rows, uint32_t dyn_stride, float* __restrict__ hist
 ) {
     uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= dim) return;
-    float s0 = state[c], s1 = state[dim + c], s2 = state[2u * dim + c];
+    uint32_t t0 = blockIdx.y * ST_SCONV_ROWS;
+    if (c >= dim || t0 >= m_rows) return;
+    uint32_t t1 = min(m_rows, t0 + ST_SCONV_ROWS);
+    // The three inputs before row t0: the saved state for the first block, x itself after it.
+    float s0, s1, s2;
+    if (t0 == 0u) {
+        s0 = state[c]; s1 = state[dim + c]; s2 = state[2u * dim + c];
+    } else {
+        s0 = x[static_cast<size_t>(t0 - 3u) * dim + c];
+        s1 = x[static_cast<size_t>(t0 - 2u) * dim + c];
+        s2 = x[static_cast<size_t>(t0 - 1u) * dim + c];
+    }
+    const float o0 = s0, o1 = s1, o2 = s2;
     if (hist != nullptr) {
         // [3 + m_rows][dim]: the old state, then every input (speculative-verify rewind).
-        hist[c] = s0; hist[dim + c] = s1; hist[2u * dim + c] = s2;
-        for (uint32_t t = 0u; t < m_rows; ++t) hist[static_cast<size_t>(3u + t) * dim + c] = x[static_cast<size_t>(t) * dim + c];
+        if (t0 == 0u) { hist[c] = s0; hist[dim + c] = s1; hist[2u * dim + c] = s2; }
+        for (uint32_t t = t0; t < t1; ++t) hist[static_cast<size_t>(3u + t) * dim + c] = x[static_cast<size_t>(t) * dim + c];
     }
     const float4 w = reinterpret_cast<const float4*>(weight)[c];
     uint32_t h = (head_dim > 0u) ? (c / head_dim) : 0u;
-    for (uint32_t t = 0u; t < m_rows; ++t) {
+    for (uint32_t t = t0; t < t1; ++t) {
         float cur = x[static_cast<size_t>(t) * dim + c];
         float y = fmaf(s0, w.x, fmaf(s1, w.y, fmaf(s2, w.z, cur * w.w)));
         if (dyn != nullptr) {
@@ -173,7 +188,21 @@ extern "C" __global__ void smalltide_sconv_k4_rows_f32(
         out[static_cast<size_t>(t) * dim + c] = y;
         s0 = s1; s1 = s2; s2 = cur;
     }
-    state[c] = s0; state[dim + c] = s1; state[2u * dim + c] = s2;
+    if (t0 == 0u) {
+        // The new state is the last three inputs of the whole call (the first block is the only
+        // one that reads or writes `state`).
+        float n0, n1, n2;
+        if (m_rows >= 3u) {
+            n0 = x[static_cast<size_t>(m_rows - 3u) * dim + c];
+            n1 = x[static_cast<size_t>(m_rows - 2u) * dim + c];
+            n2 = x[static_cast<size_t>(m_rows - 1u) * dim + c];
+        } else if (m_rows == 2u) {
+            n0 = o2; n1 = x[c]; n2 = x[dim + c];
+        } else {
+            n0 = o1; n1 = o2; n2 = x[c];
+        }
+        state[c] = n0; state[dim + c] = n1; state[2u * dim + c] = n2;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -988,7 +1017,12 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
         // This lane's key (column n = l % 16) for S and its cache slot.
         uint32_t kp = k0 + nl;
         bool kin = kp <= key_hi;
-        uint32_t slot = kv_phys(page_table, (window != 0u) ? (kp % max_seq) : kp);
+        // The tile's first key in the ring, once: a 32-bit modulo is a long instruction sequence
+        // here, and the 16 keys of a tile need only an add and a wrap.
+        uint32_t ring0 = (window != 0u) ? (k0 % max_seq) : k0;
+        uint32_t ks = ring0 + nl;
+        if (window != 0u && ks >= max_seq) ks -= max_seq;
+        uint32_t slot = kv_phys(page_table, ks);
         // S = Q K^T over 8 dim chunks.
         st_float8 sacc = {};
         #pragma unroll
@@ -1035,7 +1069,9 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
         #pragma unroll
         for (uint32_t r = 0u; r < 16u; ++r) {
             uint32_t kr = k0 + r;
-            uint32_t vslot = kv_phys(page_table, (window != 0u) ? (kr % max_seq) : kr);
+            uint32_t vs = ring0 + r;
+            if (window != 0u && vs >= max_seq) vs -= max_seq;
+            uint32_t vslot = kv_phys(page_table, vs);
             float4 vv;
             if (kr <= key_hi) {
                 vv = (v_q4 != 0u)
@@ -1057,6 +1093,228 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
             st_half8 vf;
             #pragma unroll
             for (uint32_t j = 0u; j < 8u; ++j) vf[j] = s_v[warp][half_ * 8u + j][c * 16u + nl];
+            o[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pa, vf, o[c]);
+        }
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+    }
+
+    // Row sums over the 16 key lanes; publish (m, l, O) per warp.
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        float s = l_run[i];
+        s += __shfl_xor(s, 8, 32); s += __shfl_xor(s, 4, 32); s += __shfl_xor(s, 2, 32); s += __shfl_xor(s, 1, 32);
+        if (nl == 0u) { s_m[warp][half_ * 8u + i] = m_run[i]; s_l[warp][half_ * 8u + i] = s; }
+        #pragma unroll
+        for (uint32_t c = 0u; c < 8u; ++c) s_o[warp][half_ * 8u + i][c * 16u + nl] = o[c][i];
+    }
+    __syncthreads();
+    // Merge the warps + the sink; 128 threads = 16 rows x 8 threads x 16 dims.
+    uint32_t mrow = threadIdx.x >> 3, dpart = (threadIdx.x & 7u) * 16u;
+    if (q_base + mrow < nq) {
+        uint32_t t, qh, p, lo;
+        qinfo(mrow, t, qh, p, lo);
+        float sink = (sinks != nullptr) ? sinks[static_cast<size_t>(t) * n_q_heads + qh] * LOG2E : -1e30f;
+        float mb = sink;
+        for (uint32_t w = 0u; w < AW_WARPS; ++w) if (s_l[w][mrow] > 0.0f) mb = fmaxf(mb, s_m[w][mrow]);
+        float lb = (sinks != nullptr) ? exp2f(sink - mb) : 0.0f;
+        float f[AW_WARPS];
+        for (uint32_t w = 0u; w < AW_WARPS; ++w) {
+            f[w] = (s_l[w][mrow] > 0.0f) ? exp2f(s_m[w][mrow] - mb) : 0.0f;
+            lb += s_l[w][mrow] * f[w];
+        }
+        float inv = (lb > 1e-30f) ? 1.0f / lb : 0.0f;
+        float* dst = out + (static_cast<size_t>(t) * n_q_heads + qh) * 128u + dpart;
+        for (uint32_t d = 0u; d < 16u; ++d) {
+            float acc = 0.0f;
+            for (uint32_t w = 0u; w < AW_WARPS; ++w) acc = fmaf(s_o[w][mrow][dpart + d], f[w], acc);
+            dst[d] = acc * inv;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V tiles for smalltide_attn_prefill_wmma_vt: the values of keys key_lo..=key_hi (key_lo a
+// multiple of 16) decoded to f16 once, dim-major per 16-key tile: vt16[tile][head][dim][16].
+// A prefill pass has ~190 query blocks per KV head and each of them needs every tile of its
+// window: decoding the tile inside the attention kernel repeats the same work that many times
+// (about three quarters of that kernel's time). The f16 values are exactly the ones the
+// attention kernels compute themselves; keys past key_hi are 0 (they are masked, but a stale
+// NaN would still poison P * V).
+//   Tile index: (ring slot of its first key) / 16 for a local ring (max_seq % 16 == 0), key / 16
+//   for a global cache.   Grid: (n_kv_heads, n_tiles), Block: 128 (one thread a dim)
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_kv_v_tiles_f16(
+    uint4* __restrict__ vt16, const uint8_t* __restrict__ v_cache, const float* __restrict__ v_scales,
+    uint32_t n_kv_heads, uint32_t max_seq, uint32_t window, uint32_t key_lo, uint32_t key_hi,
+    const uint32_t* __restrict__ page_table, uint32_t v_q4
+) {
+    uint32_t kvh = blockIdx.x, d = threadIdx.x;
+    uint32_t k0 = key_lo + blockIdx.y * 16u;
+    uint32_t ring0 = (window != 0u) ? (k0 % max_seq) : k0;
+    const uint8_t* vb = v_cache + static_cast<size_t>(kvh) * 128u;
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * 128u;
+    st_half8 h[2];
+    #pragma unroll
+    for (uint32_t r = 0u; r < 16u; ++r) {
+        uint32_t kr = k0 + r;
+        uint32_t vs = ring0 + r;
+        if (window != 0u && vs >= max_seq) vs -= max_seq;
+        uint32_t vslot = kv_phys(page_table, vs);
+        float v = 0.0f;
+        if (kr <= key_hi) {
+            // The component d & 3 of what the attention kernels load for lane d >> 2.
+            float4 vv = (v_q4 != 0u)
+                ? kv_load_v_q4(v_cache, v_scales, static_cast<size_t>(vslot) * n_kv_heads + kvh, d >> 2)
+                : decode_fp8x4(reinterpret_cast<const uint32_t*>(vb + static_cast<size_t>(vslot) * kv_stride)[d >> 2]);
+            uint32_t i = d & 3u;
+            v = (i == 0u) ? vv.x : (i == 1u) ? vv.y : (i == 2u) ? vv.z : vv.w;
+        }
+        h[r >> 3][r & 7u] = (_Float16)v;
+    }
+    uint4* dst = vt16 + ((static_cast<size_t>(ring0 >> 4) * n_kv_heads + kvh) * 128u + d) * 2u;
+    dst[0] = __builtin_bit_cast(uint4, h[0]);
+    dst[1] = __builtin_bit_cast(uint4, h[1]);
+}
+
+// The same as smalltide_attn_prefill_wmma, value for value, with the V tile read pre-decoded.
+extern "C" __global__ void smalltide_attn_prefill_wmma_vt(
+    float* __restrict__ out, const float* __restrict__ q, const uint8_t* __restrict__ k_cache,
+    const float* __restrict__ k_scales, const uint8_t* __restrict__ v_cache, const float* __restrict__ v_scales,
+    const float* __restrict__ rel_table, const float* __restrict__ sinks, uint32_t n_q_heads, uint32_t n_kv_heads,
+    uint32_t max_seq, uint32_t window, uint32_t pos0, uint32_t rel_extent, float inv_sqrt_d, uint32_t rows,
+    const uint32_t* __restrict__ page_table, uint32_t v_q4, const uint4* __restrict__ vt16
+) {
+    const float LOG2E = 1.4426950408889634f;
+    uint32_t kvh = blockIdx.x;
+    uint32_t g = n_q_heads / n_kv_heads;
+    uint32_t qh0 = kvh * g;
+    uint32_t nq = rows * g;
+    uint32_t q_base = blockIdx.y * 16u;
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t nl = l & 15u, half_ = l >> 4;
+
+    __shared__ _Float16 s_p[AW_WARPS][16][16];
+    __shared__ float s_m[AW_WARPS][16], s_l[AW_WARPS][16];
+    __shared__ float s_o[AW_WARPS][16][128 + 4];
+
+    // Query vectors of this block: positions, rows and their key ranges.
+    auto qinfo = [&](uint32_t m, uint32_t& t, uint32_t& qh, uint32_t& p, uint32_t& lo) {
+        uint32_t qi = min(q_base + m, nq - 1u);
+        t = qi / g;
+        qh = qh0 + qi % g;
+        p = pos0 + t;
+        lo = (window != 0u && p + 1u > window) ? (p + 1u - window) : 0u;
+    };
+    uint32_t t_first, qh_x, p_first, lo_first, t_last, p_last, lo_last;
+    qinfo(0u, t_first, qh_x, p_first, lo_first);
+    qinfo(15u, t_last, qh_x, p_last, lo_last);
+    // Key tiles are aligned to absolute multiples of 16 and owned by warp (tile index % 4), so a
+    // query's result does not depend on which other queries share its block (prefill segmentation
+    // invariance: prefix-cache restores must reproduce a cold prefill bit for bit).
+    uint32_t key_lo = lo_first & ~15u;     // smallest window start (positions grow with m)
+    uint32_t key_hi = p_last;              // inclusive
+    uint32_t n_tiles = (key_hi - key_lo) / 16u + 1u;
+    uint32_t tile0 = key_lo / 16u;
+
+    // A fragment of Q (row m = l % 16, dims half*8 + 16c .. +8), pre-scaled to the log2 domain.
+    uint32_t tA, qhA, pA, loA;
+    qinfo(nl, tA, qhA, pA, loA);
+    bool validA = q_base + nl < nq;
+    const float* qrow = q + (static_cast<size_t>(tA) * n_q_heads + qhA) * 128u;
+    float qs = inv_sqrt_d * LOG2E;
+    st_half8 qa[8];
+    #pragma unroll
+    for (uint32_t c = 0u; c < 8u; ++c) {
+        const float4* src = reinterpret_cast<const float4*>(qrow + c * 16u + half_ * 8u);
+        float4 u = validA ? src[0] : make_float4(0, 0, 0, 0), v = validA ? src[1] : make_float4(0, 0, 0, 0);
+        qa[c][0] = (_Float16)(u.x * qs); qa[c][1] = (_Float16)(u.y * qs); qa[c][2] = (_Float16)(u.z * qs); qa[c][3] = (_Float16)(u.w * qs);
+        qa[c][4] = (_Float16)(v.x * qs); qa[c][5] = (_Float16)(v.y * qs); qa[c][6] = (_Float16)(v.z * qs); qa[c][7] = (_Float16)(v.w * qs);
+    }
+    // Rows this lane holds in the C layout: m = half * 8 + i.
+    uint32_t tC[8], qhC[8], pC[8], loC[8];
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) qinfo(half_ * 8u + i, tC[i], qhC[i], pC[i], loC[i]);
+
+    // Position-major cache ([slot][n_kv_heads][128], scales [slot][n_kv_heads]).
+    const uint8_t* kb = k_cache + static_cast<size_t>(kvh) * 128u;
+    const uint8_t* vb = v_cache + static_cast<size_t>(kvh) * 128u;
+    const float* ksb = k_scales + kvh;
+    const float* vsb = v_scales + kvh;
+    const size_t kv_stride = static_cast<size_t>(n_kv_heads) * 128u;
+
+    float m_run[8], l_run[8];
+    st_float8 o[8];
+    #pragma unroll
+    for (uint32_t i = 0u; i < 8u; ++i) { m_run[i] = -1e30f; l_run[i] = 0.0f; }
+    #pragma unroll
+    for (uint32_t c = 0u; c < 8u; ++c) o[c] = (st_float8){};
+
+    uint32_t first = (warp + AW_WARPS - (tile0 % AW_WARPS)) % AW_WARPS;
+    for (uint32_t tile = first; tile < n_tiles; tile += AW_WARPS) {
+        uint32_t k0 = key_lo + tile * 16u;
+        // This lane's key (column n = l % 16) for S and its cache slot.
+        uint32_t kp = k0 + nl;
+        bool kin = kp <= key_hi;
+        // The tile's first key in the ring, once: a 32-bit modulo is a long instruction sequence
+        // here, and the 16 keys of a tile need only an add and a wrap.
+        uint32_t ring0 = (window != 0u) ? (k0 % max_seq) : k0;
+        uint32_t ks = ring0 + nl;
+        if (window != 0u && ks >= max_seq) ks -= max_seq;
+        uint32_t slot = kv_phys(page_table, ks);
+        // S = Q K^T over 8 dim chunks.
+        st_float8 sacc = {};
+        #pragma unroll
+        for (uint32_t c = 0u; c < 8u; ++c) {
+            uint2 kw = kin ? *reinterpret_cast<const uint2*>(kb + static_cast<size_t>(slot) * kv_stride + c * 16u + half_ * 8u) : make_uint2(0u, 0u);
+            float4 a = decode_fp8x4(kw.x), b = decode_fp8x4(kw.y);
+            st_half8 kf;
+            kf[0] = (_Float16)a.x; kf[1] = (_Float16)a.y; kf[2] = (_Float16)a.z; kf[3] = (_Float16)a.w;
+            kf[4] = (_Float16)b.x; kf[5] = (_Float16)b.y; kf[6] = (_Float16)b.z; kf[7] = (_Float16)b.w;
+            sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qa[c], kf, sacc);
+        }
+        float kscale = kin ? ksb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f;
+        float vscale = (v_q4 != 0u) ? 1.0f : (kin ? vsb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f);
+        // Logits, masks, relative bias; online softmax (row max over the 16 key lanes).
+        float pr[8];
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            bool ok = kin && kp <= pC[i] && kp >= loC[i] && (q_base + half_ * 8u + i) < nq;
+            float sc = -1e30f;
+            if (ok) {
+                uint32_t dist = pC[i] - kp;
+                float rb = (rel_table != nullptr && dist < rel_extent)
+                    ? rel_table[(static_cast<size_t>(tC[i]) * n_q_heads + qhC[i]) * rel_extent + dist] * LOG2E : 0.0f;
+                sc = sacc[i] * kscale + rb;
+            }
+            float mx = sc;
+            mx = fmaxf(mx, __shfl_xor(mx, 8, 32));
+            mx = fmaxf(mx, __shfl_xor(mx, 4, 32));
+            mx = fmaxf(mx, __shfl_xor(mx, 2, 32));
+            mx = fmaxf(mx, __shfl_xor(mx, 1, 32));
+            float mn = fmaxf(m_run[i], mx);
+            float al = exp2f(m_run[i] - mn);
+            float pv = ok ? exp2f(sc - mn) : 0.0f;
+            l_run[i] = l_run[i] * al + pv; // per-lane partial (reduced at the end)
+            m_run[i] = mn;
+            #pragma unroll
+            for (uint32_t c = 0u; c < 8u; ++c) o[c][i] *= al;
+            pr[i] = pv * vscale;
+        }
+        // P (C layout: lane = key column) -> LDS -> A layout (lane = query row).
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) s_p[warp][half_ * 8u + i][nl] = (_Float16)pr[i];
+        // The V tile comes pre-decoded (smalltide_kv_v_tiles_f16): [tile][head][dim][16 keys] f16,
+        // so this lane's 8 keys of one dim are a single 16-byte load - no decode, no LDS staging.
+        const uint4* vtile = vt16 + (static_cast<size_t>(ring0 >> 4) * n_kv_heads + kvh) * 256u;
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
+        st_half8 pa;
+        #pragma unroll
+        for (uint32_t j = 0u; j < 8u; ++j) pa[j] = s_p[warp][nl][half_ * 8u + j];
+        #pragma unroll
+        for (uint32_t c = 0u; c < 8u; ++c) {
+            st_half8 vf = as_half8(vtile[(c * 16u + nl) * 2u + half_]);
             o[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pa, vf, o[c]);
         }
         __builtin_amdgcn_wave_barrier();
@@ -1174,7 +1432,12 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_split(
         uint32_t k0 = key_lo + tile * 16u;
         uint32_t kp = k0 + nl;
         bool kin = kp <= key_hi;
-        uint32_t slot = kv_phys(page_table, (window != 0u) ? (kp % max_seq) : kp);
+        // The tile's first key in the ring, once: a 32-bit modulo is a long instruction sequence
+        // here, and the 16 keys of a tile need only an add and a wrap.
+        uint32_t ring0 = (window != 0u) ? (k0 % max_seq) : k0;
+        uint32_t ks = ring0 + nl;
+        if (window != 0u && ks >= max_seq) ks -= max_seq;
+        uint32_t slot = kv_phys(page_table, ks);
         st_float8 sacc = {};
         #pragma unroll
         for (uint32_t c = 0u; c < 8u; ++c) {
@@ -1217,7 +1480,9 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_split(
         #pragma unroll
         for (uint32_t r = 0u; r < 16u; ++r) {
             uint32_t kr = k0 + r;
-            uint32_t vslot = kv_phys(page_table, (window != 0u) ? (kr % max_seq) : kr);
+            uint32_t vs = ring0 + r;
+            if (window != 0u && vs >= max_seq) vs -= max_seq;
+            uint32_t vslot = kv_phys(page_table, vs);
             float4 vv;
             if (kr <= key_hi) {
                 vv = (v_q4 != 0u)
@@ -1374,6 +1639,78 @@ extern "C" __global__ void smalltide_gemm_fp8_rows_wmma(
         for (uint32_t i = 0u; i < 8u; ++i) {
             uint32_t mm = m0 + (l >> 4) * 8u + i;
             if (mm < m_rows) y[static_cast<size_t>(mm) * n_rows + n] = c[j][i] * sc;
+        }
+    }
+}
+
+// smalltide_gemm_fp8_rows_wmma with the activations already in f16, and ST_GEMM_RG row groups
+// (16 rows each) per warp: every output element is computed identically (same k order, same
+// WMMA steps), but a warp decodes each weight fragment once for all its row groups, and the
+// activations are not converted again for each of the N / 64 column blocks. Decoding and
+// converting were about two thirds of the plain kernel's time.
+//   Grid: (ceil(N / 64), ceil(M / (128 * ST_GEMM_RG))), Block: 256
+#define ST_GEMM_RG 2u
+extern "C" __global__ void smalltide_gemm_fp8_rows_wmma_x16(
+    float* __restrict__ y, const _Float16* __restrict__ x, const uint8_t* __restrict__ w_fp8,
+    const float* __restrict__ row_scale, uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) {
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t m0 = (blockIdx.y * 8u + warp) * (16u * ST_GEMM_RG);
+    if (m0 >= m_rows) return;
+    uint32_t n0 = blockIdx.x * 64u;
+    const _Float16* xr[ST_GEMM_RG];
+    bool a_ok[ST_GEMM_RG];
+    #pragma unroll
+    for (uint32_t g = 0u; g < ST_GEMM_RG; ++g) {
+        uint32_t am = m0 + 16u * g + (l & 15u);
+        a_ok[g] = am < m_rows;
+        xr[g] = x + static_cast<size_t>(a_ok[g] ? am : 0u) * k_cols;
+    }
+    const uint8_t* wr[4];
+    bool b_ok[4];
+    #pragma unroll
+    for (uint32_t j = 0u; j < 4u; ++j) {
+        uint32_t n = n0 + 16u * j + (l & 15u);
+        b_ok[j] = n < n_rows;
+        wr[j] = w_fp8 + static_cast<size_t>(b_ok[j] ? n : 0u) * k_cols;
+    }
+    st_float8 c[ST_GEMM_RG][4] = {};
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    // k permuted consistently for A and B: in each 32-wide block half-wave h owns the 16
+    // consecutive k at h*16 (step s uses 8 of them): one 16-byte weight load per N tile.
+    uint32_t hoff = (l >> 4) * 16u;
+    for (uint32_t k = 0u; k < k_cols; k += 32u) {
+        uint32_t base = k + hoff;
+        st_half8 b0[4], b1[4];
+        #pragma unroll
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            uint4 wv = b_ok[j] ? *reinterpret_cast<const uint4*>(wr[j] + base) : zero;
+            b0[j] = fp8x8_to_half8(make_uint2(wv.x, wv.y));
+            b1[j] = fp8x8_to_half8(make_uint2(wv.z, wv.w));
+        }
+        #pragma unroll
+        for (uint32_t g = 0u; g < ST_GEMM_RG; ++g) {
+            const uint4* xp = reinterpret_cast<const uint4*>(xr[g] + base);
+            st_half8 a0 = as_half8(a_ok[g] ? xp[0] : zero), a1 = as_half8(a_ok[g] ? xp[1] : zero);
+            #pragma unroll
+            for (uint32_t j = 0u; j < 4u; ++j) {
+                c[g][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0[j], c[g][j]);
+                c[g][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1[j], c[g][j]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint32_t j = 0u; j < 4u; ++j) {
+        uint32_t n = n0 + 16u * j + (l & 15u);
+        if (n >= n_rows) continue;
+        float sc = (row_scale != nullptr) ? row_scale[n] : 1.0f;
+        #pragma unroll
+        for (uint32_t g = 0u; g < ST_GEMM_RG; ++g) {
+            #pragma unroll
+            for (uint32_t i = 0u; i < 8u; ++i) {
+                uint32_t mm = m0 + 16u * g + (l >> 4) * 8u + i;
+                if (mm < m_rows) y[static_cast<size_t>(mm) * n_rows + n] = c[g][j][i] * sc;
+            }
         }
     }
 }

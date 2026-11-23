@@ -86,7 +86,8 @@ fn main() {
                 };
                 let r = chat_format::render_chat(&msgs, c.get("tools"), c.get("reasoning_effort"));
                 out.push(match r {
-                    Ok(r) => serde_json::json!({ "ok": r.prompt }),
+                    // The template's text: without the guards on the caller's text.
+                    Ok(r) => serde_json::json!({ "ok": r.prompt.replace(chat_format::TEXT_GUARD, "") }),
                     Err(e) => serde_json::json!({ "err": e }),
                 });
             }
@@ -702,10 +703,20 @@ fn run_generate(args: &[String]) {
     let mut effort = "0".to_string();
     let mut max_tokens: usize = 128;
     let mut temperature: f32 = 0.0;
+    // Top-1 agreement test (see the `agree_prompts` block below and bench/agreement.py).
+    let (mut agree_prompts, mut agree_ref, mut agree_out): (Option<String>, Option<String>, Option<String>) = (None, None, None);
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
             "--prompt" | "-p" if i + 1 < args.len() => { prompt = args[i + 1].clone(); i += 2; }
+            "--agree-prompts" if i + 1 < args.len() => { agree_prompts = Some(args[i + 1].clone()); i += 2; }
+            "--agree-ref" if i + 1 < args.len() => { agree_ref = Some(args[i + 1].clone()); i += 2; }
+            "--agree-out" if i + 1 < args.len() => { agree_out = Some(args[i + 1].clone()); i += 2; }
+            // A prompt too long for a command line (Windows: 32,767 characters).
+            "--prompt-file" if i + 1 < args.len() => {
+                prompt = std::fs::read_to_string(&args[i + 1]).unwrap_or_else(|e| { eprintln!("--prompt-file {}: {e}", args[i + 1]); std::process::exit(2) });
+                i += 2;
+            }
             "--raw" => { raw_prompt = true; i += 1; }
             "--effort" if i + 1 < args.len() => { effort = args[i + 1].clone(); i += 2; }
             "--max-tokens" | "-n" if i + 1 < args.len() => {
@@ -756,6 +767,130 @@ fn run_generate(args: &[String]) {
             let warm = engine.debug_bench_moe(&slots, mx, 10, false).expect("bench");
             println!("[bench-moe] {label:<24} cold {cold:.3} ms | warm {warm:.3} ms");
         }
+    }
+
+    if let Some(pfile) = agree_prompts.as_ref() {
+        // Top-1 agreement, in two runs over the prompts of `--agree-prompts` (a JSON list of
+        // {"name", "prompt"}), greedy, up to `-n` tokens each:
+        //   1. reference (no --agree-ref; run it with SMALLTIDE_RESCUE_MODE=exact SMALLTIDE_SPEC=0,
+        //      so every routed expert is loaded and run): writes each prompt's tokens to --agree-out;
+        //   2. this configuration (--agree-ref <that file>): the same prompts, fed the reference's
+        //      tokens one position at a time (teacher forcing), counting the positions where its
+        //      own most likely next token is the reference's. Once through draft-verify passes
+        //      (the path speculative decoding uses) and once through single-token steps.
+        // Teacher forcing keeps every position comparable: a free-running comparison says
+        // nothing after the first difference.
+        const EOS_ID: u32 = 200_006;
+        const EOT_ID: u32 = 199_999;
+        let read_json = |path: &str| -> serde_json::Value {
+            let text = std::fs::read_to_string(path).unwrap_or_else(|e| { eprintln!("{path}: {e}"); std::process::exit(2) });
+            serde_json::from_str(&text).unwrap_or_else(|e| { eprintln!("{path}: {e}"); std::process::exit(2) })
+        };
+        let prompts = read_json(pfile);
+        let refs_in = agree_ref.as_ref().map(|f| read_json(f));
+        let out_path = agree_out.clone().unwrap_or_else(|| { eprintln!("--agree-prompts needs --agree-out <file>"); std::process::exit(2) });
+        let width = std::env::var("SMALLTIDE_AGREE_WIDTH").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8);
+        let sampling = SamplingParams { temperature: 0.0, ..SamplingParams::default() };
+        let skipped = |e: &smalltide_model_inkling2::engine::Inkling2Engine<HipBackend>| {
+            let t = &e.tide.scheduler.telemetry;
+            (t.routed_weight_skipped, t.routed_weight_total)
+        };
+        let share = |a: (f64, f64), b: (f64, f64)| if b.1 > a.1 { (b.0 - a.0) / (b.1 - a.1) } else { 0.0 };
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        for (pi, p) in prompts.as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().enumerate() {
+            let name = p["name"].as_str().unwrap_or("?").to_string();
+            let text = p["prompt"].as_str().unwrap_or("");
+            let ids = tok.encode(&format!(
+                "<|message_system|><|content_text|>Thinking effort level: {effort}<|end_message|><|message_user|><|content_text|>{text}<|end_message|>"
+            ));
+            let p0 = ids.len();
+            engine.reset_sequence().expect("reset");
+            let t0 = Instant::now();
+            engine.prefill(&ids, 0, true).expect("prefill");
+            let _ = engine.rebalance_after_prefill(128).expect("rebalance");
+            let first = engine.sample_next_token(&sampling, &[]).expect("sample");
+            let prefill_s = t0.elapsed().as_secs_f64();
+            match refs_in.as_ref() {
+                None => {
+                    let mut toks = vec![first];
+                    let t1 = Instant::now();
+                    while toks.len() <= max_tokens {
+                        let t = *toks.last().unwrap();
+                        if t == EOS_ID || t == EOT_ID {
+                            break;
+                        }
+                        engine.forward_token(t, p0 + toks.len() - 1, false, true).expect("decode");
+                        engine.post_decode_tide_step().expect("post");
+                        toks.push(engine.sample_next_token(&sampling, &[]).expect("sample"));
+                    }
+                    println!("[agree] reference {name}: prompt {p0} tokens, {} tokens in {:.1} s", toks.len(), t1.elapsed().as_secs_f64());
+                    results.push(serde_json::json!({ "name": name, "prompt_tokens": p0, "tokens": toks }));
+                }
+                Some(r) => {
+                    let r = &r[pi];
+                    let refs: Vec<u32> = r["tokens"].as_array().map(|a| a.iter().map(|v| v.as_u64().unwrap_or(0) as u32).collect()).unwrap_or_default();
+                    if r["name"].as_str() != Some(name.as_str()) || r["prompt_tokens"].as_u64() != Some(p0 as u64) || refs.is_empty() {
+                        eprintln!("[agree] {name}: the reference file does not match this prompt");
+                        std::process::exit(2);
+                    }
+                    let n = refs.len() - 1; // positions with a reference next token after the first
+                    let mut snap = None;
+                    engine.snapshot_state(p0, &mut snap).expect("snapshot");
+                    // Draft-verify passes: `width` reference tokens per pass.
+                    let s0 = skipped(&engine);
+                    let t1 = Instant::now();
+                    let (mut v_agree, mut v_first_miss, mut i) = (0usize, None::<usize>, 0usize);
+                    while i < n {
+                        let w = width.min(n - i);
+                        engine.verify(&refs[i..i + w], p0 + i).expect("verify");
+                        let am = engine.rows_argmax(w).expect("argmax");
+                        for c in 0..w {
+                            if am[c] == refs[i + c + 1] {
+                                v_agree += 1;
+                            } else if v_first_miss.is_none() {
+                                v_first_miss = Some(i + c + 1);
+                            }
+                        }
+                        engine.verify_rewind(w, w).expect("rewind");
+                        engine.post_batch_tide_step().expect("post batch");
+                        i += w;
+                    }
+                    let (v_secs, s1) = (t1.elapsed().as_secs_f64(), skipped(&engine));
+                    // Single-token steps, from the same state after the prompt.
+                    engine.restore_state(snap.as_ref().unwrap(), false).expect("restore");
+                    let t2 = Instant::now();
+                    let (mut s_agree, mut s_first_miss) = (0usize, None::<usize>);
+                    for i in 0..n {
+                        engine.forward_token(refs[i], p0 + i, false, true).expect("decode");
+                        engine.post_decode_tide_step().expect("post");
+                        if engine.sample_next_token(&sampling, &[]).expect("sample") == refs[i + 1] {
+                            s_agree += 1;
+                        } else if s_first_miss.is_none() {
+                            s_first_miss = Some(i + 1);
+                        }
+                    }
+                    let (s_secs, s2) = (t2.elapsed().as_secs_f64(), skipped(&engine));
+                    if let Some(sn) = snap.take() {
+                        engine.free_snapshot(sn).expect("free snapshot");
+                    }
+                    println!(
+                        "[agree] {name}: prompt {p0} tokens (first token {}), {n} positions | verify passes {:.2}% ({:.1} tok/s, skipped weight {:.2}%) | single steps {:.2}% ({:.1} tok/s, skipped weight {:.2}%)",
+                        if first == refs[0] { "same" } else { "DIFFERENT" },
+                        100.0 * v_agree as f64 / n.max(1) as f64, n as f64 / v_secs, 100.0 * share(s0, s1),
+                        100.0 * s_agree as f64 / n.max(1) as f64, n as f64 / s_secs, 100.0 * share(s1, s2),
+                    );
+                    results.push(serde_json::json!({
+                        "name": name, "prompt_tokens": p0, "positions": n, "prefill_s": prefill_s,
+                        "first_token_same": first == refs[0],
+                        "verify": { "agree": v_agree, "first_miss": v_first_miss, "tok_s": n as f64 / v_secs, "skipped_weight": share(s0, s1), "width": width },
+                        "single": { "agree": s_agree, "first_miss": s_first_miss, "tok_s": n as f64 / s_secs, "skipped_weight": share(s1, s2) },
+                    }));
+                }
+            }
+        }
+        std::fs::write(&out_path, serde_json::to_string_pretty(&serde_json::Value::Array(results)).unwrap()).unwrap_or_else(|e| { eprintln!("{out_path}: {e}"); std::process::exit(2) });
+        println!("[agree] wrote {out_path}");
+        return;
     }
 
     let formatted = if raw_prompt {
@@ -1380,9 +1515,34 @@ fn run_generate(args: &[String]) {
         println!("
 [rescue-check] {:.1} checks/token | wait {:.3} ms + plan {:.3} ms per check",
             pr.rescue_checks as f64 / dec_toks.max(1) as f64, pr.rescue_wait_ms / pr.rescue_checks as f64, pr.rescue_plan_ms / pr.rescue_checks as f64);
+    }
+    {
+        // Rescue batches of both paths (single-token checks and verify passes): one batch is one
+        // layer's missing experts, copied while the GPU waits at that layer.
         let (n, fill, sync) = engine.tide.rescue_stats;
         if n > 0 {
-            println!("[rescue-check] {n} rescues: {:.3} ms staging copy + {:.3} ms copy-stream wait each", fill / n as f64, sync / n as f64);
+            println!("[rescue-check] {n} rescue batches: {:.3} ms staging copy + {:.3} ms copy-stream wait each", fill / n as f64, sync / n as f64);
+            for (i, (b, f, w)) in engine.tide.rescue_hist.iter().enumerate() {
+                if *b > 0 {
+                    println!("[rescue-check]   batches of {}{}: {b} | {:.3} ms staging + {:.3} ms wait", i + 1, if i == 3 { "+" } else { "" }, f / *b as f64, w / *b as f64);
+                }
+            }
+            let (d, dn, dnone) = engine.tide.stage_disk;
+            if dn > 0 {
+                println!("[rescue-check]   read from the disk while staging: {dn} experts ({dnone} of them had no RAM copy), {:.2} ms each", d * 1e3 / dn as f64);
+            }
+            let (pn, pb) = engine.tide.ram_pinned_stats();
+            if pb > 0 {
+                println!("[rescue-check]   page-locked RAM copies: {pn} experts in {:.2} GiB; {} experts uploaded straight from them", pb as f64 / (1u64 << 30) as f64, engine.tide.pinned_uploads);
+            }
+            let kept = engine.tide.scheduler.telemetry.evicted_kept_in_ram;
+            if kept > 0 {
+                println!("[rescue-check]   {kept} experts left the card with no RAM copy and were read back in the background");
+            }
+            let (c, k) = engine.tide.stage_copy;
+            if k > 0 {
+                println!("[rescue-check] {k} experts staged in all (prefill included): {:.3} ms each copying from RAM into the staging buffer", c * 1e3 / k as f64);
+            }
         }
     }
     if spec && spec_steps > 0 {
@@ -1636,6 +1796,7 @@ fn run_stress_rescue(mode: &str, tokens: usize) {
             backend.rescue_write_route(
                 rview.slice(il * ROUTE_STRIDE * 4, ROUTE_STRIDE * 4),
                 route_row,
+                16,
                 16,
                 ticket,
                 compute_stream,

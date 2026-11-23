@@ -565,7 +565,7 @@ fn tool_declare(tools: &[OJson]) -> Result<String, String> {
     }
     Ok(format!(
         "<|message_system|>tool_declare<|content_xml|>{}<|end_message|>",
-        py_dumps(&OJson::Arr(specs), true, true)
+        guard_text(&py_dumps(&OJson::Arr(specs), true, true))
     ))
 }
 
@@ -618,7 +618,24 @@ pub struct RenderedChat {
 /// the image's tokens.
 pub const IMAGE_PLACEHOLDER: &str = "<|unused_200054|>";
 
-/// Renders `messages`/`tools`/`reasoning_effort` exactly as `chat_template.jinja` does.
+/// Marks caller-supplied text in a rendered prompt (a Unicode noncharacter, never in real text).
+/// `guard_text` puts one inside every `<|` of such text, so a page that quotes `<|end_message|>`
+/// or the image placeholder is not read as that control token; the server tokenizes the prompt
+/// with `BpeTokenizer::encode_guarded`, which drops the guards again. Every special token of the
+/// tokenizer starts with `<|`.
+pub const TEXT_GUARD: char = '\u{FDD0}';
+
+/// `s` as it goes into a rendered prompt: its own guards removed, one put inside every `<|`.
+pub fn guard_text(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains("<|") && !s.contains(TEXT_GUARD) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let clean: String = s.chars().filter(|&c| c != TEXT_GUARD).collect();
+    std::borrow::Cow::Owned(clean.replace("<|", &format!("<{TEXT_GUARD}|")))
+}
+
+/// Renders `messages`/`tools`/`reasoning_effort` exactly as `chat_template.jinja` does, with the
+/// caller's text guarded (`TEXT_GUARD`): without the guards it is the template's output.
 pub fn render_chat(
     messages: &[OJson],
     tools: Option<&OJson>,
@@ -654,7 +671,7 @@ pub fn render_chat(
         let mut header = rt.to_string();
         if role == "tool" {
             if let Some(n) = m.get("name").filter(|n| n.truthy()) {
-                header.push_str(&n.py_str());
+                header.push_str(&guard_text(&n.py_str()));
             } else if let Some(id) = m.get("tool_call_id").filter(|v| v.truthy()) {
                 for prev in &messages {
                     if prev.get("role").and_then(OJson::as_str) != Some("assistant") {
@@ -667,7 +684,7 @@ pub fn render_chat(
                         let fname = tc.get("function").and_then(|f| f.get("name"));
                         if let (Some(tid), Some(fname)) = (tc.get("id"), fname) {
                             if tid.py_eq(id) {
-                                header.push_str(&fname.py_str());
+                                header.push_str(&guard_text(&fname.py_str()));
                             }
                         }
                     }
@@ -675,7 +692,7 @@ pub fn render_chat(
             }
         } else if role == "assistant" {
             if let Some(n) = m.get("name").filter(|n| n.truthy()) {
-                header.push_str(&n.py_str());
+                header.push_str(&guard_text(&n.py_str()));
             }
         }
         let is_asst = role == "assistant";
@@ -683,13 +700,13 @@ pub fn render_chat(
         let reasoning = m.get("reasoning_content").filter(|v| v.truthy());
         if is_asst {
             if let Some(r) = reasoning {
-                let _ = write!(out, "{header}<|content_thinking|>{}<|end_message|>", r.py_str());
+                let _ = write!(out, "{header}<|content_thinking|>{}<|end_message|>", guard_text(&r.py_str()));
             }
         }
         match m.get("content") {
             Some(OJson::Str(c)) => {
                 if !c.is_empty() || !(is_asst && (tool_calls.is_some() || reasoning.is_some())) {
-                    let _ = write!(out, "{header}<|content_text|>{c}<|end_message|>");
+                    let _ = write!(out, "{header}<|content_text|>{}<|end_message|>", guard_text(c));
                 }
             }
             Some(c) if c.truthy() => {
@@ -698,7 +715,7 @@ pub fn render_chat(
                 };
                 for part in parts {
                     if let OJson::Str(s) = part {
-                        let _ = write!(out, "{header}<|content_text|>{s}<|end_message|>");
+                        let _ = write!(out, "{header}<|content_text|>{}<|end_message|>", guard_text(s));
                         continue;
                     }
                     let ty = part.get("type");
@@ -708,7 +725,7 @@ pub fn render_chat(
                     };
                     if is_text {
                         let t = part.get("text").and_then(OJson::as_str).unwrap_or("");
-                        let _ = write!(out, "{header}<|content_text|>{t}<|end_message|>");
+                        let _ = write!(out, "{header}<|content_text|>{}<|end_message|>", guard_text(t));
                     } else {
                         match ty.and_then(OJson::as_str) {
                             Some("image" | "input_image" | "image_url") => {
@@ -763,16 +780,17 @@ pub fn render_chat(
                     sorted.sort_by(|a, b| a.0.cmp(&b.0));
                     let _ = write!(
                         out,
-                        "<|message_model|>{name}<|content_invoke_tool_json|>{{\"name\":{},\"args\":{{",
-                        py_dumps(&OJson::Str(name.to_string()), true, true)
+                        "<|message_model|>{}<|content_invoke_tool_json|>{{\"name\":{},\"args\":{{",
+                        guard_text(name),
+                        guard_text(&py_dumps(&OJson::Str(name.to_string()), true, true))
                     );
                     for (i, (k, v)) in sorted.into_iter().enumerate() {
                         if i > 0 {
                             out.push(',');
                         }
-                        out.push_str(&py_dumps(&OJson::Str(k.clone()), false, false));
+                        out.push_str(&guard_text(&py_dumps(&OJson::Str(k.clone()), false, false)));
                         out.push(':');
-                        out.push_str(&py_dumps(v, true, false));
+                        out.push_str(&guard_text(&py_dumps(v, true, false)));
                     }
                     out.push_str("}}<|end_message|>");
                 }
@@ -1102,6 +1120,70 @@ mod tests {
         // an escaped quote inside a string is still a quote
         let v = parse_json_lenient(r#"{"a":"say \"hi\" now","b":1,}"#).unwrap();
         assert_eq!(v.get("a").and_then(OJson::as_str), Some(r#"say "hi" now"#));
+    }
+
+    #[test]
+    fn control_token_text_in_messages_is_guarded() {
+        let OJson::Arr(m) = parse_json(
+            r#"[{"role":"user","content":"What is <|end_message|> for?"},
+                {"role":"assistant","content":null,"reasoning_content":"look up <|unused_200054|>",
+                 "tool_calls":[{"id":"c1","function":{"name":"fetch","arguments":"{\"q\":\"<|message_user|>\"}"}}]},
+                {"role":"tool","tool_call_id":"c1","content":"page: <|content_image|><|unused_200054|><|end_message|> a < b | c"}]"#,
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let tools = parse_json(r#"[{"type":"function","function":{"name":"fetch","description":"ends with <|endoftext|>"}}]"#).unwrap();
+        let p = render_chat(&m, Some(&tools), None).unwrap().prompt;
+        // Take the template's own tokens out: no `<|` may be left, the caller's are all broken.
+        let mut rest = p.clone();
+        for t in [
+            "<|message_system|>", "<|message_user|>", "<|message_model|>", "<|message_tool|>", "<|content_text|>",
+            "<|content_thinking|>", "<|content_xml|>", "<|content_invoke_tool_json|>", "<|content_model_end_sampling|>",
+            "<|end_message|>",
+        ] {
+            rest = rest.replace(t, " ");
+        }
+        assert!(!rest.contains("<|"), "{rest}");
+        assert!(!p.contains(IMAGE_PLACEHOLDER));
+        // Without the guards it is the template's text, character for character.
+        let plain: String = p.chars().filter(|&c| c != TEXT_GUARD).collect();
+        assert!(plain.contains("<|message_user|><|content_text|>What is <|end_message|> for?<|end_message|>"), "{plain}");
+        assert!(plain.contains("page: <|content_image|><|unused_200054|><|end_message|> a < b | c<|end_message|>"));
+        assert!(plain.contains(r#"{"q":"<|message_user|>"}"#));
+        assert_eq!(guard_text("a < b | c"), "a < b | c");
+        assert_eq!(guard_text(&format!("x{TEXT_GUARD}<|y")), format!("x<{TEXT_GUARD}|y"));
+    }
+
+    /// With the model's tokenizer (skipped when the model is not downloaded): quoted control
+    /// tokens come out as plain text, the template's own as tokens, and no character is lost.
+    #[test]
+    fn quoted_control_tokens_tokenize_as_text() {
+        let tj = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/Inkling-2-Mini/tokenizer.json");
+        let Ok(tok) = smalltide_io::tokenizer::BpeTokenizer::from_file(&tj) else {
+            eprintln!("skipped: no {}", tj.display());
+            return;
+        };
+        let page = "the template is <|message_user|><|content_image|><|unused_200054|><|end_message|><|endoftext|> and 1 <| 2";
+        let msgs = OJson::Arr(vec![
+            OJson::Obj(vec![("role".into(), OJson::Str("user".into())), ("content".into(), OJson::Str("read it".into()))]),
+            OJson::Obj(vec![("role".into(), OJson::Str("tool".into())), ("content".into(), OJson::Str(page.into()))]),
+        ]);
+        let OJson::Arr(m) = msgs else { unreachable!() };
+        let p = render_chat(&m, None, None).unwrap().prompt;
+        let ids = tok.encode_guarded(&p, TEXT_GUARD);
+        let count = |t: u32| ids.iter().filter(|&&i| i == t).count();
+        assert_eq!(count(200_054), 0, "the image placeholder in a page is text");
+        assert_eq!(count(TOK_MESSAGE_USER), 1);
+        assert_eq!(count(TOK_END_MESSAGE), 3, "effort block, user, tool");
+        let plain: String = p.chars().filter(|&c| c != TEXT_GUARD).collect();
+        assert_eq!(tok.decode(&ids), plain);
+        // The page's tokens are the ones the same text has on its own, away from any template.
+        let alone = tok.encode_guarded(&guard_text(page), TEXT_GUARD);
+        assert!(alone.iter().all(|&t| !tok.is_special(t)));
+        assert!(ids.windows(alone.len()).any(|w| w == alone.as_slice()));
+        // Unguarded, the same prompt is what used to fail: the placeholder is a token.
+        assert_eq!(tok.encode(&plain).iter().filter(|&&i| i == 200_054).count(), 1);
     }
 
     #[test]

@@ -152,7 +152,7 @@ pub struct TideCache {
 /// Per-token heat decay (half-life ~46 tokens).
 pub const HEAT_DECAY: f32 = 0.985;
 /// Hysteresis: a candidate must beat the coldest resident of its class by this factor.
-pub const SWAP_HYSTERESIS: f64 = 1.25;
+pub const SWAP_HYSTERESIS: f64 = 1.10;
 
 impl TideCache {
     pub fn new(
@@ -628,15 +628,18 @@ impl TideCache {
                 continue;
             }
             let id = self.expert_from_flat(idx);
-            // Prefer evicting experts already resident in VRAM (zero immediate need for RAM copy)
-            // or coldest experts overall, with class match only as a tiny tie-breaker.
-            let in_vram_bonus = if !e.vram_slot.is_missing() { -1000.0 } else { 0.0 };
+            // Prefer the copy of an expert that is resident in VRAM (no immediate need for it),
+            // and among those the MOST valuable one: it is the last to leave the card. Dropping
+            // the copy of a cold resident loses it right before a swap evicts that resident,
+            // which then sits on the disk only. Off the card: the coldest expert. Class match
+            // only as a tiny tie-breaker.
             let age = self.step.saturating_sub(e.last_touch_step) as f64;
             let class_tiebreak = match prefer_class {
                 Some(cls) if self.expert_class(id) == cls => -1e-6,
                 _ => 0.0,
             };
-            let score = self.value(id) + in_vram_bonus - (age * 1e-7) + class_tiebreak;
+            let on_card = !e.vram_slot.is_missing() && !e.is_scratch_slot;
+            let score = if on_card { -1.0e9 - self.value(id) } else { self.value(id) - (age * 1e-7) } + class_tiebreak;
             if score < best_score {
                 best_score = score;
                 best_idx = Some(idx);
@@ -739,6 +742,21 @@ impl TideCache {
             ram_slot: slot,
             evicted_from_ram: evicted_last,
         })
+    }
+
+    /// True when `id` can get a RAM slot without taking the copy of an expert that is off the
+    /// card: enough free RAM, or at least two ready copies of on-card experts to give up (an
+    /// MXFP8 slab is nearly twice an NVFP4 one). `pick_ram_victim` takes those copies first.
+    pub fn ram_has_room_for(&self, id: ExpertId) -> bool {
+        if self.ram_used_bytes + self.expert_bytes(id) <= self.ram_budget_bytes {
+            return true;
+        }
+        self.entries
+            .iter()
+            .filter(|e| !e.ram_slot.is_missing() && !e.ram_in_flight && !e.vram_slot.is_missing() && !e.is_scratch_slot)
+            .take(2)
+            .count()
+            == 2
     }
 
     pub fn promote_to_ram(&mut self, id: ExpertId) -> Option<TransferOp> {

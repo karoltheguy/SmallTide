@@ -28,6 +28,10 @@ pub const EV_DROPPED: u8 = 6;
 /// The names the server sends beside the kinds, by kind
 pub const EV_NAMES: [&str; 7] = ["", "hot read", "inline rescue", "adaptation", "preload", "predicted read", "rescue not kept"];
 
+/// Number of missed-pick routing-share histogram bins per zone (each 2% wide: 0-2%, ..., 38%+).
+pub const RESCUE_HIST_BINS: usize = 20;
+pub const RESCUE_HIST_BIN_PCT: usize = 2;
+
 /// One residency event: (layer, expert) came in (or, EV_DROPPED, was used and let go), `share` the
 /// missed pick's share of its token's routing weight (0 when no token caused it), `victim` the expert
 /// whose slot it took. `at`: seconds since the Unix epoch.
@@ -118,6 +122,65 @@ impl RouteLog {
     }
 }
 
+/// Per-block (`Prelude`, `Loop Core`, `Coda`) rescue gate & budget tuning snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RescueZoneSnapshot {
+    pub name: &'static str,
+    pub layers_label: &'static str,
+    /// Effective routing-share gate in `[0, 1]` for this block (0.0 for Exact, 1.0 for Disabled).
+    pub gate: f32,
+    /// Configured base budget per single-token step (`verify_rows == 1`).
+    pub base_budget: usize,
+    /// Rolling-window average effective budget per step (reflects verify_rows > 1 scaling).
+    pub avg_budget: f64,
+    /// Rolling-window average rescues used per step.
+    pub avg_used: f64,
+    /// 95th-percentile rescues used in a single step over the rolling window.
+    pub p95_used: usize,
+    /// Maximum rescues used in a single step over the rolling window.
+    pub max_used: usize,
+    /// Average budget utilization (`avg_used / avg_budget * 100`).
+    pub util_pct: f64,
+    /// Percentage of rolling-window steps where `used >= budget` (budget saturated).
+    pub capped_pct: f64,
+    /// Percentage of rolling-window steps where `used == 0`.
+    pub zero_pct: f64,
+    /// Percentage of all steps since boot where `used >= budget`.
+    pub boot_capped_pct: f64,
+    /// Total rescues performed in this block since boot.
+    pub boot_rescued: u64,
+    /// Rolling-window average layers/step short-circuited after the zone budget was spent.
+    pub avg_capped_layers: f64,
+    /// Rolling-window average missed picks/step with `share >= gate` that went unrescued.
+    pub avg_blocked_picks: f64,
+    /// Rolling-window average missed picks/step with `share < gate`.
+    pub avg_below_gate_picks: f64,
+    /// Rolling-window average skipped routing share/step from picks `>= gate`.
+    pub avg_blocked_weight: f64,
+    /// Rolling-window average skipped routing share/step from picks `< gate`.
+    pub avg_below_weight: f64,
+    /// Average routing share of rescued picks in the rolling window (0 when none rescued).
+    pub rescued_share_avg: f64,
+    /// Minimum routing share of rescued picks in the rolling window (0 when none rescued).
+    pub rescued_share_min: f64,
+    /// Histogram of ALL missed picks' normalized routing shares over the rolling window
+    /// (20 bins of 2% width: `[0..2%), [2..4%), ..., [38%..100%]`).
+    pub miss_hist: [u32; RESCUE_HIST_BINS],
+    /// Observational balance label: `"balanced"`, `"saturated"`, `"tight"`, `"underused"`, `"idle"`, `"off"`, `"exact"`.
+    pub status: &'static str,
+}
+
+/// Complete rescue gate & budget tuning telemetry across all 3 layer blocks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RescueSnapshot {
+    pub policy: &'static str,
+    pub window_steps: usize,
+    pub total_steps: u64,
+    pub base_budget_total: usize,
+    pub last_verify_rows: usize,
+    pub zones: [RescueZoneSnapshot; 3],
+}
+
 pub struct ExpertMap {
     /// the model's layer index of each row: the layers with routed experts, in order
     pub layers: Vec<usize>,
@@ -140,6 +203,8 @@ pub struct ExpertMap {
     pub events: Vec<MapEvent>,
     /// the recent decode passes' routing, oldest first (empty for an engine that keeps none)
     pub routes: Vec<MapRoute>,
+    /// Per-block (Prelude / Loop Core / Coda) rescue gate & budget tuning stats
+    pub rescue: Option<RescueSnapshot>,
 }
 
 impl ExpertMap {
@@ -179,7 +244,7 @@ mod tests {
     fn rows_and_counts() {
         let m = ExpertMap { layers: vec![3, 5], experts: 4, state: vec![0, 1, 1, 3, 2, 0, 0, 1],
                             demand: Some(vec![0.0, 1.0, 4.0, 1e-9, 0.0, 0.0, 0.0, 0.0]), slots: 8, spare: 2, world: 2, busy: false,
-                            counters: vec![], events: vec![], routes: vec![] };
+                            counters: vec![], events: vec![], routes: vec![], rescue: None };
         assert_eq!(m.counts(), [3, 3, 1, 1]);
         assert_eq!(m.state_rows(), ["0113", "2001"]);
         // 1/4 of the top is half the scale; a trace of mass is never shown as none; an unused row is all 0

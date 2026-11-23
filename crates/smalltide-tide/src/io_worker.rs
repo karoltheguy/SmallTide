@@ -25,7 +25,7 @@ enum IoCommand {
         ram_slot: SlotIndex,
         slab_len: usize,
     },
-    /// High-priority synchronous read (cold start or blocking sync rescue).
+    /// Synchronous read (cold start or blocking sync rescue): served before queued `AsyncRead`s.
     SyncRead {
         expert: ExpertId,
         slab_len: usize,
@@ -51,7 +51,26 @@ impl Stage2IoWorker {
         let handle = thread::Builder::new()
             .name("smalltide-stage2-nvme".into())
             .spawn(move || {
-                while let Ok(cmd) = rx_cmd.recv() {
+                // A synchronous read has the GPU waiting for it (a rescue of an expert that is
+                // on the disk only): it goes ahead of every queued background read, so it waits
+                // for at most the read in progress. In arrival order it waited behind all of
+                // them (seen: 20 ms a read with a hundred background reads queued).
+                let mut queue: std::collections::VecDeque<IoCommand> = std::collections::VecDeque::new();
+                loop {
+                    if queue.is_empty() {
+                        match rx_cmd.recv() {
+                            Ok(cmd) => queue.push_back(cmd),
+                            Err(_) => break,
+                        }
+                    }
+                    while let Ok(cmd) = rx_cmd.try_recv() {
+                        queue.push_back(cmd);
+                    }
+                    let first = queue
+                        .iter()
+                        .position(|c| matches!(c, IoCommand::SyncRead { .. } | IoCommand::Shutdown))
+                        .unwrap_or(0);
+                    let Some(cmd) = queue.remove(first) else { break };
                     match cmd {
                         IoCommand::AsyncRead {
                             expert,

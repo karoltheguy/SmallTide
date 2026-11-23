@@ -96,12 +96,24 @@ fn peer_disconnected(stream: &TcpStream) -> bool {
     closed
 }
 
+thread_local! {
+    /// The engine thread's fault report (`Inkling2Engine::rescue_state_report`), printed with
+    /// every engine error.
+    static FAULT_REPORT: std::cell::RefCell<Option<Box<dyn Fn() -> String>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Logs an engine error for a request; a lost GPU context (HIP launch failure / illegal address:
 /// sticky, every later launch fails too) ends the process with a clear message instead of a server
 /// that answers every request with an error.
 fn engine_error(what: &str, msg: &str) -> String {
     let line = format!("{what}: {msg}");
     eprintln!("[error] {line}");
+    // Where the rescue handshake stood (host memory only: safe with the GPU context lost).
+    FAULT_REPORT.with(|f| {
+        if let Some(report) = f.borrow().as_ref() {
+            eprint!("{}", report());
+        }
+    });
     if ["hipError_t=719", "hipError_t=700", "hipError_t=999"].iter().any(|c| msg.contains(c)) {
         eprintln!("[fatal] the GPU context is lost ({msg}); the server must be restarted - exiting");
         std::process::exit(2);
@@ -144,7 +156,12 @@ enum EngineCommand {
         reply_tx: Sender<Value>,
     },
     UpdateConfig {
-        rescue_policy: RescuePolicy,
+        rescue_policy: Option<RescuePolicy>,
+        rescue_budget: Option<usize>,
+        rescue_zone_budgets: Option<[usize; 3]>,
+        loop_core_gate: Option<f32>,
+        async_per_token: Option<usize>,
+        async_hysteresis: Option<f64>,
         reply_tx: Sender<Value>,
     },
 }
@@ -197,6 +214,11 @@ struct CompletionReq {
 struct TideConfigReq {
     rescue_mode: Option<String>,
     rescue_threshold: Option<f32>,
+    rescue_budget: Option<usize>,
+    rescue_zone_budgets: Option<[usize; 3]>,
+    loop_core_gate: Option<f32>,
+    async_per_token: Option<usize>,
+    async_hysteresis: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -263,7 +285,7 @@ fn render_chat_request(body: &OJson) -> Result<(String, Option<String>, bool, Ve
     let images = r.images;
     let mut prompt = r.prompt;
     if let Some(n) = &forced {
-        prompt.push_str(&format!("<|message_model|>{n}<|content_invoke_tool_json|>"));
+        prompt.push_str(&format!("<|message_model|>{}<|content_invoke_tool_json|>", chat_format::guard_text(n)));
     }
     let single = forced.is_some() || matches!(body.get("parallel_tool_calls"), Some(OJson::Bool(false)));
     Ok((prompt, forced, single, images))
@@ -371,6 +393,16 @@ pub fn run_serve(args: &[String]) {
     let s = crate::settings::Settings::from_env();
     let (host, port) = (s.host.clone(), s.port);
     println!("=== SmallTide OpenAI API Server (model: {SERVED_MODEL_NAME}) ===");
+    // The port first: a second server stops here, before it loads a second copy of the model
+    // next to the running one (two copies overfill the card and the RAM within seconds).
+    let bind_addr = format!("{host}:{port}");
+    let listener = match TcpListener::bind(&bind_addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[fatal] cannot listen on {bind_addr}: {e} - is another smalltide server already running?");
+            std::process::exit(1);
+        }
+    };
     println!("Loading tokenizer, FP8 dense weights, and expert pools from {} ...", s.model_dir.display());
     let crate::settings::Loaded { engine, tok, .. } = crate::settings::build_engine(&s, s.lanes);
     let tok = Arc::new(tok);
@@ -379,8 +411,6 @@ pub fn run_serve(args: &[String]) {
     let tok_worker = tok.clone();
     thread::spawn(move || engine_worker_loop(engine, tok_worker, cmd_rx));
 
-    let bind_addr = format!("{host}:{port}");
-    let listener = TcpListener::bind(&bind_addr).expect("bind HTTP server");
     println!("Listening on http://{bind_addr}");
     println!("  GET  http://127.0.0.1:{port}/expert-map");
     println!("  GET  http://127.0.0.1:{port}/health");
@@ -585,11 +615,11 @@ fn finish_req(
     let (dr, dm, dd) = (
         tel.stage1_sync_rescues - req.log_c0.0,
         tel.stage1_skipped_tail_misses - req.log_c0.1,
-        tel.stage2_disk_reads - req.log_c0.2,
+        tel.rescue_disk_reads - req.log_c0.2,
     );
     let ntok = req.generated.len().max(1) as f64;
     eprintln!(
-        "[req] lane {lane}: finish={} prompt {} (cached {}) -> {} tokens: answer {} chars, thinking {} chars, {} tool call(s) | skipped expert weight {:.1}% | per token: {:.1} rescue loads, {:.1} skipped experts, {:.1} disk reads | ends with {:?}",
+        "[req] lane {lane}: finish={} prompt {} (cached {}) -> {} tokens: answer {} chars, thinking {} chars, {} tool call(s) | skipped expert weight {:.1}% | per token: {:.1} rescue loads, {:.1} skipped experts, {:.1} disk reads with the GPU waiting | ends with {:?}",
         if req.n_tool_calls > 0 && req.finish_reason == "stop" { "tool_calls" } else { req.finish_reason },
         req.prompt_len,
         req.reuse_len,
@@ -621,6 +651,10 @@ fn engine_worker_loop(
     tok: Arc<BpeTokenizer>,
     cmd_rx: Receiver<EngineCommand>,
 ) {
+    // The fault report reads the engine through a raw pointer: on this thread only, between
+    // engine calls, and `engine` stays in this frame until the thread ends.
+    let engine_ptr: *const Inkling2Engine<HipBackend> = std::ptr::addr_of!(engine);
+    FAULT_REPORT.with(|f| *f.borrow_mut() = Some(Box::new(move || unsafe { (*engine_ptr).rescue_state_report() })));
     let n_lanes = engine.num_lanes();
     let env_usize = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(d);
     let mut pc: PrefixCache<SeqSnapshot> = PrefixCache::new(
@@ -722,6 +756,7 @@ fn engine_worker_loop(
                         "prompt_aware_swaps": tel.prompt_aware_swaps,
                         "experts_vram_resident": { "prelude": pre, "loop_core": core, "coda": coda },
                         "experts_ram_warm": ram,
+                        "rescue": crate::expert_map::rescue_json(&engine.tide.scheduler.rescue_snapshot()),
                         "kv_pool": engine.kv_pool_info().map(|(pages, free, per, _)| json!({"pages": pages, "free": free, "positions_per_page": per})),
                         "prefix_cache": {
                             "requests": pc.stats.requests,
@@ -745,11 +780,43 @@ fn engine_worker_loop(
                     });
                     let _ = reply_tx.send(stats);
                 }
-                EngineCommand::UpdateConfig { rescue_policy, reply_tx } => {
-                    engine.tide.scheduler.tide_cfg.rescue_policy = rescue_policy;
+                EngineCommand::UpdateConfig {
+                    rescue_policy,
+                    rescue_budget,
+                    rescue_zone_budgets,
+                    loop_core_gate,
+                    async_per_token,
+                    async_hysteresis,
+                    reply_tx,
+                } => {
+                    let s = &mut engine.tide.scheduler;
+                    if let Some(p) = rescue_policy {
+                        s.tide_cfg.rescue_policy = p;
+                    }
+                    if let Some(b) = rescue_budget {
+                        s.rescue_budget = b;
+                    }
+                    if let Some(z) = rescue_zone_budgets {
+                        s.rescue_zone_budgets = Some(z);
+                    }
+                    if let Some(g) = loop_core_gate {
+                        s.loop_core_gate = Some(g);
+                    }
+                    if let Some(a) = async_per_token {
+                        s.tide_cfg.max_async_vram_promotions_per_token = a;
+                    }
+                    if let Some(h) = async_hysteresis {
+                        s.async_hysteresis = h.max(1.0);
+                    }
+                    s.reset_rescue_window();
                     let _ = reply_tx.send(json!({
                         "ok": true,
-                        "rescue_policy": format!("{:?}", engine.tide.scheduler.tide_cfg.rescue_policy),
+                        "rescue_policy": format!("{:?}", s.tide_cfg.rescue_policy),
+                        "rescue_zone_budgets": s.effective_zone_budgets(1),
+                        "loop_core_gate": s.loop_core_gate,
+                        "async_per_token": s.tide_cfg.max_async_vram_promotions_per_token,
+                        "async_hysteresis": s.async_hysteresis,
+                        "rescue": crate::expert_map::rescue_json(&s.rescue_snapshot()),
                     }));
                 }
                 g @ EngineCommand::Generate { .. } => queue.push_back(g),
@@ -780,7 +847,10 @@ fn engine_worker_loop(
                 else {
                     unreachable!()
                 };
-                let (prompt_ids, image_starts, image_err) = match expand_images(tok.encode(&prompt_text), &images) {
+                // A chat prompt's caller text is guarded: control tokens typed or quoted in a
+                // message (a fetched page showing the chat template) stay plain text.
+                let ids = if is_chat { tok.encode_guarded(&prompt_text, chat_format::TEXT_GUARD) } else { tok.encode(&prompt_text) };
+                let (prompt_ids, image_starts, image_err) = match expand_images(ids, &images) {
                     Ok((ids, starts)) => (ids, starts, None),
                     Err(e) => (Vec::new(), Vec::new(), Some(e)),
                 };
@@ -788,6 +858,7 @@ fn engine_worker_loop(
                     (!images.is_empty() && vision.is_none()).then(|| "image input is not available on this server (no vision tower in the checkpoint)".to_string())
                 });
                 if let Some(message) = image_err {
+                    eprintln!("[bad-request] {message}");
                     let _ = event_tx.send(StreamEvent::BadRequest { code: "invalid_image", message });
                 } else if prompt_ids.is_empty() {
                     let _ = event_tx.send(StreamEvent::BadRequest {
@@ -1003,12 +1074,16 @@ fn engine_worker_loop(
                             let greedy = req.sampling.temperature <= 0.0
                                 && (req.sampling.repetition_penalty - 1.0).abs() < 1e-6;
                             let tv = Instant::now();
-                            let vres = engine
-                                .verify_for_sampling(&block, req.pos, greedy)
-                                .and_then(|_| engine.verify_sample(&block, &req.sampling, &req.generated));
+                            let vres: std::result::Result<(usize, u32), (&'static str, String)> =
+                                match engine.verify_for_sampling(&block, req.pos, greedy) {
+                                    Err(e) => Err(("verify forward error", e.to_string())),
+                                    Ok(()) => engine
+                                        .verify_sample(&block, &req.sampling, &req.generated)
+                                        .map_err(|e| ("verify sample error", e.to_string())),
+                                };
                             match vres {
-                                Err(e) => {
-                                    let _ = req.event_tx.send(StreamEvent::Error(engine_error("verify error", &e.to_string())));
+                                Err((what, e)) => {
+                                    let _ = req.event_tx.send(StreamEvent::Error(engine_error(what, &e)));
                                     pc.invalidate(l);
                                     drafter_state = None;
                                     done = true;
@@ -1020,7 +1095,9 @@ fn engine_worker_loop(
                                         drafter_state = None;
                                         done = true;
                                     } else {
-                                        let _ = engine.post_batch_tide_step();
+                                        if let Err(e) = engine.post_batch_tide_step() {
+                                            let _ = engine_error("post verify tide step", &e.to_string());
+                                        }
                                         let dt_v = tv.elapsed().as_secs_f64() * 1000.0;
                                         spec_vbase_ema = 0.85 * spec_vbase_ema + 0.15 * (dt_v - 2.3 * n as f64).clamp(10.0, 30.0);
                                         let eval_n = (c + 1).min(n);
@@ -1289,7 +1366,7 @@ fn admit(
         log_w0: (engine.telemetry().routed_weight_total, engine.telemetry().routed_weight_skipped),
         log_c0: {
             let t = engine.telemetry();
-            (t.stage1_sync_rescues, t.stage1_skipped_tail_misses, t.stage2_disk_reads)
+            (t.stage1_sync_rescues, t.stage1_skipped_tail_misses, t.rescue_disk_reads)
         },
     })
 }
@@ -1458,15 +1535,24 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     return;
                 }
             };
-            let policy = match req.rescue_mode.as_deref().unwrap_or("threshold") {
-                "exact" => RescuePolicy::Exact,
-                "disabled" | "none" => RescuePolicy::Disabled,
-                _ => RescuePolicy::Threshold(req.rescue_threshold.unwrap_or(0.25)),
+            let policy = if req.rescue_mode.is_some() || req.rescue_threshold.is_some() {
+                Some(match req.rescue_mode.as_deref().unwrap_or("threshold") {
+                    "exact" => RescuePolicy::Exact,
+                    "disabled" | "none" => RescuePolicy::Disabled,
+                    _ => RescuePolicy::Threshold(req.rescue_threshold.unwrap_or(0.12)),
+                })
+            } else {
+                None
             };
             let (tx, rx) = mpsc::channel();
             if cmd_tx
                 .send(EngineCommand::UpdateConfig {
                     rescue_policy: policy,
+                    rescue_budget: req.rescue_budget,
+                    rescue_zone_budgets: req.rescue_zone_budgets,
+                    loop_core_gate: req.loop_core_gate,
+                    async_per_token: req.async_per_token,
+                    async_hysteresis: req.async_hysteresis,
                     reply_tx: tx,
                 })
                 .is_ok()
@@ -1488,6 +1574,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
             let req: ChatCompletionReq = match serde_json::from_slice(&body) {
                 Ok(r) => r,
                 Err(e) => {
+                    eprintln!("[bad-request] /v1/chat/completions JSON parse failed: {e}");
                     write_json_response(
                         &mut stream,
                         "400 Bad Request",
@@ -1504,6 +1591,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
             let (prompt_text, forced_tool, single_tool_call, images) = match rendered {
                 Ok(r) => r,
                 Err(e) => {
+                    eprintln!("[bad-request] /v1/chat/completions render failed: {e}");
                     write_json_response(
                         &mut stream,
                         "400 Bad Request",

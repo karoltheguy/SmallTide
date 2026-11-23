@@ -38,6 +38,21 @@ struct TableUploadBuf {
     used: bool,
 }
 
+const STAGE_KICK_DEFAULT: bool = true;
+
+/// A RAM-tier expert copy in page-locked memory (`SMALLTIDE_RAM_PINNED_GB`): its upload to VRAM
+/// goes straight from this buffer, without the copy into the staging ring that otherwise takes
+/// about 0.2 of the 0.45 ms a rescued expert costs. One buffer per RAM slot, allocated on first
+/// use while the page-locked budget lasts, and kept for the slot's later occupants.
+struct PinnedSlab {
+    /// The expert whose bytes the buffer holds now (None: nothing valid).
+    owner: Option<ExpertId>,
+    buf: PinnedBuf,
+    len: usize,
+    /// `uploads_issued` at the last upload queued from this buffer.
+    upload_seq: u64,
+}
+
 pub struct TideExecutor<B: ComputeBackend> {
     pub backend: Arc<B>,
     pub scheduler: TideScheduler,
@@ -61,8 +76,32 @@ pub struct TideExecutor<B: ComputeBackend> {
     /// Tier 1 Host RAM warm expert slabs, keyed by `(class, ram_slot)` and tagged with the
     /// expert they hold so a re-used slot can never silently feed stale bytes to a DMA.
     ram_slabs: HashMap<(ExpertClass, SlotIndex), (ExpertId, Vec<u8>)>,
+    /// Page-locked part of the RAM tier (see `PinnedSlab`): byte budget, bytes allocated, buffers.
+    /// A RAM copy is in `pinned_slabs` or in `ram_slabs`, never both.
+    ram_pinned_budget: usize,
+    ram_pinned_bytes: usize,
+    pinned_slabs: HashMap<(ExpertClass, SlotIndex), PinnedSlab>,
+    /// Uploads queued straight from page-locked RAM copies, and how many of them the host has
+    /// since seen land (a copy-stream sync): a buffer with a later upload is not overwritten.
+    uploads_issued: u64,
+    uploads_synced: u64,
+    /// Experts uploaded straight from a page-locked RAM copy.
+    pub pinned_uploads: u64,
     /// Dev: (rescues, host ms issuing (RAM -> staging copies), ms waiting for the copy stream).
     pub rescue_stats: (u64, f64, f64),
+    /// The last `execute_rescue_now`: ms filling the staging buffer (RAM / disk reads), ms waiting for the copies to land.
+    pub last_rescue_ms: (f64, f64),
+    /// Seconds spent copying experts from the RAM tier into the staging buffer, and how many
+    /// (rescues, promotions and prefill staging alike): the largest host-side cost of a rescue.
+    pub stage_copy: (f64, u64),
+    /// Rescue batches by size (1, 2, 3, 4 or more experts): (batches, staging ms, wait ms).
+    pub rescue_hist: [(u64, f64, f64); 4],
+    /// Dev: (seconds, experts, of which had no RAM slot at all) read from disk while staging.
+    pub stage_disk: (f64, u64, u64),
+    /// Start a staged expert's transfer while the next one is staged (`SMALLTIDE_STAGE_KICK=0`
+    /// turns it off), see `kick_copy_stream`.
+    stage_kick: bool,
+    kick_event: Event,
     /// Dedicated background Stage 2 NVMe I/O worker thread.
     stage2_worker: Option<Stage2IoWorker>,
 
@@ -130,6 +169,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
         let compute_stream = backend.create_stream(QueueKind::Compute)?;
         let copy_stream = backend.create_stream(QueueKind::AsyncCopyH2D)?;
         let dma_event = backend.create_event()?;
+        let kick_event = backend.create_event()?;
         let compute_fence = backend.create_event()?;
 
         let max_slab = nvfp4_layout
@@ -161,7 +201,19 @@ impl<B: ComputeBackend> TideExecutor<B> {
             table_ring,
             table_ring_cursor: 0,
             ram_slabs: HashMap::new(),
+            ram_pinned_budget: 0,
+            ram_pinned_bytes: 0,
+            pinned_slabs: HashMap::new(),
+            uploads_issued: 0,
+            uploads_synced: 0,
+            pinned_uploads: 0,
             rescue_stats: (0, 0.0, 0.0),
+            last_rescue_ms: (0.0, 0.0),
+            stage_copy: (0.0, 0),
+            rescue_hist: [(0, 0.0, 0.0); 4],
+            stage_disk: (0.0, 0, 0),
+            stage_kick: std::env::var("SMALLTIDE_STAGE_KICK").map(|v| v.trim() != "0").unwrap_or(STAGE_KICK_DEFAULT),
+            kick_event,
             stage2_worker,
             pending_batches: VecDeque::new(),
             free_events: Vec::new(),
@@ -367,6 +419,16 @@ impl<B: ComputeBackend> TideExecutor<B> {
         }
     }
 
+    /// Makes the runtime hand the copy stream's queued transfers to the driver now. Without it
+    /// they start only when something waits for the stream: the wait after a rescue batch of
+    /// 1, 2, 3 experts was 0.25, 0.49, 0.81 ms, the full transfer time each. An event query
+    /// flushes the queue; it costs about 0.05 ms, so it is used only when more experts follow.
+    fn kick_copy_stream(&mut self) -> Result<()> {
+        self.backend.record_event(self.kick_event, self.copy_stream)?;
+        let _ = self.backend.query_event(self.kick_event)?;
+        Ok(())
+    }
+
     /// Non-blocking drain of completed background Stage 2 NVMe -> RAM reads.
     /// Call once per decode token before `scheduler.plan_async_step()`!
     pub fn poll_stage2_completions(&mut self) -> Result<usize> {
@@ -380,8 +442,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             // Only accept the read if the cache still assigns this RAM slot to this expert.
             let e = self.scheduler.cache.entry(item.expert);
             if e.ram_slot == item.ram_slot {
-                self.ram_slabs
-                    .insert((item.class, item.ram_slot), (item.expert, bytes));
+                self.ram_put(item.class, item.ram_slot, item.expert, bytes)?;
                 self.scheduler.cache.mark_ram_ready(item.expert);
             }
         }
@@ -493,7 +554,8 @@ impl<B: ComputeBackend> TideExecutor<B> {
     /// (expert, slot) pairs written into VRAM.
     fn issue_ops(&mut self, ops: &[TransferOp], async_disk_io: bool) -> Result<Vec<(ExpertId, SlotIndex)>> {
         let mut batch: Vec<(ExpertId, SlotIndex)> = Vec::new();
-        for op in ops {
+        for (op_i, op) in ops.iter().enumerate() {
+            let more_follow = op_i + 1 < ops.len();
             match *op {
                 TransferOp::DiskToRam {
                     expert,
@@ -507,12 +569,11 @@ impl<B: ComputeBackend> TideExecutor<B> {
                             worker.submit_async_read(expert, cls, ram_slot, slab_len);
                         } else {
                             let bytes = worker.read_sync(expert, slab_len)?;
-                            self.ram_slabs.insert((cls, ram_slot), (expert, bytes));
+                            self.ram_put(cls, ram_slot, expert, bytes)?;
                             self.scheduler.cache.mark_ram_ready(expert);
                         }
                     } else {
-                        self.ram_slabs
-                            .insert((cls, ram_slot), (expert, vec![0u8; slab_len]));
+                        self.ram_put(cls, ram_slot, expert, vec![0u8; slab_len])?;
                         self.scheduler.cache.mark_ram_ready(expert);
                     }
                 }
@@ -525,13 +586,11 @@ impl<B: ComputeBackend> TideExecutor<B> {
                 } => {
                     let cls = self.scheduler.cache.expert_class(expert);
                     let slab_len = self.slab_len_for(expert);
-                    let src_offset = self.reserve_staging(slab_len)?;
-                    self.fill_staging_from_ram_or_disk(expert, cls, Some(src_ram_slot), src_offset, slab_len)?;
                     let (dst_pool, dst_off) = self.vram_target(expert, dst_vram_slot);
-                    self.upload_slab(expert, dst_pool, dst_off, src_offset, slab_len)?;
+                    self.stage_and_upload(expert, cls, Some(src_ram_slot), dst_pool, dst_off, slab_len, more_follow)?;
                     batch.push((expert, dst_vram_slot));
                     if release_ram_after_upload {
-                        self.ram_slabs.remove(&(cls, src_ram_slot));
+                        self.ram_drop(cls, src_ram_slot);
                     }
                 }
                 TransferOp::DiskToVramDirect {
@@ -549,7 +608,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
                         staging[src_offset..src_offset + slab_len].copy_from_slice(&bytes);
                     }
                     if let Some(rs) = also_keep_ram_slot {
-                        self.ram_slabs.insert((cls, rs), (expert, bytes));
+                        self.ram_put(cls, rs, expert, bytes)?;
                     }
                     let (dst_pool, dst_off) = self.vram_target(expert, dst_vram_slot);
                     self.upload_slab(expert, dst_pool, dst_off, src_offset, slab_len)?;
@@ -562,10 +621,8 @@ impl<B: ComputeBackend> TideExecutor<B> {
                 } => {
                     let cls = self.scheduler.cache.expert_class(expert);
                     let slab_len = self.slab_len_for(expert);
-                    let src_offset = self.reserve_staging(slab_len)?;
-                    self.fill_staging_from_ram_or_disk(expert, cls, src_ram_slot, src_offset, slab_len)?;
                     let (dst_pool, dst_off) = self.vram_target(expert, scratch_vram_slot);
-                    self.upload_slab(expert, dst_pool, dst_off, src_offset, slab_len)?;
+                    self.stage_and_upload(expert, cls, src_ram_slot, dst_pool, dst_off, slab_len, more_follow)?;
                     batch.push((expert, scratch_vram_slot));
                 }
             }
@@ -585,10 +642,21 @@ impl<B: ComputeBackend> TideExecutor<B> {
         let _ = self.issue_ops(ops, false)?;
         let t1 = std::time::Instant::now();
         // The copy stream is in order: once it is idle, every slab DMA has landed in VRAM.
-        self.backend.sync_stream(self.copy_stream)?;
+        self.backend.sync_stream(self.copy_stream).map_err(|e| SmallTideError::Backend {
+            backend: "tide",
+            message: format!("execute_rescue_now sync copy_stream ({} ops): {e}", ops.len()),
+        })?;
+        self.uploads_synced = self.uploads_issued;
         self.rescue_stats.0 += 1;
         self.rescue_stats.1 += (t1 - t0).as_secs_f64() * 1000.0;
         self.rescue_stats.2 += t1.elapsed().as_secs_f64() * 1000.0;
+        self.last_rescue_ms = ((t1 - t0).as_secs_f64() * 1000.0, t1.elapsed().as_secs_f64() * 1000.0);
+        if !ops.is_empty() {
+            let h = &mut self.rescue_hist[ops.len().min(4) - 1];
+            h.0 += 1;
+            h.1 += self.last_rescue_ms.0;
+            h.2 += self.last_rescue_ms.1;
+        }
         while let Some((ev, _)) = self.pending_batches.pop_front() {
             self.free_events.push(ev);
         }
@@ -613,25 +681,38 @@ impl<B: ComputeBackend> TideExecutor<B> {
         if experts.is_empty() {
             return Ok(Vec::new());
         }
+        self.fence_scratch()?;
+        self.stage_into_scratch_fenced(experts)
+    }
+
+    /// Marks the point on the compute stream after which nothing queued so far uses the scratch
+    /// ring: a following `stage_into_scratch_fenced` copies as soon as that point is reached, so
+    /// kernels queued in between (which must not touch the ring) overlap the copy.
+    pub fn fence_scratch(&mut self) -> Result<()> {
+        self.backend.record_event(self.compute_fence, self.compute_stream)
+    }
+
+    /// `stage_into_scratch` behind the fence set by the last `fence_scratch`.
+    pub fn stage_into_scratch_fenced(&mut self, experts: &[ExpertId]) -> Result<Vec<SlotIndex>> {
+        if experts.is_empty() {
+            return Ok(Vec::new());
+        }
         let cls = self.scheduler.cache.expert_class(experts[0]);
         let (base, size) = self.scheduler.cache.scratch_ring(cls);
         if experts.len() > size as usize {
             return Err(SmallTideError::Backend { backend: "tide", message: "too many experts for scratch ring".into() });
         }
-        // Previous users of these slots (earlier kernels on the compute stream) must be done.
-        self.backend.record_event(self.compute_fence, self.compute_stream)?;
+        // Previous users of these slots (kernels on the compute stream before the fence) must be done.
         self.backend.stream_wait_event(self.copy_stream, self.compute_fence)?;
         let mut slots = Vec::with_capacity(experts.len());
         for (i, &id) in experts.iter().enumerate() {
             debug_assert_eq!(self.scheduler.cache.expert_class(id), cls);
             let slot = SlotIndex(base + i as u32);
             let slab_len = self.slab_len_for(id);
-            let src_offset = self.reserve_staging(slab_len)?;
             let e = self.scheduler.cache.entry(id);
             let ram = if self.scheduler.cache.is_ram_ready(id) { Some(e.ram_slot) } else { None };
-            self.fill_staging_from_ram_or_disk(id, cls, ram, src_offset, slab_len)?;
             let (dst_pool, dst_off) = self.vram_target(id, slot);
-            self.upload_slab(id, dst_pool, dst_off, src_offset, slab_len)?;
+            self.stage_and_upload(id, cls, ram, dst_pool, dst_off, slab_len, false)?;
             self.scheduler.telemetry.stage1_sync_rescues += 1;
             self.scheduler.telemetry.stage1_bytes_transferred += slab_len as u64;
             slots.push(slot);
@@ -639,6 +720,104 @@ impl<B: ComputeBackend> TideExecutor<B> {
         self.backend.record_event(self.dma_event, self.copy_stream)?;
         self.backend.stream_wait_event(self.compute_stream, self.dma_event)?;
         Ok(slots)
+    }
+
+    /// Stages one expert (RAM, or the disk if it is not there) and queues its copy to the card.
+    /// `more_follow`: further experts of the same batch are staged after this one, so its
+    /// transfer is started now and runs while they are copied from RAM.
+    fn stage_and_upload(
+        &mut self,
+        expert: ExpertId,
+        cls: ExpertClass,
+        ram_slot: Option<SlotIndex>,
+        dst_pool: DeviceBuf,
+        dst_off: usize,
+        slab_len: usize,
+        more_follow: bool,
+    ) -> Result<()> {
+        let host_pool = self.mxfp8_host_mapped && cls == ExpertClass::Mxfp8;
+        if let (false, Some(rs)) = (host_pool, ram_slot) {
+            if let Some(ps) = self.pinned_slabs.get(&(cls, rs)) {
+                if ps.owner == Some(expert) && ps.len >= slab_len && dst_off + slab_len <= dst_pool.size_bytes {
+                    // Page-locked RAM copy: the transfer reads it in place. With nothing to copy
+                    // meanwhile there is no reason to start it early.
+                    let buf = ps.buf;
+                    self.backend.memcpy_h2d_async(dst_pool, dst_off, buf, 0, slab_len, self.copy_stream)?;
+                    self.uploads_issued += 1;
+                    self.pinned_uploads += 1;
+                    self.pinned_slabs.get_mut(&(cls, rs)).unwrap().upload_seq = self.uploads_issued;
+                    return Ok(());
+                }
+            }
+        }
+        let src_offset = self.reserve_staging(slab_len)?;
+        self.fill_staging_from_ram_or_disk(expert, cls, ram_slot, src_offset, slab_len)?;
+        self.upload_slab(expert, dst_pool, dst_off, src_offset, slab_len)?;
+        if more_follow && self.stage_kick {
+            self.kick_copy_stream()?;
+        }
+        Ok(())
+    }
+
+    /// Page-locked part of the RAM tier in bytes (`SMALLTIDE_RAM_PINNED_GB`, 0 = none). Call
+    /// before any expert is loaded.
+    pub fn set_ram_pinned_budget(&mut self, bytes: usize) {
+        self.ram_pinned_budget = bytes;
+    }
+
+    /// (experts whose RAM copy is page-locked now, page-locked bytes allocated).
+    pub fn ram_pinned_stats(&self) -> (usize, usize) {
+        (self.pinned_slabs.values().filter(|p| p.owner.is_some()).count(), self.ram_pinned_bytes)
+    }
+
+    /// Stores `bytes` as `expert`'s RAM copy in slot `(cls, slot)`: in the slot's page-locked
+    /// buffer when it has one (or can still get one), else on the heap.
+    fn ram_put(&mut self, cls: ExpertClass, slot: SlotIndex, expert: ExpertId, bytes: Vec<u8>) -> Result<()> {
+        let key = (cls, slot);
+        let cap = match cls {
+            ExpertClass::Nvfp4 => self.nvfp4_layout.aligned_slab_bytes,
+            ExpertClass::Mxfp8 => self.mxfp8_layout.aligned_slab_bytes,
+        };
+        let host_pool = self.mxfp8_host_mapped && cls == ExpertClass::Mxfp8;
+        if bytes.len() <= cap && !host_pool {
+            if !self.pinned_slabs.contains_key(&key) && self.ram_pinned_bytes + cap <= self.ram_pinned_budget {
+                if let Ok(buf) = self.backend.alloc_pinned(cap) {
+                    self.ram_pinned_bytes += cap;
+                    self.pinned_slabs.insert(key, PinnedSlab { owner: None, buf, len: 0, upload_seq: 0 });
+                }
+            }
+            if let Some(ps) = self.pinned_slabs.get(&key) {
+                let (buf, seq) = (ps.buf, ps.upload_seq);
+                if seq > self.uploads_synced {
+                    // An upload from this buffer may still be in flight: it must land first.
+                    self.backend.sync_stream(self.copy_stream)?;
+                    self.uploads_synced = self.uploads_issued;
+                }
+                unsafe {
+                    let dst = self.backend.pinned_as_mut_slice(buf)?;
+                    dst[..bytes.len()].copy_from_slice(&bytes);
+                }
+                let ps = self.pinned_slabs.get_mut(&key).unwrap();
+                ps.owner = Some(expert);
+                ps.len = bytes.len();
+                self.ram_slabs.remove(&key);
+                return Ok(());
+            }
+        }
+        if let Some(ps) = self.pinned_slabs.get_mut(&key) {
+            ps.owner = None;
+        }
+        self.ram_slabs.insert(key, (expert, bytes));
+        Ok(())
+    }
+
+    /// Forgets the RAM copy in slot `(cls, slot)`; a page-locked buffer stays for the slot's
+    /// next occupant.
+    fn ram_drop(&mut self, cls: ExpertClass, slot: SlotIndex) {
+        self.ram_slabs.remove(&(cls, slot));
+        if let Some(ps) = self.pinned_slabs.get_mut(&(cls, slot)) {
+            ps.owner = None;
+        }
     }
 
     /// Copies an expert's slab into the staging ring from its RAM slot, verifying the slot really
@@ -657,25 +836,40 @@ impl<B: ComputeBackend> TideExecutor<B> {
             .is_some();
         if hit {
             let (_, bytes) = self.ram_slabs.get(&(cls, ram_slot.unwrap())).unwrap();
+            let t = std::time::Instant::now();
             unsafe {
                 let staging = self.backend.pinned_as_mut_slice(self.pinned_staging)?;
                 staging[src_offset..src_offset + slab_len].copy_from_slice(&bytes[..slab_len]);
             }
+            self.stage_copy.0 += t.elapsed().as_secs_f64();
+            self.stage_copy.1 += 1;
             return Ok(());
         }
         if ram_slot.is_some() {
             self.scheduler.telemetry.stage1_ram_fallback_reads += 1;
+            self.scheduler.telemetry.rescue_disk_reads += 1;
         }
+        let t = std::time::Instant::now();
         let bytes = self.read_disk_sync(expert, slab_len)?;
         unsafe {
             let staging = self.backend.pinned_as_mut_slice(self.pinned_staging)?;
             staging[src_offset..src_offset + slab_len].copy_from_slice(&bytes[..slab_len]);
         }
+        self.stage_disk.0 += t.elapsed().as_secs_f64();
+        self.stage_disk.1 += 1;
+        if ram_slot.is_none() {
+            self.stage_disk.2 += 1;
+        }
         if let Some(rs) = ram_slot {
             // Repair the RAM tier so the next promotion of this expert is a real RAM hit.
             if self.scheduler.cache.entry(expert).ram_slot == rs {
-                self.ram_slabs.insert((cls, rs), (expert, bytes));
+                self.ram_put(cls, rs, expert, bytes)?;
             }
+        } else if let Some(rs) = self.scheduler.adopt_disk_read_into_ram(expert) {
+            // It was on the disk only, or its background read has not been collected yet. Keep
+            // what was just read, or every later rescue of it reads the disk again (seen: 94
+            // experts read 386 times in one 12K-token request).
+            self.ram_put(cls, rs, expert, bytes)?;
         }
         Ok(())
     }
@@ -715,7 +909,13 @@ impl<B: ComputeBackend> TideExecutor<B> {
 
     fn reserve_staging(&mut self, len: usize) -> Result<usize> {
         if self.staging_cursor + len > self.pinned_staging.size_bytes {
-            self.backend.sync_stream(self.copy_stream)?;
+            self.backend.sync_stream(self.copy_stream).map_err(|e| SmallTideError::Backend {
+                backend: "tide",
+                message: format!(
+                    "reserve_staging wrap sync copy_stream (cursor={}, len={}, cap={}): {e}",
+                    self.staging_cursor, len, self.pinned_staging.size_bytes
+                ),
+            })?;
             self.staging_cursor = 0;
         }
         let off = self.staging_cursor;

@@ -8,18 +8,34 @@ Pre-built Windows releases embed the compiled `gfx1201` `.hsaco` GPU kernels ins
 
 ## Measured Performance (RX 9070 XT 16 GB, Windows 11)
 
-Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver. *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
+Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver, the settings of `.env.example`, and the monitor on the motherboard output so the card holds nothing but the model (see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard)). *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
 
 | Workload | Prompt / output | Decode | TTFT |
 | --- | ---: | ---: | ---: |
-| `prose` (essay) | 58 / 1,024 | **68.0 tok/s** | 228 ms |
-| `code` (LRU cache module + tests) | 74 / 1,024 | **68.9 tok/s** | 298 ms |
-| `edit` (refactor a 1.4K-token file) | 1,425 / 1,024 | **74.7 tok/s** | 2.24 s |
-| `random` (8K-token random prompt) | 8,266 / 372 | **47.9 tok/s** | 6.71 s |
-| `angry-birds` (one-shot HTML game) | 76 / 8,192 | **89.1 tok/s** | 418 ms |
-| `mario` (one-shot HTML game) | 66 / 6,678 | **85.7 tok/s** | 436 ms |
+| `prose` (essay) | 58 / 1,024 | **68.6 tok/s** | 238 ms |
+| `code` (LRU cache module + tests) | 74 / 1,024 | **68.7 tok/s** | 247 ms |
+| `edit` (refactor a 1.4K-token file) | 1,425 / 1,024 | **72.3 tok/s** | 0.97 s |
+| `random` (8K-token random prompt) | 8,256 / 1,024 | **87.9 tok/s** | 4.00 s |
+| `angry-birds` (one-shot HTML game) | 76 / 8,192 | **75.7 tok/s** | 342 ms |
+| `mario` (one-shot HTML game) | 66 / 8,192 | **93.8 tok/s** | 355 ms |
 
-*`random` uses a prompt of random tokens, a worst case for the engine; `angry-birds` reached the 8,192-token output limit.*
+*`random` uses a prompt of random tokens, a worst case for the engine. Its answers are sampled and can end early: the three runs produced 527, 1,024, 1,024 tokens at 50, 88, 90 tok/s. Decode speed depends on how many experts a run has to copy in: the three runs of `edit` were 73, 72, 69 tok/s.*
+
+Reading a prompt (prefill) runs at about 1,750 tokens a second on a cold 11,658-token prompt and about 1,450 on a 58,000-token one.
+
+**Top-1 agreement with the full model.** Adaptive expert loading skips low-weight experts that are not on the card. Against a reference pass that loads and runs every routed expert, the engine picks the same most likely next token at **95.9%** of positions through draft-verify passes (the path speculative decoding uses) and **96.2%** through single-token steps. Measured with `bench/agreement.py` on four workloads, three prompts each, 1,024 tokens per prompt ([method and how to run it](#top-1-agreement-with-the-full-model)).
+
+| Workload | Positions | Draft-verify passes | Single-token steps | Skipped routing weight (verify / single) |
+| --- | ---: | ---: | ---: | ---: |
+| `prose` | 3,072 | 96.1% | 95.8% | 0.5% / 0.6% |
+| `code` | 3,072 | 96.5% | 96.3% | 1.0% / 0.9% |
+| `edit` | 2,870 | 95.4% | 96.2% | 1.1% / 0.6% |
+| `long` (9K-token prompt built from this repository's documents) | 3,072 | 95.4% | 96.6% | 1.7% / 0.9% |
+| all | 12,086 | **95.9%** | **96.2%** | |
+
+*Same card and settings as the table above. Fed its own reference, the exact configuration agrees at every position of the single-token path (128 positions checked), so the differences come from the skipped experts, in decode and in reading the prompt.*
+
+The test says how often the top choice changes, not whether the answers are worse.
 
 ---
 
@@ -28,7 +44,7 @@ Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 
 - **GPU:** AMD Radeon RX 9070 XT (16 GB, RDNA 4 `gfx1201`)
 - **OS:** Windows 11 (64-bit)
 - **Driver:** **AMD Software: Adrenalin Edition 26.10.44 or newer** (ships `amdhip64_7.dll` and fixes the 26.5.1–26.9.1 WDDM residency cap bug — no ROCm SDK needed)
-- **System RAM:** 32 GB recommended (16 GB allocated for the warm RAM expert tier so misses rescue over PCIe instead of NVMe)
+- **System RAM:** 32 GB recommended (10 GB of it holds the warm RAM expert tier so misses rescue over PCIe instead of NVMe)
 - **Disk:** ~36 GB free on NVMe (~21 GB Hugging Face checkpoint + ~14.7 GB packed `experts.stide`)
 
 ---
@@ -109,7 +125,7 @@ Send images as content parts of a user (or tool) message, in the OpenAI format w
 
 1. **Loop-aware adaptive residency (TideLM).** Inkling-2-Mini runs 24 physical MoE layers as 48 logical layers: 4 Prelude layers, 12 Loop Core layers executed **4 times per token**, and 8 Coda layers. SmallTide tracks every router pick into persistent routing priors (`<MODEL_DIR>/tide_priors.json`), automatically seeded on first boot from `profiles/inkling2-mini-priors.json` (aggregate routing shares only, zero user text). Value-per-byte placement prioritizes the 4× Loop Core first (~98%+ hit rate in VRAM), filling the rest of dedicated VRAM with the hottest Prelude NVFP4 and Coda MXFP8 experts.
 2. **Windows DXGI residency-aware sizing.** On Windows WDDM, `hipMemGetInfo` reports shared system RAM as free VRAM, causing oversized allocations to silently drop ~10× in bandwidth over PCIe. With `SMALLTIDE_POOL_BUDGET=resident` (default), SmallTide queries DXGI's local residency budget and probes copy bandwidth across every 256 MiB window at startup (`fit_pools_to_resident`) so 100% of active expert slots stay on dedicated GDDR6.
-3. **2-Stage Miss Handling + Fused GPU Spin-Wait Rescue.** Non-VRAM experts live warm in pinned/host RAM (`SMALLTIDE_RAM_GB=16`) backed by 4 KB-aligned Win32 `FILE_FLAG_NO_BUFFERING` NVMe reads (`experts.stide`). High-weight misses (`>= 0.12` in Prelude/Coda, `>= 0.05` in Loop Core, per-zone budgets `12/9/15`) are copied over PCIe on a dedicated DMA stream and synchronized on-GPU by a fused HIP spin-wait + route-patch kernel (`SMALLTIDE_RESCUE_WAIT=spin`), while lower-weight misses are skipped and renormalized and hot misses promote asynchronously in the background.
+3. **2-Stage Miss Handling + Fused GPU Spin-Wait Rescue.** Non-VRAM experts live warm in host RAM (`SMALLTIDE_RAM_GB=10`: every expert that is not on the card plus the ones most likely to leave it; a stray one is read back in the background) backed by 4 KB-aligned Win32 `FILE_FLAG_NO_BUFFERING` NVMe reads (`experts.stide`). High-weight misses (`>= 0.08` in Prelude/Coda, `>= 0.09` in Loop Core, per-zone budgets `18/35/20`) are copied over PCIe on a dedicated DMA stream and synchronized on-GPU by a fused HIP spin-wait + route-patch kernel (`SMALLTIDE_RESCUE_WAIT=spin`), while lower-weight misses are skipped and renormalized and hot misses promote asynchronously in the background.
 4. **Lossless DSpark Speculative Decoding.** Inkling-2-Mini's 3-layer DSpark drafter (`mtp.safetensors`, ~418 MiB VRAM at 49K ctx) drafts up to 7 tokens per step with confidence-gated adaptive depth. Verification uses GPU-side top-k/top-p filtering (`smalltide_logits_filter_rows`) and exact stochastic rejection sampling, accelerating both `temperature = 0` and `temperature > 0` without altering the target distribution.
 5. **Paged K8/V4 Global KV & Prefix Caching.** Global-attention KV (8 target layers + 1 drafter layer) is paged from a shared `SMALLTIDE_KV_TOKENS` pool across lanes with asymmetric **`k8v4`** quantization (`SMALLTIDE_KV_FMT=k8v4`: FP8 E4M3 keys for exact attention scores + per-32-group asymmetric INT4 values, saving ~472 MiB at 128K for +115 more resident experts). Multi-turn conversations restore prefix snapshots (including drafter KV state) from pinned host RAM without re-prefilling.
 
@@ -125,16 +141,47 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 | `SMALLTIDE_KV_FMT` | `k8v4` | Global KV format: `k8v4` (FP8 keys + Q4 values, saves ~472 MiB @ 128K) or `fp8` (full FP8 K/V). |
 | `SMALLTIDE_LANES` | `2` | Concurrent serving lanes (each extra lane reserves ~124 MiB of local KV rings + slack page). |
 | `SMALLTIDE_RESCUE_MODE` | `threshold` | `threshold` (balanced), `exact` (copy every miss, bit-exact MoE), or `disabled` (fastest, skip inline misses). |
-| `SMALLTIDE_RESCUE_THRESHOLD` / `..._CORE` | `0.12` / `0.05` | Routing-weight gate for inline rescues (Prelude & Coda / Loop Core). |
-| `SMALLTIDE_RESCUE_BUDGET_PRELUDE` / `_CORE` / `_CODA` | `12` / `9` / `15` | Per-token inline rescue caps per architectural zone. |
+| `SMALLTIDE_RESCUE_THRESHOLD` / `..._CORE` | `0.08` / `0.09` | Routing-weight gate for inline rescues (Prelude & Coda / Loop Core). Lower gates rescue more: better fidelity, slower decode (a rescue costs about 0.7 ms). |
+| `SMALLTIDE_RESCUE_BUDGET_PRELUDE` / `_CORE` / `_CODA` | `18` / `35` / `20` | Per-token inline rescue caps per architectural zone. |
+| `SMALLTIDE_PREFILL_CHUNK` | `1024` | Tokens per prefill chunk (64 to 1024). Larger chunks read a prompt faster for more scratch VRAM: 1024 costs about 80 resident experts against 256 and is almost twice as fast. |
+| `SMALLTIDE_ATTN_VTILES` | `all` | Prefill attention reads value vectors decoded once per layer pass. `all` spends 268 MiB of VRAM at 128K context (about 55 resident experts) and reads a 58K-token prompt a third faster; `local` spends 4 MiB; `0` is off. |
+| `SMALLTIDE_BATCH_RESCUE` | `1` | Two requests at once are decoded as one batch; `1` rescues missing experts for the batch like a draft-verify pass, `0` skips them (faster, lower fidelity). |
+| `SMALLTIDE_IDLE_HEARTBEAT_MS` | `1000` | Idle GPU heartbeat; keep it on when no monitor is plugged into the card (see below). `0` turns it off. |
 | `SMALLTIDE_SPEC` | `1` | Enable (`1`) or disable (`0`) DSpark speculative decoding. |
 | `SMALLTIDE_VISION` / `SMALLTIDE_VISION_MAX_TOKENS` | `1` / `1536` | Image input on (`1`) or off (`0`), and the most tokens one image takes (larger images are scaled down). |
-| `SMALLTIDE_RAM_GB` | `16` | Host RAM tier for non-VRAM experts (lower to `10` on 16 GB RAM PCs). |
+| `SMALLTIDE_RAM_PINNED_GB` | `0` | Experimental. This much of the RAM tier in page-locked memory: those experts upload to the card without a copy into the staging buffer (`2`: about 3% faster decode on a 12K-token prompt). Capped at 3; with 5 the server lost the GPU context, see [LIMITATIONS.md](LIMITATIONS.md). |
+| `SMALLTIDE_RAM_GB` | `10` | Host RAM tier for non-VRAM experts. It has to hold every expert that is not on the card (about 4.8 MiB each) with room to spare; `16` holds all 3,072. |
 | `SMALLTIDE_HOST` / `SMALLTIDE_PORT` | `0.0.0.0` / `8000` | Server bind address (`127.0.0.1` for local-only) and port. |
 
 > **Getting maximum resident experts on Windows:** Closing VRAM-heavy desktop apps (browsers with many tabs, Adobe Creative Cloud, games, hardware-accelerated Electron apps) before launching `.\smalltide.cmd serve` directly increases the number of experts SmallTide can keep resident on the card. Run `.\smalltide.cmd vram-probe` anytime to inspect your card's current resident headroom.
 
 To reset learned routing priors back to the bundled seed, delete `models\Inkling-2-Mini\tide_priors.json` and restart the server.
+
+---
+
+## Monitor on the card or on the motherboard
+
+Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K desktop, a browser and a few Electron apps hold 3 to 5 GB of the card when the monitor is plugged into it; with the cable on the motherboard (the Ryzen's integrated graphics draws the desktop) the card holds nothing but the model.
+
+| | Monitor on the RX 9070 XT | Monitor on the motherboard |
+| --- | --- | --- |
+| Resident experts (2 lanes, 128K context, drafter on) | about 1,750 of 3,072 | about 2,100 |
+| Routing weight they cover | about 90% | about 97% |
+| Desktop apps and the model | compete for VRAM: when the desktop's share grows, Windows moves part of the model to system RAM and decode drops to a quarter of its speed until the server is restarted | separate: the desktop uses system RAM through the integrated graphics |
+| A rescue that stalls for more than about 2 s | Windows resets the graphics driver (`hipError_t=719`), the server exits | no driver reset was seen (nothing else asks for the card) |
+| An idle card | stays awake (it draws the desktop) | is put to sleep by the driver unless the heartbeat runs: see below |
+| System RAM | the desktop's graphics memory is on the card | the desktop's graphics memory comes out of system RAM (1 to 4 GB) |
+
+**Setting it up with the monitor on the motherboard**
+
+1. Move the cable to the motherboard's video output and **reboot**: programs keep using the graphics card they started on, so until then the desktop still sits on the 9070 XT.
+2. Start the server. The startup line should show `VRAM free: … /15.92 GiB` (the engine picks the discrete card by itself; `SMALLTIDE_HIP_DEVICE` overrides it) and a resident count well above 2,000.
+3. Leave these at their defaults:
+   - `SMALLTIDE_IDLE_HEARTBEAT_MS=1000`. Radeon drivers 26.5.1 and later put a card with no display to sleep about 10 seconds after its last GPU work, and Windows first moves everything in the card's memory - the whole model - into system RAM, which exhausts a 32 GB machine within seconds ([ROCm/TheRock#7221](https://github.com/ROCm/TheRock/issues/7221)). The heartbeat is a few milliseconds of GPU work once a second from the moment the server starts, loading included, and keeps the card awake. AMD reports the driver bug fixed in Adrenalin 26.9.2; that was not verified here, and 26.10.44 (build 32.0.31044.16) still has it.
+   - `SMALLTIDE_RAM_GB=10`, not 16: the desktop now lives in system RAM too.
+4. Run one server at a time. A second one would load a second copy of the model next to the first; it now stops at once with `cannot listen on …`.
+
+With the monitor on the card none of this is needed, and closing VRAM-heavy apps before starting the server is what buys resident experts.
 
 ---
 
@@ -149,6 +196,19 @@ foreach ($w in "prose","code","edit","random","angry-birds","mario") { .\smallti
 ```
 
 Each run prints decode speed, TTFT, skipped routing weight, inline rescues/token, VRAM hit rates by zone and disk reads; `--out` writes the summary JSON, and the one-shot games are saved to `results/oneshots/`.
+
+### Top-1 agreement with the full model
+
+Adaptive expert loading skips low-weight experts that are not on the card (see [LIMITATIONS.md](LIMITATIONS.md)). `bench/agreement.py` measures how often that changes the most likely next token. A reference pass runs every routed expert (`SMALLTIDE_RESCUE_MODE=exact`, `SMALLTIDE_SPEC=0`) and saves its greedy tokens. A second pass with your settings is fed those tokens one position at a time, and its own top choice is compared with the reference's at each position, once through draft-verify passes (the path speculative decoding uses) and once through single-token steps.
+
+Stop the server first (the test needs the card to itself):
+
+```powershell
+python bench\agreement.py                                            # 4 workloads x 3 prompts x 1,024 tokens, about 12 minutes
+python bench\agreement.py --workloads prose code --runs 1 --tokens 256   # about 2 minutes
+```
+
+The results are in [Measured Performance](#measured-performance-rx-9070-xt-16-gb-windows-11).
 
 ---
 

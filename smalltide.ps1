@@ -120,7 +120,12 @@ try {
             if (-not (Test-Path (Join-Path $Root "Cargo.toml"))) {
                 throw "Cargo.toml not found here. This looks like a pre-built release package (no build needed!)."
             }
-            & cargo build --release -p smalltide-cli @Rest
+            $buildScript = Join-Path $Root "scripts\build.ps1"
+            if (Test-Path $buildScript) {
+                & $buildScript @Rest
+            } else {
+                & cargo build --release -p smalltide-cli @Rest
+            }
             exit $LASTEXITCODE
         }
 

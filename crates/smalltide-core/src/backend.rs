@@ -117,6 +117,10 @@ pub struct PrefillAttnParams {
     pub inv_sqrt_d: f32,
     /// True when V cache is packed Q4_asym32 instead of FP8.
     pub v_q4: bool,
+    /// Scratch for the pre-decoded f16 V tiles of a many-row (prefill) pass: 256 bytes per key
+    /// and KV head, indexed by ring slot / 16 (local) or position / 16 (global). `None`: the
+    /// attention kernel decodes V itself (the same values).
+    pub v_tiles: Option<DeviceBuf>,
 }
 
 /// Expert-grouped MoE launch for prefill (see `moe_grouped`).
@@ -273,12 +277,13 @@ pub trait ComputeBackend: Send + Sync {
     }
 
     /// Copies `n_words` u32 values from `src` to coherent host-mapped `dst[0..n_words]`, flushes
-    /// system-scope stores, and publishes `ticket` to `dst[n_words]`.
+    /// system-scope stores, and publishes `ticket` to `dst[sentinel_idx]`.
     fn rescue_write_route(
         &self,
         _dst: DeviceBuf,
         _src: DeviceBuf,
         _n_words: usize,
+        _sentinel_idx: usize,
         _ticket: u32,
         _stream: Stream,
     ) -> Result<()> {

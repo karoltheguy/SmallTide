@@ -57,6 +57,51 @@ pub fn load_dotenv() -> Option<PathBuf> {
     Some(path)
 }
 
+/// Keeps the GPU awake for the life of the process: a little real work on a stream of its own,
+/// once a second (`SMALLTIDE_IDLE_HEARTBEAT_MS`, 0 = off), from a background thread.
+///
+/// With no display on the card, Radeon drivers 26.5.1 and later put an idle card to sleep after
+/// about 10 s, and Windows first moves everything in the card's memory into system RAM - the
+/// whole model, which exhausts a 32 GB machine in seconds (ROCm/TheRock#7221). The GPU is idle
+/// that long while the server waits for a request, and also while the model loads from a cold
+/// disk, so the beat cannot live in the request loop.
+fn spawn_gpu_heartbeat(backend: Arc<HipBackend>) {
+    let ms = parse("SMALLTIDE_IDLE_HEARTBEAT_MS", 1000usize, "milliseconds (0 = off)");
+    if ms == 0 {
+        return;
+    }
+    const WORDS: usize = 4 << 20; // 16 MiB of f32
+    let (stream, buf) = match (backend.create_stream(smalltide_core::backend::QueueKind::Compute), backend.alloc_device(WORDS * 4)) {
+        (Ok(s), Ok(b)) => (s, b),
+        _ => {
+            eprintln!("[heartbeat] could not set up the idle GPU heartbeat");
+            return;
+        }
+    };
+    std::thread::spawn(move || {
+        let mut seen = backend.launch_epoch();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+            // The engine queued GPU work since the last look: the card is awake, and a beat now
+            // would only get in the way (waiting for it stalls the engine's own launches, which
+            // tripled the time of a 58K-token prefill).
+            let now = backend.launch_epoch();
+            if now != seen {
+                seen = now;
+                continue;
+            }
+            // A few milliseconds of real work: 16 passes over the buffer.
+            let beat = (0..16).try_for_each(|_| backend.zero_f32(buf, WORDS, stream)).and_then(|_| backend.sync_stream(stream));
+            if let Err(e) = beat {
+                // A lost GPU context fails every later launch too: say it once and stop.
+                eprintln!("[heartbeat] stopped: {e}");
+                return;
+            }
+            seen = backend.launch_epoch();
+        }
+    });
+}
+
 fn var(key: &str) -> Option<String> {
     std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
@@ -169,7 +214,7 @@ impl Settings {
             kv_v_q4,
             priors_path,
             priors_update: parse::<u8>("SMALLTIDE_PRIORS_UPDATE", 1, "0 or 1") != 0,
-            prior_weight: parse("SMALLTIDE_PRIOR_WEIGHT", 1.0f32, "a number >= 0"),
+            prior_weight: parse("SMALLTIDE_PRIOR_WEIGHT", 0.35f32, "a number >= 0"),
             priors_newest_share: parse("SMALLTIDE_PRIORS_NEWEST", 0.1f32, "a number in [0, 0.5)"),
             spec: parse::<u8>("SMALLTIDE_SPEC", 0, "0 or 1") != 0,
             model_dir,
@@ -232,13 +277,15 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
         .expect("load dense weights");
     let pack = StidePackReader::open(&pack_path).expect("open experts.stide");
     let backend = Arc::new(HipBackend::new_auto().expect("init HipBackend"));
+    spawn_gpu_heartbeat(backend.clone());
     let dense_gpu = Inkling2DenseGpu::upload(backend.clone(), dense_host).expect("upload dense GPU");
+    smalltide_model_inkling2::engine::set_prefill_chunk(parse("SMALLTIDE_PREFILL_CHUNK", 1024usize, "a token count (64 to 1024)"));
     // The drafter goes before the VRAM measurement so the pool budget accounts for it.
     let drafter = if s.spec {
         let path = dir.join("mtp.safetensors");
         let t = Instant::now();
         let d = smalltide_model_inkling2::drafter::Drafter::load(backend.clone(), &path, &dense_gpu, cfg.unpadded_vocab_size, s.max_ctx,
-            smalltide_model_inkling2::engine::PREFILL_CHUNK, s.kv_v_q4).expect("load drafter (mtp.safetensors)");
+            smalltide_model_inkling2::engine::prefill_chunk(), s.kv_v_q4).expect("load drafter (mtp.safetensors)");
         println!("[spec] DSpark drafter loaded ({:.0} MiB VRAM, kv={}, {:.1}s)", d.vram_bytes as f64 / (1u64 << 20) as f64,
             if s.kv_v_q4 { "k8v4" } else { "fp8" }, t.elapsed().as_secs_f64());
         Some(d)
@@ -361,6 +408,17 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     let mut tide = TideExecutor::new(backend.clone(), cfg.clone(), tide_cfg, nvfp4_slots, mxfp8_slots, ram_budget_bytes, Some(pack))
         .expect("create TideExecutor");
     tide.set_mxfp8_host_mapped(mxfp8_host_mapped);
+    // SMALLTIDE_RAM_PINNED_GB: this much of the RAM tier (SMALLTIDE_RAM_GB) in page-locked
+    // memory. An expert whose RAM copy is page-locked uploads straight from it, with no copy
+    // into the staging buffer. Off by default and capped at 3: this driver loses the GPU context
+    // (hipError_t=719) somewhere above 6 GB of page-locked memory in all, and the prefix cache's
+    // snapshots are page-locked too. With 5 GB here the server lost the context during a
+    // 26K-token prompt; with 2 GB it passed the validation requests.
+    let pinned_gb: f64 = parse("SMALLTIDE_RAM_PINNED_GB", 0.0, "GiB");
+    if pinned_gb > 3.0 {
+        eprintln!("[settings] SMALLTIDE_RAM_PINNED_GB={pinned_gb} is above the 3 GiB cap; using 3");
+    }
+    tide.set_ram_pinned_budget((pinned_gb.clamp(0.0, 3.0) * (1u64 << 30) as f64) as usize);
 
     // Engine buffers (activations, KV, prefill scratch) before the expert pools: on Windows the
     // driver backs allocations beyond the resident budget with system memory, in order.
@@ -418,7 +476,13 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
             update: s.priors_update,
         });
     }
-    engine.prefill_min_share = parse("SMALLTIDE_PREFILL_MIN_SHARE", 1.0f32, "tokens of routing share");
+    // A missing expert is copied in for a prefill chunk when its routing share summed over the
+    // chunk reaches this many tokens' worth; below it the expert is skipped and the rest
+    // renormalized. The default grows with the chunk (1.0 up to 512 rows, 2.0 at 1024): a larger
+    // chunk sums more rows, and at 1024 rows a threshold of 2.0 skips less routing weight than
+    // 1.0 did with 256-row chunks while copying fewer experts.
+    let min_share_default = (smalltide_model_inkling2::engine::prefill_chunk() as f32 / 512.0).max(1.0);
+    engine.prefill_min_share = parse("SMALLTIDE_PREFILL_MIN_SHARE", min_share_default, "tokens of routing share");
     engine.tide.scheduler.rescue_budget = parse("SMALLTIDE_RESCUE_BUDGET", 4usize, "rescues per token");
     let opt_u = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok());
     let (bp, bc, bd) = (
@@ -438,7 +502,7 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     engine.prefill_chunk_swaps = parse("SMALLTIDE_PREFILL_CHUNK_SWAPS", 96usize, "a swap count");
     engine.anticipate_swaps = parse("SMALLTIDE_ANTICIPATE_SWAPS", 256usize, "a swap count");
     engine.anticipate_wait = parse::<u8>("SMALLTIDE_ANTICIPATE_WAIT", 0, "0 or 1") != 0;
-    engine.tide.scheduler.async_hysteresis = parse("SMALLTIDE_ASYNC_HYSTERESIS", 1.25f64, "a factor >= 1");
+    engine.tide.scheduler.async_hysteresis = parse("SMALLTIDE_ASYNC_HYSTERESIS", 1.10f64, "a factor >= 1");
     let preload_ops = engine.tide.scheduler.plan_pre_prefill(None);
     engine.tide.execute_transfers(&preload_ops, true, false).expect("Mode 1 pre-prefill");
     backend.sync_stream(engine.tide.copy_stream).expect("sync prefill DMA");

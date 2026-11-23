@@ -3,8 +3,50 @@
 //! (tidelm-server/src/expert_map.rs + expert_map.html). The engine thread answers between its
 //! steps with a copy of host data; nothing is asked of the engine unless a page polls.
 
-use smalltide_tide::expert_map::ExpertMap;
+use smalltide_tide::expert_map::{ExpertMap, RescueSnapshot, RESCUE_HIST_BIN_PCT};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn rescue_json(r: &RescueSnapshot) -> serde_json::Value {
+    let zones: Vec<serde_json::Value> = r
+        .zones
+        .iter()
+        .map(|z| {
+            serde_json::json!({
+                "name": z.name,
+                "layers": z.layers_label,
+                "gate": z.gate,
+                "base_budget": z.base_budget,
+                "avg_budget": (z.avg_budget * 100.0).round() / 100.0,
+                "avg_used": (z.avg_used * 100.0).round() / 100.0,
+                "p95_used": z.p95_used,
+                "max_used": z.max_used,
+                "util_pct": (z.util_pct * 10.0).round() / 10.0,
+                "capped_pct": (z.capped_pct * 10.0).round() / 10.0,
+                "zero_pct": (z.zero_pct * 10.0).round() / 10.0,
+                "boot_capped_pct": (z.boot_capped_pct * 10.0).round() / 10.0,
+                "boot_rescued": z.boot_rescued,
+                "avg_capped_layers": (z.avg_capped_layers * 100.0).round() / 100.0,
+                "avg_blocked_picks": (z.avg_blocked_picks * 100.0).round() / 100.0,
+                "avg_below_gate_picks": (z.avg_below_gate_picks * 100.0).round() / 100.0,
+                "avg_blocked_weight": (z.avg_blocked_weight * 1000.0).round() / 1000.0,
+                "avg_below_weight": (z.avg_below_weight * 1000.0).round() / 1000.0,
+                "rescued_share_avg": (z.rescued_share_avg * 1000.0).round() / 1000.0,
+                "rescued_share_min": (z.rescued_share_min * 1000.0).round() / 1000.0,
+                "miss_hist": z.miss_hist,
+                "status": z.status,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "policy": r.policy,
+        "window_steps": r.window_steps,
+        "total_steps": r.total_steps,
+        "base_budget_total": r.base_budget_total,
+        "last_verify_rows": r.last_verify_rows,
+        "hist_bin_width_pct": RESCUE_HIST_BIN_PCT,
+        "zones": zones,
+    })
+}
 
 pub const PAGE: &str = include_str!("expert_map.html");
 
@@ -89,6 +131,7 @@ pub fn json(m: &ExpertMap, model: &str, engine: &str, ask: &Ask, token: Option<&
         "routes": routes,
         "route_seq": m.routes.last().map(|r| r.seq).unwrap_or(0).max(ask.since),
         "tokens_shown": token.is_some(),
+        "rescue": m.rescue.as_ref().map(rescue_json),
     })
 }
 

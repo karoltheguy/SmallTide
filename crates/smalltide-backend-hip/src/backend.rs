@@ -56,8 +56,13 @@ pub struct HipBackend {
     streams: Mutex<HashMap<u64, StreamEntry>>,
     events: Mutex<HashMap<u64, EventEntry>>,
     graphs: Mutex<HashMap<u64, GraphEntry>>,
+    /// f16 copy of a many-row GEMM's activations (`gemm_fp8_rows`), grown on demand.
+    gemm_x16: Mutex<Option<DeviceBuf>>,
     /// Host-side instrumentation (see `HipBackend::take_host_stats`).
     stat_launches: AtomicU64,
+    /// Kernel launches since the backend was created (never reset: `launch_epoch`).
+    launch_epoch: AtomicU64,
+    seg_kernels: bool,
     stat_launch_ns: AtomicU64,
     stat_sync_ns: AtomicU64,
     stat_syncs: AtomicU64,
@@ -244,6 +249,12 @@ impl HipBackend {
     }
 
     /// Backend on the device chosen by `HipRuntime::select_device` (env `SMALLTIDE_HIP_DEVICE`).
+    /// Kernel launches so far, from any thread: unchanged between two reads means the engine
+    /// queued no GPU work in between.
+    pub fn launch_epoch(&self) -> u64 {
+        self.launch_epoch.load(Ordering::Relaxed)
+    }
+
     pub fn new_auto() -> Result<Self> {
         let rt = HipRuntime::load()?;
         let d = rt.select_device()?;
@@ -265,7 +276,10 @@ impl HipBackend {
             streams: Mutex::new(HashMap::new()),
             events: Mutex::new(HashMap::new()),
             graphs: Mutex::new(HashMap::new()),
+            gemm_x16: Mutex::new(None),
             stat_launches: AtomicU64::new(0),
+            launch_epoch: AtomicU64::new(0),
+            seg_kernels: std::env::var_os("SMALLTIDE_SEGTIME_KERNELS").is_some(),
             stat_launch_ns: AtomicU64::new(0),
             stat_sync_ns: AtomicU64::new(0),
             stat_syncs: AtomicU64::new(0),
@@ -371,7 +385,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, rescue_write_route, rescue_apply_patch, rescue_wait_and_patch, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, gemv_multi_wmma, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, dspark_argmax_final_margin, argmax_rows_part, argmax_rows_reduce, attn_prefill_wmma_split, attn_prefill_wmma_reduce, dspark_quant_fold_fp8, dspark_logits_argmax_fp8, dspark_rnn_step, dspark_ctx_store_fp8, dspark_attn_fp8_split, dspark_attn_reduce, dspark_embed_prep, add_rmsnorm_rows, dspark_qk_norm_rope, moe_w2_rows, vit_gemm_bf16, vit_epilogue, vit_ln, vit_rope, vit_attn)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, rescue_write_route, rescue_apply_patch, rescue_wait_and_patch, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_x16, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, gemv_multi_wmma, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, dspark_argmax_final_margin, argmax_rows_part, argmax_rows_reduce, attn_prefill_wmma_split, attn_prefill_wmma_reduce, attn_prefill_wmma_vt, kv_v_tiles_f16, dspark_quant_fold_fp8, dspark_logits_argmax_fp8, dspark_rnn_step, dspark_ctx_store_fp8, dspark_attn_fp8_split, dspark_attn_reduce, dspark_embed_prep, add_rmsnorm_rows, dspark_qk_norm_rope, moe_w2_rows, vit_gemm_bf16, vit_epilogue, vit_ln, vit_rope, vit_attn)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -465,6 +479,19 @@ impl HipBackend {
         extra: *mut *mut c_void,
     ) -> crate::ffi::HipError {
         self.bind();
+        if self.seg_kernels {
+            // Dev (SMALLTIDE_SEGTIME_KERNELS): one timeline mark per kernel, so the segment
+            // timer reports in-stream time per kernel with no sync per launch.
+            let mut g = self.seg_timer.lock().unwrap();
+            if let Some(t) = g.as_mut() {
+                if t.marks.len() + 1 >= t.events.len() {
+                    self.flush_segments(t);
+                }
+                let i = t.marks.len();
+                let _ = (self.rt.hip_event_record)(t.events[i], s);
+                t.marks.push(self.kernel_name(f));
+            }
+        }
         let t0 = std::time::Instant::now();
         let mut timer = self.kernel_timer.lock().unwrap();
         let slot = timer.as_mut().map(|t| {
@@ -484,6 +511,7 @@ impl HipBackend {
         drop(timer);
         self.stat_launch_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.stat_launches.fetch_add(1, Ordering::Relaxed);
+        self.launch_epoch.fetch_add(1, Ordering::Relaxed);
         r
     }
 
@@ -755,14 +783,16 @@ impl ComputeBackend for HipBackend {
         dst: DeviceBuf,
         src: DeviceBuf,
         n_words: usize,
+        sentinel_idx: usize,
         ticket: u32,
         stream: Stream,
     ) -> Result<()> {
         let mut d_dst = self.dev_ptr(dst)?;
         let mut d_src = self.dev_ptr(src)?;
         let mut n_arg = n_words as u32;
+        let mut s_arg = sentinel_idx as u32;
         let mut t_arg = ticket;
-        let mut args = [p(&mut d_dst), p(&mut d_src), p(&mut n_arg), p(&mut t_arg)];
+        let mut args = [p(&mut d_dst), p(&mut d_src), p(&mut n_arg), p(&mut s_arg), p(&mut t_arg)];
         self.launch(self.kernels.rescue_write_route, (1, 1, 1), 32, &mut args, stream, "launch(rescue_write_route)")
     }
 
@@ -1981,6 +2011,25 @@ impl ComputeBackend for HipBackend {
             if rows <= 16 {
                 return self.launch(self.kernels.gemm_fp8_rows_wmma_small, (n.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma_small)");
             }
+            if std::env::var_os("SMALLTIDE_GEMM_NO_X16").is_none() {
+                // The activations to f16 once, then the GEMM reads them as WMMA fragments.
+                let need = rows * k_cols * 2;
+                let x16 = {
+                    let mut g = self.gemm_x16.lock().unwrap();
+                    if g.map_or(true, |buf| buf.size_bytes < need) {
+                        if let Some(old) = g.take() {
+                            self.sync_stream(stream)?;
+                            self.free_device(old)?;
+                        }
+                        *g = Some(self.alloc_device(need)?);
+                    }
+                    g.unwrap()
+                };
+                self.f32_to_f16(x16, x, rows * k_cols, stream)?;
+                let mut xh = self.dev_ptr(x16)?;
+                let mut args16 = [p(&mut a), p(&mut xh), p(&mut c), p(&mut d), p(&mut m), p(&mut n), p(&mut k)];
+                return self.launch(self.kernels.gemm_fp8_rows_wmma_x16, (n.div_ceil(64), m.div_ceil(256), 1), 256, &mut args16, stream, "launch(gemm_fp8_rows_wmma_x16)");
+            }
             return self.launch(self.kernels.gemm_fp8_rows_wmma, (n.div_ceil(64), m.div_ceil(128), 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma)");
         }
         self.launch(self.kernels.gemm_fp8_e4m3_batched_f32, (n.div_ceil(4), m.div_ceil(8), 1), 128, &mut args, stream, "launch(gemm_fp8_rows)")
@@ -2478,7 +2527,8 @@ impl ComputeBackend for HipBackend {
         let (mut di, mut hd, mut m, mut ds) = (dim as u32, head_dim as u32, rows as u32, dyn_stride as u32);
         let mut hi = self.opt_dev_ptr(hist)?;
         let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut di), p(&mut hd), p(&mut m), p(&mut ds), p(&mut hi)];
-        self.launch(self.kernels.sconv_k4_rows_f32, (di.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(sconv_k4_rows)")
+        // One block per 256 channels and 16 rows (ST_SCONV_ROWS in the kernel).
+        self.launch(self.kernels.sconv_k4_rows_f32, (di.div_ceil(256), m.div_ceil(16), 1), 256, &mut args, stream, "launch(sconv_k4_rows)")
     }
 
     fn kv_store_fp8_rows(&self, k_cache: DeviceBuf, k_scales: DeviceBuf, v_cache: DeviceBuf,
@@ -2505,6 +2555,18 @@ impl ComputeBackend for HipBackend {
         if std::env::var_os("SMALLTIDE_ATTN_SCALAR").is_none() && pp.n_q_heads % pp.n_kv_heads == 0 {
             let mut rows = pp.rows as u32;
             let nqv = rows * (nq / nkv);
+            if let Some(vt) = pp.v_tiles {
+                // Pre-decode the V tiles of every key the rows can see, then attend reading them.
+                let lo0 = if pp.window != 0 && pp.pos0 + 1 > pp.window { pp.pos0 + 1 - pp.window } else { 0 };
+                let (mut key_lo, mut key_hi) = ((lo0 & !15) as u32, (pp.pos0 + pp.rows - 1) as u32);
+                let n_tiles = (key_hi - key_lo) / 16 + 1;
+                let mut vtp = self.dev_ptr(vt)?;
+                let mut targs = [p(&mut vtp), p(&mut e), p(&mut f), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut key_lo), p(&mut key_hi), p(&mut pt), p(&mut vq4)];
+                self.launch(self.kernels.kv_v_tiles_f16, (nkv, n_tiles, 1), 128, &mut targs, stream, "launch(kv_v_tiles_f16)")?;
+                let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut g), p(&mut h),
+                    p(&mut nq), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd), p(&mut rows), p(&mut pt), p(&mut vq4), p(&mut vtp)];
+                return self.launch(self.kernels.attn_prefill_wmma_vt, (nkv, nqv.div_ceil(16), 1), 128, &mut args, stream, "launch(attn_prefill_wmma_vt)");
+            }
             let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut e), p(&mut f), p(&mut g), p(&mut h),
                 p(&mut nq), p(&mut nkv), p(&mut ms), p(&mut win), p(&mut p0), p(&mut re), p(&mut isd), p(&mut rows), p(&mut pt), p(&mut vq4)];
             return self.launch(self.kernels.attn_prefill_wmma, (nkv, nqv.div_ceil(16), 1), 128, &mut args, stream, "launch(attn_prefill_wmma)");

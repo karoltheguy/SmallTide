@@ -5,12 +5,114 @@
 //! 4. In-layer dispatch + configurable Sync Rescue (Exact / Threshold / Disabled)
 
 use crate::cache::{TideCache, TransferOp};
+use crate::expert_map::{
+    RescueSnapshot, RescueZoneSnapshot, RESCUE_HIST_BINS, RESCUE_HIST_BIN_PCT,
+};
 use crate::priors::TidePriors;
 use smalltide_core::{
     ExpertId, Inkling2Config, PhysicalLayerId, RescuePolicy, SlotIndex, TideConfig, TideTelemetry,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+
+const RESCUE_WINDOW_CAP: usize = 128;
+
+#[inline]
+fn rescue_hist_bin(norm_w: f32) -> usize {
+    let pct = (norm_w.max(0.0) * 100.0) / (RESCUE_HIST_BIN_PCT as f32);
+    (pct.floor() as usize).min(RESCUE_HIST_BINS - 1)
+}
+
+#[derive(Debug, Clone)]
+struct RescueStepZone {
+    rescued: u16,
+    budget: u16,
+    capped_layers: u16,
+    blocked_picks: u16,
+    below_gate_picks: u16,
+    blocked_weight: f32,
+    below_weight: f32,
+    rescued_share_sum: f32,
+    rescued_share_min: f32,
+    miss_hist: [u32; RESCUE_HIST_BINS],
+}
+
+impl Default for RescueStepZone {
+    fn default() -> Self {
+        Self {
+            rescued: 0,
+            budget: 0,
+            capped_layers: 0,
+            blocked_picks: 0,
+            below_gate_picks: 0,
+            blocked_weight: 0.0,
+            below_weight: 0.0,
+            rescued_share_sum: 0.0,
+            rescued_share_min: f32::INFINITY,
+            miss_hist: [0; RESCUE_HIST_BINS],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RescueStepRecord {
+    verify_rows: usize,
+    zones: [RescueStepZone; 3],
+}
+
+#[derive(Debug, Default)]
+struct RescueTracker {
+    window: VecDeque<RescueStepRecord>,
+    cur: RescueStepRecord,
+    step_active: bool,
+    step_is_prefill: bool,
+    boot_steps: u64,
+    boot_rescued: [u64; 3],
+    boot_capped_steps: [u64; 3],
+}
+
+impl RescueTracker {
+    fn commit_current(&mut self) {
+        if !self.step_active || self.step_is_prefill {
+            self.step_active = false;
+            return;
+        }
+        let rec = std::mem::take(&mut self.cur);
+        self.boot_steps += 1;
+        for z in 0..3 {
+            let rz = &rec.zones[z];
+            self.boot_rescued[z] += rz.rescued as u64;
+            if rz.budget > 0 && rz.rescued >= rz.budget {
+                self.boot_capped_steps[z] += 1;
+            }
+        }
+        if self.window.len() == RESCUE_WINDOW_CAP {
+            self.window.pop_front();
+        }
+        self.window.push_back(rec);
+        self.step_active = false;
+    }
+
+    fn start_step(&mut self, verify_rows: usize, budgets: [usize; 3]) {
+        self.commit_current();
+        self.cur = RescueStepRecord {
+            verify_rows: verify_rows.max(1),
+            zones: std::array::from_fn(|z| RescueStepZone {
+                budget: budgets[z].min(u16::MAX as usize) as u16,
+                ..RescueStepZone::default()
+            }),
+        };
+        self.step_active = false;
+        self.step_is_prefill = false;
+    }
+}
+
+/// `SMALLTIDE_KEEP_EVICTED_IN_RAM=0` turns off `keep_evicted_in_ram` and
+/// `adopt_disk_read_into_ram` (dev comparison).
+fn keep_evicted_in_ram_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SMALLTIDE_KEEP_EVICTED_IN_RAM").map(|v| v.trim() != "0").unwrap_or(true))
+}
 
 /// Routing priors owned by the scheduler: installed at startup, updated at each request end.
 pub struct PriorsStore {
@@ -80,6 +182,10 @@ pub struct TideScheduler {
     /// Kind / routing share the next logged transfers get (set by each planner; 0 = not logged).
     event_kind: u8,
     event_share: f32,
+    /// `decoded_tokens` at which periodic adaptive rebalance last fired (immune to multi-token spec jumps!).
+    last_periodic_rebalance_tok: u64,
+    /// Per-block (Prelude / Loop Core / Coda) rescue gate & budget tuning telemetry.
+    rescue_tracker: RescueTracker,
 }
 
 impl TideScheduler {
@@ -105,7 +211,7 @@ impl TideScheduler {
             pending_async_vram: HashMap::new(),
             pending_async_ram: HashMap::new(),
             priors_store: None,
-            async_hysteresis: 2.0,
+            async_hysteresis: 1.10,
             rescue_budget: 4,
             rescue_zone_budgets: None,
             loop_core_gate: None,
@@ -114,6 +220,8 @@ impl TideScheduler {
             events: crate::expert_map::EventLog::default(),
             event_kind: 0,
             event_share: 0.0,
+            last_periodic_rebalance_tok: 0,
+            rescue_tracker: RescueTracker::default(),
         }
     }
 
@@ -247,12 +355,58 @@ impl TideScheduler {
         ops
     }
 
+    /// A background swap (`op`) took an expert off the card. If that expert has no copy in RAM
+    /// it is on the disk only, and its next rescue would read the disk while the GPU waits:
+    /// queue a background read of it now. Only where RAM has room (`ram_has_room_for`).
+    fn keep_evicted_in_ram(&mut self, op: &TransferOp, ops: &mut Vec<TransferOp>) {
+        if !keep_evicted_in_ram_on() {
+            return;
+        }
+        let victim = match *op {
+            TransferOp::RamToVram { evicted_from_vram: Some(v), .. } | TransferOp::DiskToVramDirect { evicted_from_vram: Some(v), .. } => v,
+            _ => return,
+        };
+        if !self.cache.entry(victim).ram_slot.is_missing() || !self.cache.ram_has_room_for(victim) {
+            return;
+        }
+        if let Some(read) = self.cache.promote_to_ram_with_flag(victim, true) {
+            self.record_transfer_telemetry(&read, false);
+            self.telemetry.evicted_kept_in_ram += 1;
+            ops.push(read);
+        }
+    }
+
+    /// An expert that was not ready in RAM was just read from the disk for a rescue. Returns the
+    /// RAM slot the caller stores the bytes in, so its next rescue is a RAM copy: the slot its
+    /// background read is still on its way to (that read is then already done), or a new one.
+    /// None when RAM has no room.
+    pub fn adopt_disk_read_into_ram(&mut self, id: ExpertId) -> Option<SlotIndex> {
+        if !keep_evicted_in_ram_on() {
+            return None;
+        }
+        let e = self.cache.entry(id);
+        if !e.ram_slot.is_missing() {
+            self.cache.mark_ram_ready(id);
+            return Some(e.ram_slot);
+        }
+        if !self.cache.ram_has_room_for(id) {
+            return None;
+        }
+        match self.cache.promote_to_ram_with_flag(id, false)? {
+            TransferOp::DiskToRam { ram_slot, .. } => Some(ram_slot),
+            _ => None,
+        }
+    }
+
     /// Startup RAM warm-up in `order` (most valuable first): experts that are NOT in VRAM first
     /// (a miss on them would otherwise read the disk), then RAM copies of VRAM-resident experts
-    /// with the budget left (cheap fallback once they are evicted from VRAM).
+    /// with the budget left (cheap fallback once they are evicted from VRAM). Those copies go to
+    /// the least valuable residents first: they are the ones a swap evicts, and an evicted expert
+    /// without a RAM copy is read from the disk the next time it is rescued - while the GPU waits.
     fn fill_ram(&mut self, order: &[ExpertId], ops: &mut Vec<TransferOp>) {
         for want_resident in [false, true] {
-            for &id in order {
+            let ids: Vec<ExpertId> = if want_resident { order.iter().rev().copied().collect() } else { order.to_vec() };
+            for id in ids {
                 let e = self.cache.entry(id);
                 let in_vram = !e.vram_slot.is_missing();
                 // Pinned experts are never evicted from VRAM: a RAM copy would be dead weight.
@@ -348,7 +502,8 @@ impl TideScheduler {
             if let Some(op) = self.cache.promote_to_vram(id, pin, false) {
                 self.record_transfer_telemetry(&op, false);
                 self.telemetry.prompt_aware_swaps += 1;
-                ops.push(op);
+                ops.push(op.clone());
+                self.keep_evicted_in_ram(&op, &mut ops);
                 swaps += 1;
                 floors[ci] = None;
             }
@@ -416,8 +571,278 @@ impl TideScheduler {
     /// Mode 4: Per-layer decode dispatch planner (Split-Batch Hit/Miss + Sync Rescue + Renorm).
     /// Token boundary: the per-zone rescue budgets start again.
     pub fn begin_token(&mut self) {
+        self.begin_verify_step(1);
+    }
+
+    /// Step boundary for single-token decode (`verify_rows == 1`) or speculative verify (`m > 1`).
+    pub fn begin_verify_step(&mut self, verify_rows: usize) {
+        let budgets = self.effective_zone_budgets(verify_rows);
+        self.rescue_tracker.start_step(verify_rows, budgets);
         self.rescues_this_token = 0;
         self.rescues_by_zone = [0; 3];
+    }
+
+    /// Marks the current step as prefill so prefill passes do not skew decode/verify rescue stats.
+    pub fn mark_step_prefill(&mut self) {
+        self.rescue_tracker.step_is_prefill = true;
+    }
+
+    /// Clears the rolling rescue-tuning window (e.g. after a live gate/budget config change).
+    pub fn reset_rescue_window(&mut self) {
+        self.rescue_tracker.window.clear();
+        self.rescue_tracker.step_active = false;
+    }
+
+    /// Records that `layer` was short-circuited because its zone's rescue budget was already spent.
+    pub fn note_zone_budget_capped_layer(&mut self, layer: PhysicalLayerId) {
+        if self.rescue_tracker.step_is_prefill {
+            return;
+        }
+        let z = self.zone_of(layer);
+        self.rescue_tracker.step_active = true;
+        self.rescue_tracker.cur.zones[z].capped_layers =
+            self.rescue_tracker.cur.zones[z].capped_layers.saturating_add(1);
+    }
+
+    /// Effective routing-share gate for zone `z` (`0 = Prelude`, `1 = Loop Core`, `2 = Coda`).
+    #[inline]
+    pub fn effective_zone_gate(&self, zone: usize) -> f32 {
+        match self.tide_cfg.rescue_policy {
+            RescuePolicy::Exact => 0.0,
+            RescuePolicy::Disabled => 1.0,
+            RescuePolicy::Threshold(gate) => match self.loop_core_gate {
+                Some(g) if zone == 1 => g,
+                _ => gate,
+            },
+        }
+    }
+
+    /// Snapshot of per-block (`Prelude`, `Loop Core`, `Coda`) rescue gate & budget tuning metrics.
+    pub fn rescue_snapshot(&self) -> RescueSnapshot {
+        let policy = match self.tide_cfg.rescue_policy {
+            RescuePolicy::Exact => "exact",
+            RescuePolicy::Disabled => "disabled",
+            RescuePolicy::Threshold(_) => "threshold",
+        };
+        let base_budgets = self.effective_zone_budgets(1);
+        let include_cur = self.rescue_tracker.step_active && !self.rescue_tracker.step_is_prefill;
+        let window_steps = self.rescue_tracker.window.len() + usize::from(include_cur);
+        let total_steps = self.rescue_tracker.boot_steps + u64::from(include_cur);
+        let last_verify_rows = if include_cur {
+            self.rescue_tracker.cur.verify_rows.max(1)
+        } else {
+            self.rescue_tracker
+                .window
+                .back()
+                .map(|r| r.verify_rows.max(1))
+                .unwrap_or(1)
+        };
+
+        let meta: [(&'static str, &'static str); 3] = [
+            ("Prelude", "L0–5"),
+            ("Loop Core", "L6–17 ×3"),
+            ("Coda", "L18–23"),
+        ];
+
+        let zones = std::array::from_fn(|z| {
+            let gate = self.effective_zone_gate(z);
+            let base_budget = base_budgets[z];
+            let mut used_vals: Vec<usize> = Vec::with_capacity(window_steps);
+            let mut sum_used = 0u64;
+            let mut sum_budget = 0u64;
+            let mut capped_steps = 0u64;
+            let mut zero_steps = 0u64;
+            let mut max_used = 0usize;
+            let mut sum_capped_layers = 0u64;
+            let mut sum_blocked_picks = 0u64;
+            let mut sum_below_picks = 0u64;
+            let mut sum_blocked_w = 0.0f64;
+            let mut sum_below_w = 0.0f64;
+            let mut sum_rescued_sh = 0.0f64;
+            let mut min_rescued_sh = f32::INFINITY;
+            let mut miss_hist = [0u32; RESCUE_HIST_BINS];
+
+            let mut fold = |rz: &RescueStepZone| {
+                let u = rz.rescued as usize;
+                let b = rz.budget as usize;
+                used_vals.push(u);
+                sum_used += u as u64;
+                sum_budget += b as u64;
+                if b > 0 && u >= b {
+                    capped_steps += 1;
+                }
+                if u == 0 {
+                    zero_steps += 1;
+                }
+                if u > max_used {
+                    max_used = u;
+                }
+                sum_capped_layers += rz.capped_layers as u64;
+                sum_blocked_picks += rz.blocked_picks as u64;
+                sum_below_picks += rz.below_gate_picks as u64;
+                sum_blocked_w += rz.blocked_weight as f64;
+                sum_below_w += rz.below_weight as f64;
+                sum_rescued_sh += rz.rescued_share_sum as f64;
+                if rz.rescued_share_min < min_rescued_sh {
+                    min_rescued_sh = rz.rescued_share_min;
+                }
+                for bin in 0..RESCUE_HIST_BINS {
+                    miss_hist[bin] = miss_hist[bin].saturating_add(rz.miss_hist[bin]);
+                }
+            };
+
+            for rec in &self.rescue_tracker.window {
+                fold(&rec.zones[z]);
+            }
+            if include_cur {
+                fold(&self.rescue_tracker.cur.zones[z]);
+            }
+
+            used_vals.sort_unstable();
+            let p95_used = if used_vals.is_empty() {
+                0
+            } else {
+                let idx = ((used_vals.len() - 1) * 95) / 100;
+                used_vals[idx]
+            };
+
+            let n = window_steps.max(1) as f64;
+            let avg_used = if window_steps > 0 { sum_used as f64 / n } else { 0.0 };
+            let avg_budget = if window_steps > 0 {
+                sum_budget as f64 / n
+            } else {
+                base_budget as f64
+            };
+            let util_pct = if avg_budget > 0.0 {
+                (avg_used / avg_budget) * 100.0
+            } else {
+                0.0
+            };
+            let capped_pct = if window_steps > 0 {
+                (capped_steps as f64 / n) * 100.0
+            } else {
+                0.0
+            };
+            let zero_pct = if window_steps > 0 {
+                (zero_steps as f64 / n) * 100.0
+            } else {
+                0.0
+            };
+            let boot_rescued = self.rescue_tracker.boot_rescued[z]
+                + if include_cur {
+                    self.rescue_tracker.cur.zones[z].rescued as u64
+                } else {
+                    0
+                };
+            let boot_capped_steps = self.rescue_tracker.boot_capped_steps[z]
+                + if include_cur
+                    && self.rescue_tracker.cur.zones[z].budget > 0
+                    && self.rescue_tracker.cur.zones[z].rescued
+                        >= self.rescue_tracker.cur.zones[z].budget
+                {
+                    1
+                } else {
+                    0
+                };
+            let boot_capped_pct = if total_steps > 0 {
+                (boot_capped_steps as f64 / total_steps as f64) * 100.0
+            } else {
+                0.0
+            };
+            let avg_capped_layers = if window_steps > 0 {
+                sum_capped_layers as f64 / n
+            } else {
+                0.0
+            };
+            let avg_blocked_picks = if window_steps > 0 {
+                sum_blocked_picks as f64 / n
+            } else {
+                0.0
+            };
+            let avg_below_gate_picks = if window_steps > 0 {
+                sum_below_picks as f64 / n
+            } else {
+                0.0
+            };
+            let avg_blocked_weight = if window_steps > 0 {
+                sum_blocked_w / n
+            } else {
+                0.0
+            };
+            let avg_below_weight = if window_steps > 0 {
+                sum_below_w / n
+            } else {
+                0.0
+            };
+            let rescued_share_avg = if sum_used > 0 {
+                sum_rescued_sh / sum_used as f64
+            } else {
+                0.0
+            };
+            let rescued_share_min = if min_rescued_sh.is_finite() {
+                min_rescued_sh as f64
+            } else {
+                0.0
+            };
+
+            let status = match self.tide_cfg.rescue_policy {
+                RescuePolicy::Disabled => "off",
+                RescuePolicy::Exact => "exact",
+                RescuePolicy::Threshold(_) => {
+                    if base_budget == 0 {
+                        "off"
+                    } else if window_steps == 0 {
+                        "idle"
+                    } else if capped_pct >= 25.0 || util_pct >= 85.0 {
+                        "saturated"
+                    } else if capped_pct >= 8.0 || util_pct >= 65.0 {
+                        "tight"
+                    } else if avg_used < 0.25 && avg_below_gate_picks >= 1.5 {
+                        "underused"
+                    } else if avg_used < 0.05 && avg_below_gate_picks < 0.5 {
+                        "idle"
+                    } else if util_pct < 5.0 && base_budget >= 6 {
+                        "underused"
+                    } else {
+                        "balanced"
+                    }
+                }
+            };
+
+            RescueZoneSnapshot {
+                name: meta[z].0,
+                layers_label: meta[z].1,
+                gate,
+                base_budget,
+                avg_budget,
+                avg_used,
+                p95_used,
+                max_used,
+                util_pct,
+                capped_pct,
+                zero_pct,
+                boot_capped_pct,
+                boot_rescued,
+                avg_capped_layers,
+                avg_blocked_picks,
+                avg_below_gate_picks,
+                avg_blocked_weight,
+                avg_below_weight,
+                rescued_share_avg,
+                rescued_share_min,
+                miss_hist,
+                status,
+            }
+        });
+
+        RescueSnapshot {
+            policy,
+            window_steps,
+            total_steps,
+            base_budget_total: base_budgets.iter().sum(),
+            last_verify_rows,
+            zones,
+        }
     }
 
     #[inline]
@@ -504,12 +929,16 @@ impl TideScheduler {
         // subject to this layer's zone rescue budget (Prelude / Loop Core / Coda).
         let zone = self.zone_of(layer);
         let zone_cap = self.effective_zone_budgets(1)[zone];
+        let zone_gate = self.effective_zone_gate(zone);
+        if !self.rescue_tracker.step_is_prefill {
+            self.rescue_tracker.step_active = true;
+            if self.rescue_tracker.cur.zones[zone].budget == 0 && zone_cap > 0 {
+                self.rescue_tracker.cur.zones[zone].budget = zone_cap.min(u16::MAX as usize) as u16;
+            }
+        }
         let threshold_pick: Option<usize> = match self.tide_cfg.rescue_policy {
-            RescuePolicy::Threshold(gate) if self.rescues_by_zone[zone] < zone_cap => {
-                let tau = match self.loop_core_gate {
-                    Some(g) if self.model_cfg.is_loop_core_layer(layer.0 as usize) => g,
-                    _ => gate,
-                };
+            RescuePolicy::Threshold(_) if self.rescues_by_zone[zone] < zone_cap => {
+                let tau = zone_gate;
                 topk_ids
                 .iter()
                 .zip(topk_weights.iter())
@@ -552,6 +981,10 @@ impl TideScheduler {
             // VRAM Miss! Threshold tau is evaluated against normalized routing share [0..1]
             // (so it works identically regardless of route_scale = 8.0!).
             self.record_miss(layer);
+            if !self.rescue_tracker.step_is_prefill {
+                let bin = rescue_hist_bin(norm_w);
+                self.rescue_tracker.cur.zones[zone].miss_hist[bin] += 1;
+            }
             let should_sync_rescue = match self.tide_cfg.rescue_policy {
                 RescuePolicy::Exact => true,
                 RescuePolicy::Threshold(_) => threshold_pick == Some(k),
@@ -560,6 +993,7 @@ impl TideScheduler {
 
             if should_sync_rescue {
                 self.event_share = norm_w;
+                let mut rescued_ok = false;
                 // If hot enough (or free space exists), promote into a resident VRAM slot;
                 // otherwise use the transient Scratch Rescue Ring so cold 1-off misses
                 // never thrash warm resident experts!
@@ -575,6 +1009,7 @@ impl TideScheduler {
                             weight: w,
                         });
                         executed_weight += w;
+                        rescued_ok = true;
                     } else {
                         self.telemetry.stage1_skipped_tail_misses += 1;
                         self.telemetry.routed_weight_skipped += norm_w as f64;
@@ -590,11 +1025,44 @@ impl TideScheduler {
                         weight: w,
                     });
                     executed_weight += w;
+                    rescued_ok = true;
+                    // Also enqueue scratch-rescued experts for background promotion so recurring
+                    // misses graduate into permanent resident VRAM slots instead of re-rescuing!
+                    if self.cache.entry(id).ram_slot.is_missing() {
+                        *self.pending_async_ram.entry(id).or_insert(0.0) += norm_w;
+                    }
+                    *self.pending_async_vram.entry(id).or_insert(0.0) += norm_w;
+                }
+                if !self.rescue_tracker.step_is_prefill {
+                    let rz = &mut self.rescue_tracker.cur.zones[zone];
+                    if rescued_ok {
+                        rz.rescued = rz.rescued.saturating_add(1);
+                        rz.rescued_share_sum += norm_w;
+                        if norm_w < rz.rescued_share_min {
+                            rz.rescued_share_min = norm_w;
+                        }
+                    } else if norm_w >= zone_gate {
+                        rz.blocked_picks = rz.blocked_picks.saturating_add(1);
+                        rz.blocked_weight += norm_w;
+                    } else {
+                        rz.below_gate_picks = rz.below_gate_picks.saturating_add(1);
+                        rz.below_weight += norm_w;
+                    }
                 }
             } else {
                 // Skip this miss for zero-stall decode and enqueue for paced async promotion!
                 self.telemetry.stage1_skipped_tail_misses += 1;
                 self.telemetry.routed_weight_skipped += norm_w as f64;
+                if !self.rescue_tracker.step_is_prefill {
+                    let rz = &mut self.rescue_tracker.cur.zones[zone];
+                    if norm_w >= zone_gate {
+                        rz.blocked_picks = rz.blocked_picks.saturating_add(1);
+                        rz.blocked_weight += norm_w;
+                    } else {
+                        rz.below_gate_picks = rz.below_gate_picks.saturating_add(1);
+                        rz.below_weight += norm_w;
+                    }
+                }
                 let prio = norm_w;
                 if entry.ram_slot.is_missing() {
                     *self.pending_async_ram.entry(id).or_insert(0.0) += prio;
@@ -653,14 +1121,16 @@ impl TideScheduler {
             }
         }
 
-        if let RescuePolicy::Threshold(gate) = self.tide_cfg.rescue_policy {
+        if let RescuePolicy::Threshold(_) = self.tide_cfg.rescue_policy {
             let zone = self.zone_of(layer);
             let zone_cap = self.effective_zone_budgets(m)[zone];
+            let tau = self.effective_zone_gate(zone);
+            if !self.rescue_tracker.step_is_prefill {
+                self.rescue_tracker.step_active = true;
+                self.rescue_tracker.cur.verify_rows = m.max(1);
+                self.rescue_tracker.cur.zones[zone].budget = zone_cap.min(u16::MAX as usize) as u16;
+            }
             if self.rescues_by_zone[zone] < zone_cap {
-                let tau = match self.loop_core_gate {
-                    Some(g) if self.model_cfg.is_loop_core_layer(layer.0 as usize) => g,
-                    _ => gate,
-                };
                 // Aggregate (max_single_row_share, sum_share_across_rows) per unique missing expert.
                 let mut miss_stats: Vec<(ExpertId, f32, f32)> = Vec::new();
                 for (r_ids, r_ws) in rows_ids.iter().zip(rows_ws.iter()) {
@@ -682,26 +1152,47 @@ impl TideScheduler {
                 }
                 miss_stats.retain(|s| s.1 >= tau);
                 miss_stats.sort_by(|a, b| b.2.total_cmp(&a.2));
-                // 1/layer in Loop Core (36 passes); up to 2/layer in Prelude & Coda on wide verify steps.
-                let max_per_layer = if zone != 1 && m >= 4 { 2 } else { 1 };
+                // 1/layer in Loop Core (36 passes); scale Prelude & Coda up to 3/layer when budget > 12.
+                let max_per_layer = if zone == 1 {
+                    1
+                } else if m >= 4 {
+                    zone_cap.div_ceil(6).clamp(2, 3)
+                } else {
+                    zone_cap.div_ceil(6).clamp(1, 2)
+                };
                 let rem_budget = zone_cap.saturating_sub(self.rescues_by_zone[zone]);
                 let take = max_per_layer.min(rem_budget);
                 for (id, max_share, _sum_share) in miss_stats.into_iter().take(take) {
                     self.rescues_this_token += 1;
                     self.rescues_by_zone[zone] += 1;
                     self.event_share = max_share;
+                    let mut rescued_ok = false;
                     if self.cache.should_promote_instead_of_scratch(id) {
                         let pin = !self.cache.has_priors() && self.model_cfg.is_loop_core_layer(layer.0 as usize);
                         if let Some(op) = self.cache.promote_to_vram(id, pin, true) {
                             self.record_transfer_telemetry(&op, true);
                             sync_transfers.push(op);
                             rescued.push(id);
+                            rescued_ok = true;
                         }
                     } else {
                         let op = self.cache.stage_scratch_rescue(id);
                         self.record_transfer_telemetry(&op, true);
                         sync_transfers.push(op);
                         rescued.push(id);
+                        rescued_ok = true;
+                        if self.cache.entry(id).ram_slot.is_missing() {
+                            *self.pending_async_ram.entry(id).or_insert(0.0) += max_share;
+                        }
+                        *self.pending_async_vram.entry(id).or_insert(0.0) += max_share;
+                    }
+                    if rescued_ok && !self.rescue_tracker.step_is_prefill {
+                        let rz = &mut self.rescue_tracker.cur.zones[zone];
+                        rz.rescued = rz.rescued.saturating_add(1);
+                        rz.rescued_share_sum += max_share;
+                        if max_share < rz.rescued_share_min {
+                            rz.rescued_share_min = max_share;
+                        }
                     }
                 }
             }
@@ -729,6 +1220,11 @@ impl TideScheduler {
     ) {
         let total: f32 = topk_weights.iter().sum();
         let inv = if total > 1e-8 { 1.0 / total } else { 1.0 };
+        let zone = self.zone_of(layer);
+        let zone_gate = self.effective_zone_gate(zone);
+        if !self.rescue_tracker.step_is_prefill {
+            self.rescue_tracker.step_active = true;
+        }
         self.telemetry.routed_weight_total += 1.0;
         for (&exp, &w) in topk_ids.iter().zip(topk_weights.iter()) {
             let id = ExpertId { layer, expert: exp };
@@ -738,6 +1234,10 @@ impl TideScheduler {
                 self.record_hit(layer);
                 continue;
             }
+            if !self.rescue_tracker.step_is_prefill {
+                let bin = rescue_hist_bin(norm_w);
+                self.rescue_tracker.cur.zones[zone].miss_hist[bin] += 1;
+            }
             if rescued.contains(&id) {
                 self.record_miss(layer);
                 continue;
@@ -745,6 +1245,16 @@ impl TideScheduler {
             self.record_miss(layer);
             self.telemetry.stage1_skipped_tail_misses += 1;
             self.telemetry.routed_weight_skipped += norm_w as f64;
+            if !self.rescue_tracker.step_is_prefill {
+                let rz = &mut self.rescue_tracker.cur.zones[zone];
+                if norm_w >= zone_gate {
+                    rz.blocked_picks = rz.blocked_picks.saturating_add(1);
+                    rz.blocked_weight += norm_w;
+                } else {
+                    rz.below_gate_picks = rz.below_gate_picks.saturating_add(1);
+                    rz.below_weight += norm_w;
+                }
+            }
             let entry = self.cache.entry(id);
             if entry.ram_slot.is_missing() {
                 *self.pending_async_ram.entry(id).or_insert(0.0) += norm_w;
@@ -779,6 +1289,48 @@ impl TideScheduler {
                     // Keep top tail for next token with mild decay
                     if prio > 0.05 {
                         self.pending_async_ram.insert(id, prio * 0.9);
+                    }
+                }
+            }
+        }
+
+        // Stage 2 repair: an expert that left the card with no copy in RAM is on the disk only,
+        // and a rescue of it reads the disk while the GPU waits. Read such experts back in the
+        // background, most valuable first. Only into free RAM or in place of a copy of an expert
+        // that is on the card: a RAM tier full of off-card experts must not churn.
+        if self.tide_cfg.max_async_ram_promotions_per_token > 0 {
+            const REPAIRS_PER_STEP: usize = 8;
+            let mut disk_only: Vec<(ExpertId, f64)> = Vec::new();
+            let mut spare_copies = 0usize;
+            for l in 0..self.model_cfg.num_physical_layers {
+                for x in 0..self.model_cfg.n_routed_experts {
+                    let id = ExpertId { layer: PhysicalLayerId(l as u16), expert: x as u16 };
+                    let e = self.cache.entry(id);
+                    let on_card = !e.vram_slot.is_missing() && !e.is_scratch_slot;
+                    if e.ram_slot.is_missing() {
+                        if !on_card {
+                            disk_only.push((id, self.cache.value(id)));
+                        }
+                    } else if on_card && !e.ram_in_flight {
+                        spare_copies += 1;
+                    }
+                }
+            }
+            if !disk_only.is_empty() {
+                disk_only.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let mut free = self.cache.ram_budget_bytes().saturating_sub(self.cache.ram_used_bytes());
+                for (id, _) in disk_only.into_iter().take(REPAIRS_PER_STEP) {
+                    let need = self.cache.expert_bytes(id);
+                    if free >= need {
+                        free -= need;
+                    } else if spare_copies > 0 {
+                        spare_copies -= 1;
+                    } else {
+                        break;
+                    }
+                    if let Some(op) = self.cache.promote_to_ram_with_flag(id, true) {
+                        self.record_transfer_telemetry(&op, false);
+                        ops.push(op);
                     }
                 }
             }
@@ -829,7 +1381,8 @@ impl TideScheduler {
                 if let Some(op) = self.cache.promote_to_vram(id, pin, false) {
                     self.record_transfer_telemetry(&op, false);
                     self.telemetry.decode_async_promotions += 1;
-                    ops.push(op);
+                    ops.push(op.clone());
+                    self.keep_evicted_in_ram(&op, &mut ops);
                     done += 1;
                     floors[ci] = None;
                 }
@@ -860,9 +1413,18 @@ impl TideScheduler {
     ) -> Vec<TransferOp> {
         self.event_kind = crate::expert_map::EV_ADAPT;
         self.event_share = 0.0;
-        if !force && (interval_tokens == 0 || decoded_tokens == 0 || decoded_tokens % interval_tokens != 0) {
-            return Vec::new();
+        if !force {
+            if interval_tokens == 0 || decoded_tokens == 0 {
+                return Vec::new();
+            }
+            if decoded_tokens < self.last_periodic_rebalance_tok {
+                self.last_periodic_rebalance_tok = 0;
+            }
+            if decoded_tokens.saturating_sub(self.last_periodic_rebalance_tok) < interval_tokens {
+                return Vec::new();
+            }
         }
+        self.last_periodic_rebalance_tok = decoded_tokens;
         let heat_snap = self.cache.export_heat_snapshot();
         let mut cands: Vec<(ExpertId, f64)> = heat_snap
             .iter()
@@ -884,7 +1446,8 @@ impl TideScheduler {
         let mut ops = Vec::new();
         let mut floors: [Option<Option<f64>>; 2] = [None, None];
         for (id, val) in cands {
-            if ops.len() >= max_swaps {
+            // swaps only: `ops` also carries the background reads of `keep_evicted_in_ram`
+            if ops.iter().filter(|o| !matches!(o, TransferOp::DiskToRam { .. })).count() >= max_swaps {
                 break;
             }
             let cls = self.cache.expert_class(id);
@@ -910,7 +1473,8 @@ impl TideScheduler {
             let pin = !self.cache.has_priors() && self.model_cfg.is_loop_core_layer(id.layer.0 as usize);
             if let Some(op) = self.cache.promote_to_vram(id, pin, false) {
                 self.record_transfer_telemetry(&op, false);
-                ops.push(op);
+                ops.push(op.clone());
+                self.keep_evicted_in_ram(&op, &mut ops);
             }
         }
         ops
@@ -964,6 +1528,7 @@ impl TideScheduler {
                 self.telemetry.stage2_disk_reads += 1;
                 self.telemetry.stage2_bytes_read += b;
                 if is_sync_rescue {
+                    self.telemetry.rescue_disk_reads += 1;
                     self.telemetry.stage1_sync_rescues += 1;
                 } else {
                     self.telemetry.stage1_async_promotions += 1;
@@ -978,6 +1543,7 @@ impl TideScheduler {
                 let b = self.cache.expert_bytes(*expert) as u64;
                 if src_ram_slot.is_none() {
                     self.telemetry.stage2_disk_reads += 1;
+                    self.telemetry.rescue_disk_reads += 1;
                     self.telemetry.stage2_bytes_read += b;
                 }
                 self.telemetry.stage1_sync_rescues += 1;
@@ -1254,6 +1820,65 @@ mod tests {
         assert!(ops2.iter().all(|op| !matches!(op, TransferOp::DiskToVramDirect { .. })));
     }
 
+    /// An expert on the disk only is read back into RAM in the background (most valuable first),
+    /// so a later rescue of it does not read the disk; never when RAM has no room for it.
+    #[test]
+    fn test_disk_only_experts_are_read_back_in_the_background() {
+        let mut tide_cfg = TideConfig::default();
+        tide_cfg.preload_before_prefill = false;
+        let mut sched = TideScheduler::new(Inkling2Config::default(), tide_cfg.clone(), 16 * GIB, 16 * GIB);
+        let wanted = eid(3, 9);
+        for _ in 0..10 {
+            sched.cache.touch_expert(wanted, 1.0);
+        }
+        let ops = sched.plan_async_step();
+        assert!(matches!(ops.first(), Some(TransferOp::DiskToRam { expert, .. }) if *expert == wanted));
+        assert!(ops.iter().all(|op| matches!(op, TransferOp::DiskToRam { .. })) && ops.len() <= 8);
+        assert!(!sched.cache.is_ram_ready(wanted), "the read is in flight");
+        // The same expert is not queued twice.
+        let again = sched.plan_async_step();
+        assert!(again.iter().all(|op| !matches!(op, TransferOp::DiskToRam { expert, .. } if *expert == wanted)));
+        // No RAM at all: nothing is read.
+        let mut none = TideScheduler::new(Inkling2Config::default(), tide_cfg, 16 * GIB, 0);
+        assert!(none.plan_async_step().is_empty());
+    }
+
+    #[test]
+    fn test_an_expert_read_from_the_disk_for_a_rescue_stays_in_ram() {
+        let mut tide_cfg = TideConfig::default();
+        tide_cfg.preload_before_prefill = false;
+        let mut sched = TideScheduler::new(Inkling2Config::default(), tide_cfg.clone(), 16 * GIB, 16 * GIB);
+        // On the disk only: it gets a RAM slot that is ready at once (the caller has the bytes).
+        let a = eid(5, 17);
+        assert!(sched.cache.entry(a).ram_slot.is_missing());
+        let slot = sched.adopt_disk_read_into_ram(a).expect("free RAM");
+        assert_eq!(sched.cache.entry(a).ram_slot, slot);
+        assert!(sched.cache.is_ram_ready(a));
+        // A background read of it is on its way: the rescue's read completes that slot.
+        let b = eid(3, 9);
+        for _ in 0..10 {
+            sched.cache.touch_expert(b, 1.0);
+        }
+        let ops = sched.plan_async_step();
+        let queued = ops.iter().find_map(|op| match op {
+            TransferOp::DiskToRam { expert, ram_slot, .. } if *expert == b => Some(*ram_slot),
+            _ => None,
+        });
+        let queued = queued.expect("background read queued");
+        assert!(!sched.cache.is_ram_ready(b));
+        assert_eq!(sched.adopt_disk_read_into_ram(b), Some(queued));
+        assert!(sched.cache.is_ram_ready(b));
+        // RAM holds one off-card expert and nothing else fits: its copy is not taken.
+        let one = sched.cache.expert_bytes(a);
+        let mut full = TideScheduler::new(Inkling2Config::default(), tide_cfg.clone(), 16 * GIB, one);
+        assert!(full.adopt_disk_read_into_ram(a).is_some());
+        assert!(full.adopt_disk_read_into_ram(eid(5, 18)).is_none());
+        assert!(full.cache.is_ram_ready(a));
+        // No RAM tier: nothing to keep.
+        let mut none = TideScheduler::new(Inkling2Config::default(), tide_cfg, 16 * GIB, 0);
+        assert!(none.adopt_disk_read_into_ram(a).is_none());
+    }
+
     #[test]
     fn test_verify_layer_dispatch_protects_all_rows_and_ranks_shared_misses() {
         let model_cfg = Inkling2Config::default();
@@ -1295,5 +1920,55 @@ mod tests {
         assert!(sched.cache.is_vram_hit(eid(20, 0)));
         assert!(sched.cache.is_vram_hit(eid(20, 1)));
         assert!(sched.cache.is_vram_hit(eid(20, 2)));
+    }
+
+    #[test]
+    fn test_rescue_snapshot_tracks_per_zone_gate_and_budget_balance() {
+        let model_cfg = Inkling2Config::default();
+        let mut tide_cfg = TideConfig::default();
+        tide_cfg.rescue_policy = RescuePolicy::Threshold(0.12);
+        let mut sched = TideScheduler::new(model_cfg, tide_cfg, 16 * GIB, 16 * GIB);
+        // Leave misses across Prelude (layer 0), Loop Core (layer 6), and Coda (layer 20).
+        sched.cache.configure_scratch_ring(16, 4, 8);
+        let _ = sched.plan_pre_prefill(None);
+        sched.cache.publish_all_pending();
+        sched.rescue_zone_budgets = Some([2, 4, 1]);
+        sched.loop_core_gate = Some(0.05);
+
+        // Step 1:
+        // - Prelude (cap 2): 1 rescue (share 0.20), 1 below-gate miss (share 0.08) -> balanced (1/2)
+        // - Loop Core (cap 4): 0 rescues, 2 below-gate misses (0.03, 0.04) -> underused
+        // - Coda (cap 1): 1 rescue (share 0.25) hits cap 1/1 + 1 blocked miss (0.18) + 1 capped layer -> saturated
+        sched.begin_token();
+        let _ = sched.plan_layer_dispatch(PhysicalLayerId(0), &[120, 121], &[0.20, 0.08]); // norm: 0.714, 0.286 (wait: let's include a resident hit so norm matches!)
+        // Wait: use exact sum=1.0 weights so normalized shares are exact!
+        sched.begin_token();
+        let _ = sched.plan_layer_dispatch(PhysicalLayerId(0), &[0, 120, 121], &[0.72, 0.20, 0.08]);
+        let _ = sched.plan_layer_dispatch(PhysicalLayerId(6), &[0, 120, 121], &[0.93, 0.04, 0.03]);
+        let _ = sched.plan_layer_dispatch(PhysicalLayerId(20), &[0, 120, 121], &[0.57, 0.25, 0.18]);
+        sched.note_zone_budget_capped_layer(PhysicalLayerId(21));
+
+        // Commit by starting a fresh inactive step (snapshot should see step 2 + step 1!)
+        let snap = sched.rescue_snapshot();
+        assert_eq!(snap.policy, "threshold");
+        assert_eq!(snap.base_budget_total, 7);
+        assert_eq!(snap.zones[0].name, "Prelude");
+        assert!((snap.zones[0].gate - 0.12).abs() < 1e-6);
+        assert_eq!(snap.zones[0].base_budget, 2);
+        assert_eq!(snap.zones[1].name, "Loop Core");
+        assert!((snap.zones[1].gate - 0.05).abs() < 1e-6);
+        assert_eq!(snap.zones[1].base_budget, 4);
+        assert_eq!(snap.zones[2].name, "Coda");
+        assert!((snap.zones[2].gate - 0.12).abs() < 1e-6);
+        assert_eq!(snap.zones[2].base_budget, 1);
+
+        // Coda hit 1/1 cap on the step with misses and recorded 1 blocked >= gate pick + 1 capped layer
+        assert!(snap.zones[2].capped_pct >= 50.0);
+        assert!(snap.zones[2].avg_capped_layers > 0.0);
+        assert!(snap.zones[2].avg_blocked_picks > 0.0);
+        assert_eq!(snap.zones[2].status, "saturated");
+        // Histogram recorded the missed picks across the bins
+        assert!(snap.zones[2].miss_hist.iter().sum::<u32>() >= 2);
+        assert!(snap.zones[1].miss_hist.iter().sum::<u32>() >= 2);
     }
 }

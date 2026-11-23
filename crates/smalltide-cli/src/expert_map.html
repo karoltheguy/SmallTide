@@ -27,8 +27,8 @@ button, input { font: inherit; color: inherit; }
 [hidden] { display: none !important; }
 
 .page { max-width: 1680px; margin: 0 auto; padding: 18px 24px 12px; display: grid; grid-template-columns: minmax(0, 1fr) 330px;
-        grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "head head" "notes notes" "field margin" "foot foot";
-        gap: 0 28px; height: 100vh; min-height: 660px; }
+        grid-template-rows: auto auto auto minmax(0, 1fr) auto; grid-template-areas: "head head" "notes notes" "rescue rescue" "field margin" "foot foot";
+        gap: 0 28px; height: 100vh; min-height: 760px; }
 
 header { grid-area: head; display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 28px; padding-bottom: 10px; border-bottom: 1px solid var(--rule); }
 h1 { margin: 0; font-weight: 400; font-size: 30px; letter-spacing: .01em; line-height: 1.1; }
@@ -48,6 +48,45 @@ h1 { margin: 0; font-weight: 400; font-size: 30px; letter-spacing: .01em; line-h
 #notes dt { font-variant: small-caps; letter-spacing: .06em; text-transform: lowercase; color: var(--muted); font-size: 14px; }
 #notes dd { margin: 0; font-size: 21px; }
 #notes dd small { font-size: 13px; color: var(--muted); font-style: italic; margin-left: 4px; }
+
+#rescue { grid-area: rescue; margin: 0 0 10px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.rcard { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 7px 11px 8px; cursor: pointer;
+         transition: border-color .18s, background .18s; min-width: 0; }
+.rcard:hover { border-color: var(--rule-2); background: #3f4348; }
+.rcard.on { border-color: var(--ink); box-shadow: inset 0 0 0 1px rgba(241,235,221,.25); }
+.rhead { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
+.rtitle { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.rtitle b { font-weight: 600; font-size: 14px; color: var(--ink); letter-spacing: .02em; }
+.rtitle i { font-size: 12px; color: var(--muted); }
+.rcfg { font-size: 12.5px; color: var(--ink-2); white-space: nowrap; }
+.rstat { font-size: 11.5px; font-variant: small-caps; letter-spacing: .06em; padding: 0 6px; border-radius: 10px; border: 1px solid var(--rule-2); white-space: nowrap; }
+.rstat.balanced { color: var(--load); border-color: rgba(95,208,143,.45); }
+.rstat.saturated { color: var(--miss); border-color: rgba(232,116,159,.65); font-weight: 600; }
+.rstat.tight { color: #e5b567; border-color: rgba(229,181,103,.55); }
+.rstat.underused { color: var(--read); border-color: rgba(164,147,245,.5); }
+.rstat.idle, .rstat.off, .rstat.exact { color: var(--muted); border-color: var(--rule); }
+.rbar-wrap { position: relative; height: 7px; background: var(--cell-off); border-radius: 3px; overflow: visible; margin: 3px 0 3px; }
+.rbar-fill { height: 100%; border-radius: 3px; transition: width .25s; }
+.rbar-fill.balanced { background: var(--load); }
+.rbar-fill.saturated { background: var(--miss); }
+.rbar-fill.tight { background: #e5b567; }
+.rbar-fill.underused { background: var(--read); }
+.rbar-fill.idle, .rbar-fill.off, .rbar-fill.exact { background: var(--faint); }
+.rbar-p95 { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--ink); border-radius: 1px; opacity: .9; pointer-events: none; }
+.rmeta { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
+.rmeta .warn { color: var(--miss); font-weight: 600; }
+.rmeta .mut { color: var(--muted); }
+.rhist { position: relative; height: 24px; display: flex; align-items: flex-end; gap: 1px; background: rgba(0,0,0,.16);
+         border-radius: 3px; padding: 2px 2px 0; margin-bottom: 3px; }
+.rhist-bar { flex: 1 1 0; min-height: 1px; border-radius: 1px 1px 0 0; transition: height .2s; }
+.rhist-bar.below { background: rgba(232,116,159,.28); }
+.rhist-bar.above { background: var(--miss); }
+.rhist-bar.empty { background: rgba(255,255,255,.04); }
+.rhist-gate { position: absolute; top: 0; bottom: 0; width: 1.5px; background: var(--ink); pointer-events: none; opacity: .9; }
+.rhist-gate span { position: absolute; top: -1px; left: 3px; font-size: 9.5px; color: var(--ink); font-style: italic;
+                   text-shadow: 0 1px 2px rgba(0,0,0,.85); white-space: nowrap; }
+.rfoot { display: flex; justify-content: space-between; gap: 6px; font-size: 11.5px; color: var(--muted); font-style: italic; }
+.rfoot b { font-style: normal; font-weight: 400; color: var(--ink-2); }
 
 figure.field { grid-area: field; margin: 0; display: grid; grid-template-columns: 38px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; min-height: 0; }
 #focal { grid-row: 1; display: flex; flex-direction: column-reverse; justify-content: center; gap: 1px; padding: 8px 6px 8px 0; min-height: 0; }
@@ -111,7 +150,8 @@ th, td { text-align: right; padding: 3px 18px 3px 0; border-bottom: 1px solid va
 th { color: var(--muted); font-variant: small-caps; letter-spacing: .04em; } th:first-child, td:first-child { text-align: left; }
 
 @media (max-width: 980px) {
-  .page { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "head" "notes" "field" "margin" "foot"; height: auto; padding: 14px 16px; }
+  .page { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "head" "notes" "rescue" "field" "margin" "foot"; height: auto; padding: 14px 16px; }
+  #rescue { grid-template-columns: minmax(0, 1fr); }
   aside { border-left: 0; padding-left: 0; border-top: 1px solid var(--rule); padding-top: 10px; margin-top: 10px; }
   #plot { height: 70vh; }
   #focal { height: 70vh; }
@@ -138,12 +178,13 @@ th { color: var(--muted); font-variant: small-caps; letter-spacing: .04em; } th:
     <span class="opt" role="group" aria-label="How long fibres stay"><span>fibres stay</span>
       <button type="button" data-trail="5" aria-pressed="false">5 s</button><button type="button" data-trail="15" aria-pressed="true">15 s</button><button type="button" data-trail="60" aria-pressed="false">60 s</button></span>
     <span class="opt" role="group" aria-label="What is drawn"><span>show</span>
-      <button type="button" data-k="routes" aria-pressed="true">routes</button><button type="button" data-k="reads" aria-pressed="true">reads</button><button type="button" data-k="loads" aria-pressed="true">loads</button></span>
+      <button type="button" data-k="routes" aria-pressed="true">routes</button><button type="button" data-k="reads" aria-pressed="true">reads</button><button type="button" data-k="loads" aria-pressed="true">loads</button><button type="button" data-k="rescue" aria-pressed="true">rescue</button></span>
     <button id="pause" type="button" aria-pressed="false">pause</button>
   </nav>
 </header>
 
 <dl id="notes" aria-label="Counts"></dl>
+<section id="rescue" aria-label="Rescue gate and budget per layer block (Prelude, Loop Core, Coda)" hidden></section>
 
 <figure class="field">
   <div id="focal" role="group" aria-label="Focal plane: pick a layer to bring it and its neighbours into focus"></div>
@@ -216,7 +257,7 @@ let lit = new Map();      // expert -> {t0, kind}: one that just came in glows
 let pings = [], notes = [], noteNo = 0, tokenNote = null;
 let cellEv = new Map(), evicted = new Map(), seen = null;
 let sess = { tokens: 0, picks: 0, missed: 0, hot: 0, rescue: 0, moved: 0, preload: 0 };
-let layersOn = { routes: true, reads: true, loads: true };
+let layersOn = { routes: true, reads: true, loads: true, rescue: true };
 let mode = "brain", view = "state", ordering = "demand", spot = null, spotHover = null, band = null;  // band: [r0, r1) in focus
 const cam = { yaw: 1.15, pitch: 0.3, zoom: 1, drag: null, idleAt: 0 };
 try { key = sessionStorage.getItem("smalltide-key") || ""; } catch (e) {}
@@ -1260,14 +1301,28 @@ function liveMiss() {
   for (let i = routes.length - 1, c = 0; i >= 0 && c < 64; i--, c++) { p += routes[i].ex.length; m += routes[i].nMiss; }
   return p ? 100 * m / p : null;
 }
+// Expert files a rescue read from the disk, a second, over the last five seconds. It should stay
+// at 0: the GPU waits for such a read (an expert left the card with no copy in RAM). Reads in the
+// background (loading, and bringing such experts back into RAM) are counted apart.
+let diskHist = [];
+function diskRate(total) {
+  if (total == null) return null;
+  const now = Date.now();
+  if (diskHist.length && total < diskHist[diskHist.length - 1][1]) diskHist = [];
+  diskHist.push([now, total]);
+  while (diskHist.length > 2 && now - diskHist[0][0] > 5000) diskHist.shift();
+  const [t0, c0] = diskHist[0];
+  return now - t0 >= 500 ? (total - c0) * 1000 / (now - t0) : 0;
+}
 function counts() {
   const d = data, ctr = d.counters || {};
   const rows = [
     ["resident", d.counts.resident, "of " + fmt(d.total_experts), ""],
     ["missed", liveMiss(), "% of the last 64 tokens' picks", "pct"],
     ["pace", tps(), "tokens a second", "dec"],
-    ["read after misses", ctr["hot reads"] ?? null, "since boot", ""],
+    ["disk reads", diskRate(ctr["disk reads"] ?? null), "a second with the GPU waiting · " + fmt(ctr["background reads"] ?? 0) + " more in the background since boot", "warn"],
     ["rescued", ctr["inline rescues"] ?? null, "since boot", ""],
+    ["adaptive loads", ctr["experts moved"] ?? null, "since boot", ""],
   ];
   if (!statEls.length) {
     const dl = $("notes");
@@ -1286,9 +1341,154 @@ function counts() {
     if (v !== s.target) { s.from = s.shown; s.target = v; s.t0 = performance.now(); if (!statTw.includes(s)) statTw.push(s); kick(); }
   });
 }
-function show(s) { s.num.textContent = s.kind === "pct" || s.kind === "dec" ? s.shown.toFixed(1) : fmt(Math.round(s.shown)); }
+function show(s) {
+  s.num.textContent = s.kind === "pct" || s.kind === "dec" || s.kind === "warn" ? s.shown.toFixed(1) : fmt(Math.round(s.shown));
+  if (s.kind === "warn") s.num.style.color = s.shown >= 0.05 ? "var(--miss)" : "";
+}
 function statTick(now) {
   statTw = statTw.filter(s => { const p = Math.min(1, (now - s.t0) / STAT_MS), e = 1 - (1 - p) ** 3; s.shown = s.from + (s.target - s.from) * e; show(s); return p < 1; });
+}
+
+// ---------------------------------------------------------------- rescue gate & budget tuning strip (Prelude / Loop Core / Coda)
+let rescueCards = [];
+function zoneBand(zIdx) {
+  const R = data ? data.layers.length : 48;
+  if (R === 48) return zIdx === 0 ? [0, 6] : zIdx === 1 ? [6, 42] : [42, 48];
+  const a = Math.floor(R * zIdx / 3), b = Math.floor(R * (zIdx + 1) / 3);
+  return [a, Math.max(a + 1, b)];
+}
+function renderRescue() {
+  const box = $("rescue"), r = data && data.rescue;
+  if (!r || !r.zones || !layersOn.rescue) { box.hidden = true; return; }
+  box.hidden = false;
+  const binW = r.hist_bin_width_pct || 2;
+  const nBins = (r.zones[0].miss_hist || []).length || 20;
+  const maxPct = nBins * binW;
+  if (!rescueCards.length) {
+    box.textContent = "";
+    rescueCards = r.zones.map((_, zIdx) => {
+      const card = document.createElement("div"); card.className = "rcard"; card.tabIndex = 0; card.setAttribute("role", "button");
+      const head = document.createElement("div"); head.className = "rhead";
+      const title = document.createElement("span"); title.className = "rtitle";
+      const nm = document.createElement("b"), lyr = document.createElement("i");
+      title.append(nm, lyr);
+      const cfg = document.createElement("span"); cfg.className = "rcfg";
+      const st = document.createElement("span"); st.className = "rstat";
+      head.append(title, cfg, st);
+
+      const barWrap = document.createElement("div"); barWrap.className = "rbar-wrap";
+      const fill = document.createElement("div"); fill.className = "rbar-fill";
+      const p95 = document.createElement("div"); p95.className = "rbar-p95";
+      barWrap.append(fill, p95);
+
+      const meta = document.createElement("div"); meta.className = "rmeta";
+      const usedEl = document.createElement("span"), capEl = document.createElement("span");
+      meta.append(usedEl, capEl);
+
+      const hist = document.createElement("div"); hist.className = "rhist";
+      const bars = [];
+      for (let b = 0; b < nBins; b++) {
+        const el = document.createElement("div"); el.className = "rhist-bar empty";
+        hist.append(el); bars.push(el);
+      }
+      const gateLine = document.createElement("div"); gateLine.className = "rhist-gate";
+      const gateLbl = document.createElement("span"); gateLine.append(gateLbl);
+      hist.append(gateLine);
+
+      const foot = document.createElement("div"); foot.className = "rfoot";
+      const fLeft = document.createElement("span"), fRight = document.createElement("span");
+      foot.append(fLeft, fRight);
+
+      card.append(head, barWrap, meta, hist, foot);
+      const focusZone = () => {
+        const zb = zoneBand(zIdx);
+        band = band && band[0] === zb[0] && band[1] === zb[1] ? null : zb;
+        glDirty("col rim"); updateFocal(); renderRescue(); footer(); kick();
+      };
+      card.addEventListener("click", focusZone);
+      card.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); focusZone(); } });
+      box.append(card);
+      return { card, nm, lyr, cfg, st, fill, p95, usedEl, capEl, bars, gateLine, gateLbl, fLeft, fRight };
+    });
+  }
+  const win = r.window_steps || 0;
+  r.zones.forEach((z, zIdx) => {
+    const ui = rescueCards[zIdx], zb = zoneBand(zIdx);
+    const activeBand = band !== null && band[0] === zb[0] && band[1] === zb[1];
+    ui.card.classList.toggle("on", activeBand);
+    ui.nm.textContent = z.name;
+    ui.lyr.textContent = z.layers;
+    const gatePct = (z.gate * 100);
+    const gateStr = r.policy === "disabled" ? "off" : r.policy === "exact" ? "0%" : gatePct.toFixed(gatePct < 10 && gatePct % 1 ? 1 : 0) + "%";
+    const budStr = Math.abs(z.avg_budget - z.base_budget) > 0.05
+      ? z.base_budget + " (avg " + z.avg_budget.toFixed(1) + ")"
+      : String(z.base_budget);
+    ui.cfg.textContent = "gate " + gateStr + " · cap " + budStr;
+    ui.st.textContent = z.status;
+    ui.st.className = "rstat " + z.status;
+
+    const effBud = Math.max(z.avg_budget || z.base_budget || 1, 1e-6);
+    const utilClamped = Math.max(0, Math.min(100, (z.avg_used / effBud) * 100));
+    const p95Clamped = Math.max(0, Math.min(100, (z.p95_used / effBud) * 100));
+    ui.fill.style.width = utilClamped.toFixed(1) + "%";
+    ui.fill.className = "rbar-fill " + z.status;
+    ui.p95.style.left = "calc(" + p95Clamped.toFixed(1) + "% - 1px)";
+    ui.p95.style.display = win > 0 && z.p95_used > 0 ? "block" : "none";
+    ui.p95.title = "p95 rescues/step: " + z.p95_used + " of " + z.avg_budget.toFixed(1) + " (max " + z.max_used + ")";
+
+    if (win > 0) {
+      ui.usedEl.innerHTML = "used <b>" + z.avg_used.toFixed(1) + "</b>/" + z.avg_budget.toFixed(1)
+        + " (" + z.util_pct.toFixed(0) + "%) <span class=\"mut\">· p95 " + z.p95_used + " · max " + z.max_used + "</span>";
+      const capCls = z.capped_pct >= 20 ? "warn" : "";
+      ui.capEl.innerHTML = "<span class=\"" + capCls + "\">capped " + z.capped_pct.toFixed(0) + "%</span>"
+        + " <span class=\"mut\">· zero " + z.zero_pct.toFixed(0) + "%</span>";
+    } else {
+      ui.usedEl.textContent = "waiting for decode steps…";
+      ui.capEl.textContent = "since boot: " + fmt(z.boot_rescued);
+    }
+
+    // 20-bin miss-share histogram (0..40%+) with vertical gate marker & what-if hover tooltip
+    const hist = z.miss_hist || [];
+    const maxH = Math.max(1, ...hist);
+    const totalStepsW = Math.max(1, win);
+    for (let b = 0; b < ui.bars.length; b++) {
+      const cnt = hist[b] || 0, lo = b * binW, hi = lo + binW;
+      const bar = ui.bars[b];
+      bar.style.height = cnt ? Math.max(12, Math.round(100 * cnt / maxH)) + "%" : "6%";
+      const above = lo >= gatePct - 1e-6;
+      bar.className = "rhist-bar " + (cnt === 0 ? "empty" : above ? "above" : "below");
+      // Compute how many extra misses/step would pass if gate moved down to `lo`%
+      let delta = 0;
+      if (lo < gatePct) {
+        for (let q = b; q < ui.bars.length && q * binW < gatePct; q++) delta += (hist[q] || 0);
+      } else {
+        for (let q = Math.floor(gatePct / binW); q < b; q++) delta -= (hist[q] || 0);
+      }
+      const rangeStr = b === ui.bars.length - 1 ? lo + "%+" : lo + "–" + hi + "%";
+      const whatIf = lo < gatePct
+        ? "Lowering gate to " + lo + "% adds ~" + (delta / totalStepsW).toFixed(2) + " misses/step above gate."
+        : lo > gatePct
+          ? "Raising gate to " + lo + "% drops ~" + (Math.abs(delta) / totalStepsW).toFixed(2) + " misses/step below gate."
+          : "Current gate sits here.";
+      bar.title = z.name + " misses in share " + rangeStr + ": " + fmt(cnt) + " (" + (cnt / totalStepsW).toFixed(2) + "/step). " + whatIf;
+    }
+    const gLeft = Math.max(0, Math.min(99, (gatePct / maxPct) * 100));
+    ui.gateLine.style.left = gLeft.toFixed(1) + "%";
+    ui.gateLine.style.display = r.policy === "threshold" ? "block" : "none";
+    ui.gateLbl.textContent = gateStr;
+
+    if (win > 0) {
+      ui.fLeft.innerHTML = "≥gate skipped <b>" + z.avg_blocked_picks.toFixed(1) + "</b>/step"
+        + (z.avg_capped_layers > 0.05 ? " (" + z.avg_capped_layers.toFixed(1) + " cap-L)" : "")
+        + " · &lt;gate <b>" + z.avg_below_gate_picks.toFixed(1) + "</b>";
+      ui.fRight.innerHTML = (z.rescued_share_avg > 0
+        ? "avg rescued <b>" + (z.rescued_share_avg * 100).toFixed(0) + "%</b>"
+        : "0 rescued") + " · win " + win + (r.last_verify_rows > 1 ? " (m=" + r.last_verify_rows + ")" : "");
+    } else {
+      ui.fLeft.textContent = "click to focus " + z.layers + " on map";
+      ui.fRight.textContent = "window: 0/" + 128;
+    }
+  });
 }
 // the focal gauge: a tick a layer, as long as its residents; a dot where it missed lately. A pick focuses it and
 // its neighbours, the rest of the section out of focus
@@ -1355,7 +1555,7 @@ async function poll() {
     if (shape) { A = null; B = null; firstPoll = true; lastRouteSeq = 0; lastEventSeq = 0; band = null; }
     if (d.demand) demandRows = d.demand; else if (!d.has_demand) demandRows = null;
     data = d;
-    if (first) { caption0(d); layout(); buildFocal(); }
+    if (first) { caption0(d); renderRescue(); layout(); buildFocal(); }
     const now = performance.now();
     if (first || wantDemand) reorder();
     retarget(first ? "first" : "poll");
@@ -1363,7 +1563,7 @@ async function poll() {
     lastRouteSeq = Math.max(lastRouteSeq, d.route_seq || 0); lastEventSeq = Math.max(lastEventSeq, d.event_seq || 0);
     if (first) { buildSignals(); footer(); caption(); }
     firstPoll = false;
-    counts(); updateFocal();
+    counts(); renderRescue(); updateFocal();
     if (polls % 5 === 1) table();
     for (const k of SIG_KEYS) if (SIG[k].nEl) SIG[k].nEl.textContent = SIG[k].n();
     for (const b of document.querySelectorAll("[data-view=demand],[data-order=demand]")) b.disabled = !demandRows;
@@ -1493,7 +1693,7 @@ for (const b of document.querySelectorAll("[data-mode]")) b.addEventListener("cl
 for (const b of document.querySelectorAll("[data-view]")) b.addEventListener("click", () => { view = b.dataset.view; press("[data-view]", "view", view); saveHash(); if (data) retarget("view"); });
 for (const b of document.querySelectorAll("[data-order]")) b.addEventListener("click", () => { ordering = b.dataset.order; press("[data-order]", "order", ordering); saveHash(); if (data) { reorder(); retarget("view"); } });
 for (const b of document.querySelectorAll("[data-trail]")) b.addEventListener("click", () => { trailSecs = +b.dataset.trail; press("[data-trail]", "trail", b.dataset.trail); saveHash(); kick(); });
-for (const b of document.querySelectorAll("[data-k]")) b.addEventListener("click", () => { const k = b.dataset.k; layersOn[k] = !layersOn[k]; b.setAttribute("aria-pressed", String(layersOn[k])); kick(); });
+for (const b of document.querySelectorAll("[data-k]")) b.addEventListener("click", () => { const k = b.dataset.k; layersOn[k] = !layersOn[k]; b.setAttribute("aria-pressed", String(layersOn[k])); if (k === "rescue" && data) { renderRescue(); layout(); retarget(); } kick(); });
 for (const [k, v] of new URLSearchParams(location.hash.slice(1))) {
   if (k === "mode" && (v === "brain" || v === "grid")) { mode = v; press("[data-mode]", "mode", v); }
   if (k === "view" && (v === "state" || v === "demand")) { view = v; press("[data-view]", "view", v); }
@@ -1521,7 +1721,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) kick
 document.addEventListener("keydown", ev => {
   if (ev.key !== "Escape") return;
   if (spot) { spot = null; for (const e of document.querySelectorAll(".sig")) e.setAttribute("aria-pressed", "false"); }
-  else if (band !== null) { band = null; glDirty("col rim"); updateFocal(); }
+  else if (band !== null) { band = null; glDirty("col rim"); updateFocal(); renderRescue(); }
   footer(); kick();
 });
 

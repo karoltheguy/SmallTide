@@ -169,8 +169,8 @@ impl Default for TideConfig {
             exclusive_loop_pinning: true,
             preload_before_prefill: true,
             preload_prefill_decode_boundary: true,
-            max_async_vram_promotions_per_token: 2,
-            max_async_ram_promotions_per_token: 2,
+            max_async_vram_promotions_per_token: 6,
+            max_async_ram_promotions_per_token: 4,
             rescue_policy: RescuePolicy::Disabled,
         }
     }

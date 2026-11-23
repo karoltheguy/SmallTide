@@ -155,6 +155,25 @@ impl BpeTokenizer {
     /// Encodes `text` (honoring exact special tokens like `<|message_user|>` and `<|endoftext|>`)
     /// into token IDs using byte-level BPE merges.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        self.encode_with(text, None)
+    }
+
+    /// `encode` for a prompt whose caller-supplied text carries `guard` characters: a special
+    /// token's text with a guard inside it is plain text, and the guards themselves are dropped
+    /// before the plain text is tokenized. A web page that quotes `<|end_message|>` then reaches
+    /// the model as those characters, not as the control token.
+    pub fn encode_guarded(&self, text: &str, guard: char) -> Vec<u32> {
+        self.encode_with(text, Some(guard))
+    }
+
+    fn encode_with(&self, text: &str, guard: Option<char>) -> Vec<u32> {
+        let plain = |seg: &str, out: &mut Vec<u32>| match guard {
+            Some(g) if seg.contains(g) => {
+                let kept: String = seg.chars().filter(|&c| c != g).collect();
+                self.encode_plain(&kept, out);
+            }
+            _ => self.encode_plain(seg, out),
+        };
         let mut out = Vec::new();
         let mut rest = text;
         while !rest.is_empty() {
@@ -177,11 +196,11 @@ impl BpeTokenizer {
                     rest = &rest[sp.len()..];
                 }
                 Some((pos, _, _)) => {
-                    self.encode_plain(&rest[..pos], &mut out);
+                    plain(&rest[..pos], &mut out);
                     rest = &rest[pos..];
                 }
                 None => {
-                    self.encode_plain(rest, &mut out);
+                    plain(rest, &mut out);
                     break;
                 }
             }

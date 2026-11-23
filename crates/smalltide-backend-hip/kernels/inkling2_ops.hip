@@ -444,12 +444,13 @@ extern "C" __global__ void smalltide_argmax_partial_f32(
 
 // Copies `n` u32 routing words (16 for single-token decode, up to 128 for 8-row verify) from
 // `src` to coherent host-mapped `dst[0..n]`, flushes system-scope stores, then publishes `ticket`
-// to `dst[n]`.
+// to `dst[sentinel_idx]` (disjoint from all routing rows so shrinking `m` never collides with old expert IDs).
 // Grid: (1, 1, 1), Block: (32, 1, 1) (single wave32)
 extern "C" __global__ void smalltide_rescue_write_route(
     uint32_t* __restrict__ dst,
     const uint32_t* __restrict__ src,
     uint32_t n,
+    uint32_t sentinel_idx,
     uint32_t ticket
 ) {
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
@@ -458,7 +459,7 @@ extern "C" __global__ void smalltide_rescue_write_route(
     __builtin_amdgcn_wave_barrier();
     __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
     if (threadIdx.x == 0u) {
-        __scoped_atomic_store_n(dst + n, ticket, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+        __scoped_atomic_store_n(dst + sentinel_idx, ticket, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
     }
 }
 
@@ -522,6 +523,7 @@ extern "C" __global__ void smalltide_rescue_wait_and_patch(
     uint32_t* __restrict__ probe,
     uint32_t layer_id
 ) {
+    __shared__ uint32_t s_n;
     if (threadIdx.x == 0u) {
         if (probe != nullptr) {
             __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 2u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
@@ -529,12 +531,16 @@ extern "C" __global__ void smalltide_rescue_wait_and_patch(
         while (__scoped_atomic_load_n(flag, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) < ticket) {
             __builtin_amdgcn_s_sleep(2);
         }
+        // Broadcast patch header count from thread 0 after system-acquire so all 8 wavefronts
+        // observe the exact same `n` without inter-wave cache divergence.
+        __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
+        s_n = __scoped_atomic_load_n(patch_hdr, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
         if (probe != nullptr) {
             __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 3u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
         }
     }
     __syncthreads();
-    uint32_t n = __scoped_atomic_load_n(patch_hdr, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    uint32_t n = s_n;
     if (n == 0u) {
         if (threadIdx.x == 0u && probe != nullptr) {
             __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 4u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);

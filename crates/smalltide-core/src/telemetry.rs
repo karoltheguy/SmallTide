@@ -27,6 +27,11 @@ pub struct TideTelemetry {
     pub stage1_async_published: u64,
 
     pub stage2_disk_reads: u64,
+    /// The disk reads among them that a rescue waited for, the GPU parked at its layer (an
+    /// expert with no copy in RAM); the rest ran in the background.
+    pub rescue_disk_reads: u64,
+    /// Experts a background swap took off the card with no RAM copy, read back in the background.
+    pub evicted_kept_in_ram: u64,
     pub stage2_bytes_read: u64,
 
     /// Decode routing mass seen (1.0 per token per logical layer) and the part of it that was

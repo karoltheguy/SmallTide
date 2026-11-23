@@ -15,6 +15,7 @@ pub fn rescue_json(r: &RescueSnapshot) -> serde_json::Value {
                 "name": z.name,
                 "layers": z.layers_label,
                 "gate": z.gate,
+                "base_gate": z.base_gate,
                 "base_budget": z.base_budget,
                 "avg_budget": (z.avg_budget * 100.0).round() / 100.0,
                 "avg_used": (z.avg_used * 100.0).round() / 100.0,
@@ -39,6 +40,10 @@ pub fn rescue_json(r: &RescueSnapshot) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "policy": r.policy,
+        "auto_gate": r.auto_gate,
+        "auto_target_pct": r.auto_target_pct,
+        "auto_gate_min": r.auto_gate_min,
+        "auto_gate_max": r.auto_gate_max,
         "window_steps": r.window_steps,
         "total_steps": r.total_steps,
         "base_budget_total": r.base_budget_total,
@@ -49,6 +54,14 @@ pub fn rescue_json(r: &RescueSnapshot) -> serde_json::Value {
 }
 
 pub const PAGE: &str = include_str!("expert_map.html");
+
+/// When this server process first answered the page (ms since the Unix epoch). The route and
+/// event sequence numbers start again with the process, so a page left open across a restart
+/// must start again from 0 too: it sees this value change.
+fn boot_id() -> u64 {
+    static BOOT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BOOT.get_or_init(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0))
+}
 
 /// What a page asks for, from the query: `since` the last route it holds and `events_since` the last event (only
 /// newer ones are sent: a page polls five times a second), `demand=0` (the usage rows left out, a fast poll's).
@@ -74,7 +87,7 @@ impl Ask {
     }
 }
 
-/// The snapshot as the page reads it. `states`: a string a layer, a digit an expert (0 not loaded,
+/// The snapshot as the page reads it. `boot`: changes when the server restarts (see `boot_id`). `states`: a string a layer, a digit an expert (0 not loaded,
 /// 1 resident, 2 in the hot-read ring, 3 being read); `demand`: the same shape in base 36, an
 /// expert's share of its layer's routing history (0 none, z the layer's most used; null when not asked for,
 /// `has_demand` says whether the engine keeps one). `events`: the engine's recent residency events after
@@ -83,7 +96,7 @@ impl Ask {
 /// missed pick (its share of the token's routing weight), an inline rescue, an adaptation, a preload.
 /// `routes`: the decoded tokens' routing after `since`, oldest first, each {seq, age_ms, lane, pos, token (its
 /// text, to a keyed request only: it is the conversation's; else null), k, experts [row * k + pick], share
-/// (thousandths, the same order), missed (a digit a pick: 1 when it was not resident as the pass ran)}.
+/// (thousandths, the same order), missed (a digit a pick: 1 when it was not resident and not rescued, so the pass skipped it)}.
 pub fn json(m: &ExpertMap, model: &str, engine: &str, ask: &Ask, token: Option<&dyn Fn(u32) -> String>) -> serde_json::Value {
     let c = m.counts();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -107,6 +120,7 @@ pub fn json(m: &ExpertMap, model: &str, engine: &str, ask: &Ask, token: Option<&
     let counters: serde_json::Map<String, serde_json::Value> = m.counters.iter().map(|&(k, v)| (k.to_string(), v.into())).collect();
     serde_json::json!({
         "version": 3,
+        "boot": boot_id(),
         "model": model,
         "engine": engine,
         "sparks": m.world,

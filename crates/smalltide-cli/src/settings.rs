@@ -499,6 +499,25 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
         ]);
     }
     engine.tide.scheduler.loop_core_gate = std::env::var("SMALLTIDE_RESCUE_THRESHOLD_CORE").ok().and_then(|v| v.trim().parse::<f32>().ok());
+    // Auto gate: each block's gate starts at the value above and is steered so the block spends
+    // about SMALLTIDE_RESCUE_AUTO_TARGET of its rescue budget.
+    {
+        let mut auto = smalltide_tide::scheduler::AutoGate::default();
+        auto.enabled = parse::<u8>("SMALLTIDE_RESCUE_AUTO_GATE", 0, "0 or 1") != 0;
+        auto.target = parse("SMALLTIDE_RESCUE_AUTO_TARGET", auto.target, "a share of the budget in (0, 1]");
+        auto.min_gate = parse("SMALLTIDE_RESCUE_AUTO_MIN", auto.min_gate, "a routing share in [0, 1]");
+        auto.max_gate = parse("SMALLTIDE_RESCUE_AUTO_MAX", auto.max_gate, "a routing share in [0, 1]");
+        engine.tide.scheduler.set_auto_gate(auto);
+        let auto = engine.tide.scheduler.auto_gate();
+        if auto.enabled && matches!(s.rescue_policy, RescuePolicy::Threshold(_)) {
+            println!(
+                "[rescue] auto gate: each block's gate is steered to use {:.0}% of its rescue budget (gate kept within {:.2}..{:.2})",
+                auto.target * 100.0,
+                auto.min_gate,
+                auto.max_gate
+            );
+        }
+    }
     engine.prefill_chunk_swaps = parse("SMALLTIDE_PREFILL_CHUNK_SWAPS", 96usize, "a swap count");
     engine.anticipate_swaps = parse("SMALLTIDE_ANTICIPATE_SWAPS", 256usize, "a swap count");
     engine.anticipate_wait = parse::<u8>("SMALLTIDE_ANTICIPATE_WAIT", 0, "0 or 1") != 0;

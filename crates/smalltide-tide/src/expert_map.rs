@@ -78,7 +78,7 @@ impl EventLog {
 }
 
 /// One token's routing, as the page draws it: for each MoE layer (the map's rows, in order) its `topk` picks, each
-/// (expert, its share of the token's routing weight, missed: the expert was not resident when the pass routed it).
+/// (expert, its share of the token's routing weight, missed: the expert was not resident and the step did not rescue it, so the pick was skipped).
 /// `token`: the id the pass fed in that lane's first row (a decode pass's drafted rows are not kept); `at`: seconds
 /// since the Unix epoch.
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +129,8 @@ pub struct RescueZoneSnapshot {
     pub layers_label: &'static str,
     /// Effective routing-share gate in `[0, 1]` for this block (0.0 for Exact, 1.0 for Disabled).
     pub gate: f32,
+    /// The configured gate: the same as `gate` unless the auto gate is steering it.
+    pub base_gate: f32,
     /// Configured base budget per single-token step (`verify_rows == 1`).
     pub base_budget: usize,
     /// Rolling-window average effective budget per step (reflects verify_rows > 1 scaling).
@@ -174,6 +176,12 @@ pub struct RescueZoneSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RescueSnapshot {
     pub policy: &'static str,
+    /// The gates are steered towards `auto_target_pct` of each block's budget, within
+    /// `auto_gate_min..=auto_gate_max`.
+    pub auto_gate: bool,
+    pub auto_target_pct: f32,
+    pub auto_gate_min: f32,
+    pub auto_gate_max: f32,
     pub window_steps: usize,
     pub total_steps: u64,
     pub base_budget_total: usize,

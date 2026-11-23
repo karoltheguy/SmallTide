@@ -107,6 +107,36 @@ impl RescueTracker {
     }
 }
 
+/// Auto gate (`SMALLTIDE_RESCUE_AUTO_GATE=1`): under `RescuePolicy::Threshold` each block's
+/// (Prelude / Loop Core / Coda) gate starts at its configured value and is then steered, one
+/// small step per decode step, so that the block spends about `target` of its rescue budget:
+/// a block that rescues less than that lowers its gate, one that rescues more raises it.
+/// The budgets then set how much time rescues may take and the gates follow the traffic.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoGate {
+    pub enabled: bool,
+    /// Share of a block's budget to spend per step, on average (0.8).
+    pub target: f32,
+    /// Bounds of the steered gates (routing share).
+    pub min_gate: f32,
+    pub max_gate: f32,
+    /// The steered gate of each block; the configured gates until the first step.
+    live: [f32; 3],
+}
+
+impl AutoGate {
+    /// Change of ln(gate) in one step, per unit of (used / budget - target). With the 0.8 target
+    /// a block that rescues nothing halves its gate in about 17 steps and one at its cap doubles
+    /// it in about 70, while a block near the target moves by under 1% a step.
+    const GAIN: f32 = 0.05;
+}
+
+impl Default for AutoGate {
+    fn default() -> Self {
+        Self { enabled: false, target: 0.8, min_gate: 0.02, max_gate: 0.5, live: [0.0; 3] }
+    }
+}
+
 /// `SMALLTIDE_KEEP_EVICTED_IN_RAM=0` turns off `keep_evicted_in_ram` and
 /// `adopt_disk_read_into_ram` (dev comparison).
 fn keep_evicted_in_ram_on() -> bool {
@@ -175,8 +205,13 @@ pub struct TideScheduler {
     /// Threshold gate for loop-core layers (their experts run once per loop pass), if it differs
     /// from the policy's gate.
     pub loop_core_gate: Option<f32>,
+    /// Steers the gates towards a share of the budgets (off by default); set it with
+    /// `set_auto_gate` so the steered gates start from the configured ones.
+    auto_gate: AutoGate,
     rescues_this_token: usize,
     rescues_by_zone: [usize; 3],
+    /// Experts rescued inline in the current decode / verify step (see `was_rescued_this_step`).
+    step_rescued: Vec<ExpertId>,
     /// Residency events for the expert map (host bookkeeping; decides nothing).
     pub events: crate::expert_map::EventLog,
     /// Kind / routing share the next logged transfers get (set by each planner; 0 = not logged).
@@ -215,8 +250,10 @@ impl TideScheduler {
             rescue_budget: 4,
             rescue_zone_budgets: None,
             loop_core_gate: None,
+            auto_gate: AutoGate::default(),
             rescues_this_token: 0,
             rescues_by_zone: [0; 3],
+            step_rescued: Vec::new(),
             events: crate::expert_map::EventLog::default(),
             event_kind: 0,
             event_share: 0.0,
@@ -576,10 +613,25 @@ impl TideScheduler {
 
     /// Step boundary for single-token decode (`verify_rows == 1`) or speculative verify (`m > 1`).
     pub fn begin_verify_step(&mut self, verify_rows: usize) {
+        self.steer_auto_gates();
         let budgets = self.effective_zone_budgets(verify_rows);
         self.rescue_tracker.start_step(verify_rows, budgets);
         self.rescues_this_token = 0;
         self.rescues_by_zone = [0; 3];
+        self.step_rescued.clear();
+    }
+
+    /// True if `id` was copied in by an inline rescue in the current step: the step ran it, so the
+    /// expert map does not show the pick as missed even though the expert is not resident
+    /// afterwards (a rescue's slot is reused within a few layers). Per physical layer: a loop-core
+    /// expert rescued in one loop pass counts for the step's other passes too.
+    pub fn was_rescued_this_step(&self, id: ExpertId) -> bool {
+        self.step_rescued.contains(&id)
+    }
+
+    /// A step that plans no rescues (rescue off for it) starts with none recorded.
+    pub fn clear_step_rescued(&mut self) {
+        self.step_rescued.clear();
     }
 
     /// Marks the current step as prefill so prefill passes do not skew decode/verify rescue stats.
@@ -604,9 +656,9 @@ impl TideScheduler {
             self.rescue_tracker.cur.zones[z].capped_layers.saturating_add(1);
     }
 
-    /// Effective routing-share gate for zone `z` (`0 = Prelude`, `1 = Loop Core`, `2 = Coda`).
+    /// The configured routing-share gate for zone `z` (`0 = Prelude`, `1 = Loop Core`, `2 = Coda`).
     #[inline]
-    pub fn effective_zone_gate(&self, zone: usize) -> f32 {
+    pub fn configured_zone_gate(&self, zone: usize) -> f32 {
         match self.tide_cfg.rescue_policy {
             RescuePolicy::Exact => 0.0,
             RescuePolicy::Disabled => 1.0,
@@ -614,6 +666,60 @@ impl TideScheduler {
                 Some(g) if zone == 1 => g,
                 _ => gate,
             },
+        }
+    }
+
+    /// The gate in effect for zone `z`: the configured one, or the steered one with the auto gate on.
+    #[inline]
+    pub fn effective_zone_gate(&self, zone: usize) -> f32 {
+        if self.auto_gate.enabled && matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_)) {
+            self.auto_gate.live[zone]
+        } else {
+            self.configured_zone_gate(zone)
+        }
+    }
+
+    pub fn auto_gate(&self) -> AutoGate {
+        self.auto_gate
+    }
+
+    /// Turns the auto gate on or off (and sets its target and bounds); the steered gates start
+    /// again from the configured ones.
+    pub fn set_auto_gate(&mut self, cfg: AutoGate) {
+        self.auto_gate = cfg;
+        self.auto_gate.target = cfg.target.clamp(0.05, 1.0);
+        // Never exactly 0: the gate moves by a factor per step and could not come back up from it.
+        self.auto_gate.min_gate = cfg.min_gate.clamp(0.001, 1.0);
+        self.auto_gate.max_gate = cfg.max_gate.clamp(self.auto_gate.min_gate, 1.0);
+        self.reset_auto_gates();
+    }
+
+    /// The steered gates start again from the configured ones (after a gate or mode change).
+    pub fn reset_auto_gates(&mut self) {
+        self.auto_gate.live = std::array::from_fn(|z| self.configured_zone_gate(z));
+    }
+
+    /// Auto gate: one step of each block's gate from the decode / verify step that just ended.
+    /// ln(gate) moves by `GAIN * (used / budget - target)`, so the gate settles where the block
+    /// spends `target` of its budget on average, or at a bound when no gate gets it there (too
+    /// few misses to spend the budget: the floor).
+    fn steer_auto_gates(&mut self) {
+        if !self.auto_gate.enabled || !matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_)) {
+            return;
+        }
+        let t = &self.rescue_tracker;
+        if !t.step_active || t.step_is_prefill {
+            return;
+        }
+        let a = &mut self.auto_gate;
+        for z in 0..3 {
+            let rz = &t.cur.zones[z];
+            if rz.budget == 0 {
+                continue;
+            }
+            let util = (rz.rescued as f32 / rz.budget as f32).min(1.0);
+            let g = a.live[z] * (AutoGate::GAIN * (util - a.target)).exp();
+            a.live[z] = g.clamp(a.min_gate, a.max_gate);
         }
     }
 
@@ -785,6 +891,7 @@ impl TideScheduler {
                 0.0
             };
 
+            let auto = self.auto_gate;
             let status = match self.tide_cfg.rescue_policy {
                 RescuePolicy::Disabled => "off",
                 RescuePolicy::Exact => "exact",
@@ -793,6 +900,16 @@ impl TideScheduler {
                         "off"
                     } else if window_steps == 0 {
                         "idle"
+                    } else if auto.enabled {
+                        // Steered: within 10 points of the target is where it should be.
+                        let target_pct = auto.target as f64 * 100.0;
+                        if util_pct >= target_pct + 10.0 {
+                            "saturated"
+                        } else if util_pct >= target_pct - 10.0 {
+                            "balanced"
+                        } else {
+                            "underused"
+                        }
                     } else if capped_pct >= 25.0 || util_pct >= 85.0 {
                         "saturated"
                     } else if capped_pct >= 8.0 || util_pct >= 65.0 {
@@ -813,6 +930,7 @@ impl TideScheduler {
                 name: meta[z].0,
                 layers_label: meta[z].1,
                 gate,
+                base_gate: self.configured_zone_gate(z),
                 base_budget,
                 avg_budget,
                 avg_used,
@@ -837,6 +955,10 @@ impl TideScheduler {
 
         RescueSnapshot {
             policy,
+            auto_gate: self.auto_gate.enabled && policy == "threshold",
+            auto_target_pct: self.auto_gate.target * 100.0,
+            auto_gate_min: self.auto_gate.min_gate,
+            auto_gate_max: self.auto_gate.max_gate,
             window_steps,
             total_steps,
             base_budget_total: base_budgets.iter().sum(),
@@ -1033,6 +1155,9 @@ impl TideScheduler {
                     }
                     *self.pending_async_vram.entry(id).or_insert(0.0) += norm_w;
                 }
+                if rescued_ok {
+                    self.step_rescued.push(id);
+                }
                 if !self.rescue_tracker.step_is_prefill {
                     let rz = &mut self.rescue_tracker.cur.zones[zone];
                     if rescued_ok {
@@ -1153,7 +1278,13 @@ impl TideScheduler {
                 miss_stats.retain(|s| s.1 >= tau);
                 miss_stats.sort_by(|a, b| b.2.total_cmp(&a.2));
                 // 1/layer in Loop Core (36 passes); scale Prelude & Coda up to 3/layer when budget > 12.
-                let max_per_layer = if zone == 1 {
+                // With the auto gate the block's budget is the limit: the gate is what keeps the
+                // block near its share of the budget, and 1-3 a layer would leave picks above the
+                // gate skipped with budget to spare. A layer still takes no more than the rescue
+                // ring holds (a ninth rescue would push out the layer's first).
+                let max_per_layer = if self.auto_gate.enabled {
+                    crate::runtime::DEFAULT_SCRATCH_RING_SLOTS
+                } else if zone == 1 {
                     1
                 } else if m >= 4 {
                     zone_cap.div_ceil(6).clamp(2, 3)
@@ -1185,6 +1316,9 @@ impl TideScheduler {
                             *self.pending_async_ram.entry(id).or_insert(0.0) += max_share;
                         }
                         *self.pending_async_vram.entry(id).or_insert(0.0) += max_share;
+                    }
+                    if rescued_ok {
+                        self.step_rescued.push(id);
                     }
                     if rescued_ok && !self.rescue_tracker.step_is_prefill {
                         let rz = &mut self.rescue_tracker.cur.zones[zone];
@@ -1913,6 +2047,9 @@ mod tests {
         let (ops, wait_pending, rescued) =
             sched.plan_verify_layer_dispatch(PhysicalLayerId(20), &rows_ids, &rows_ws);
         assert!(!wait_pending);
+        // The step knows what it rescued (the expert map does not show those picks as missed)...
+        assert!(sched.was_rescued_this_step(eid(20, 10)) && sched.was_rescued_this_step(eid(20, 11)));
+        assert!(!sched.was_rescued_this_step(eid(20, 12)) && !sched.was_rescued_this_step(eid(20, 13)));
         // For m >= 4, at most 2 rescues per layer: must pick expert 10 (sum 1.0) and expert 11 (sum 0.35).
         assert_eq!(ops.len(), 2);
         assert_eq!(rescued, vec![eid(20, 10), eid(20, 11)]);
@@ -1920,6 +2057,16 @@ mod tests {
         assert!(sched.cache.is_vram_hit(eid(20, 0)));
         assert!(sched.cache.is_vram_hit(eid(20, 1)));
         assert!(sched.cache.is_vram_hit(eid(20, 2)));
+        // ...and the next step starts with none.
+        sched.begin_token();
+        assert!(!sched.was_rescued_this_step(eid(20, 10)));
+        // With the auto gate the budget (4) is the only limit: a layer with nothing resident gets
+        // 4 rescues, not 2.
+        sched.set_auto_gate(AutoGate { enabled: true, ..AutoGate::default() });
+        sched.begin_token();
+        let (_, _, rescued) = sched.plan_verify_layer_dispatch(PhysicalLayerId(21), &rows_ids, &rows_ws);
+        assert_eq!(rescued.len(), 4);
+        assert!(rescued.contains(&eid(21, 10)));
     }
 
     #[test]
@@ -1970,5 +2117,75 @@ mod tests {
         // Histogram recorded the missed picks across the bins
         assert!(snap.zones[2].miss_hist.iter().sum::<u32>() >= 2);
         assert!(snap.zones[1].miss_hist.iter().sum::<u32>() >= 2);
+        // Auto gate off: the gates are the configured ones.
+        assert!(!snap.auto_gate);
+        assert!((snap.zones[1].base_gate - 0.05).abs() < 1e-6);
+    }
+
+    /// Ends a decode step in which each block rescued `used[z]` experts.
+    fn end_step_with(sched: &mut TideScheduler, used: [u16; 3]) {
+        sched.begin_token();
+        sched.rescue_tracker.step_active = true;
+        for z in 0..3 {
+            sched.rescue_tracker.cur.zones[z].rescued = used[z];
+        }
+    }
+
+    #[test]
+    fn test_auto_gate_steers_each_block_to_its_budget_share() {
+        let mut tide_cfg = TideConfig::default();
+        tide_cfg.rescue_policy = RescuePolicy::Threshold(0.08);
+        let mut sched = TideScheduler::new(Inkling2Config::default(), tide_cfg, 16 * GIB, 16 * GIB);
+        sched.rescue_zone_budgets = Some([10, 10, 10]);
+        sched.loop_core_gate = Some(0.09);
+
+        // Off: steps leave the gates alone.
+        for _ in 0..50 {
+            end_step_with(&mut sched, [0, 10, 8]);
+        }
+        sched.begin_token();
+        assert_eq!(sched.effective_zone_gate(0), 0.08);
+        assert_eq!(sched.effective_zone_gate(1), 0.09);
+
+        // On: the gates start at the configured values...
+        sched.set_auto_gate(AutoGate { enabled: true, ..AutoGate::default() });
+        assert_eq!(sched.effective_zone_gate(0), 0.08);
+        assert_eq!(sched.effective_zone_gate(1), 0.09);
+        assert_eq!(sched.effective_zone_gate(2), 0.08);
+        // ...a block under its share lowers its gate, one over it raises it, one on it stays.
+        for _ in 0..20 {
+            end_step_with(&mut sched, [0, 10, 8]);
+        }
+        sched.begin_token();
+        let (pre, core, coda) = (sched.effective_zone_gate(0), sched.effective_zone_gate(1), sched.effective_zone_gate(2));
+        assert!(pre < 0.04 && pre > 0.02, "prelude gate {pre}");
+        assert!(core > 0.105 && core < 0.12, "core gate {core}");
+        assert!((coda - 0.08).abs() < 1e-4, "coda gate {coda}");
+        let snap = sched.rescue_snapshot();
+        assert!(snap.auto_gate);
+        assert!((snap.zones[0].gate - pre).abs() < 1e-6);
+        assert!((snap.zones[0].base_gate - 0.08).abs() < 1e-6);
+        assert_eq!(snap.zones[2].status, "balanced");
+        assert_eq!(snap.zones[0].status, "underused");
+
+        // The gates stay within their bounds.
+        for _ in 0..2000 {
+            end_step_with(&mut sched, [0, 10, 8]);
+        }
+        sched.begin_token();
+        assert_eq!(sched.effective_zone_gate(0), 0.02);
+        assert_eq!(sched.effective_zone_gate(1), 0.5);
+        // Prefill steps do not steer.
+        end_step_with(&mut sched, [0, 0, 0]);
+        sched.mark_step_prefill();
+        sched.begin_token();
+        assert_eq!(sched.effective_zone_gate(1), 0.5);
+        // A changed configured gate restarts the steering from it.
+        sched.loop_core_gate = Some(0.2);
+        sched.reset_auto_gates();
+        assert_eq!(sched.effective_zone_gate(1), 0.2);
+        // Exact and Disabled ignore it.
+        sched.tide_cfg.rescue_policy = RescuePolicy::Exact;
+        assert_eq!(sched.effective_zone_gate(0), 0.0);
     }
 }

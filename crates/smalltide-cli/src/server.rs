@@ -160,6 +160,8 @@ enum EngineCommand {
         rescue_budget: Option<usize>,
         rescue_zone_budgets: Option<[usize; 3]>,
         loop_core_gate: Option<f32>,
+        rescue_auto_gate: Option<bool>,
+        rescue_auto_target: Option<f32>,
         async_per_token: Option<usize>,
         async_hysteresis: Option<f64>,
         reply_tx: Sender<Value>,
@@ -217,6 +219,9 @@ struct TideConfigReq {
     rescue_budget: Option<usize>,
     rescue_zone_budgets: Option<[usize; 3]>,
     loop_core_gate: Option<f32>,
+    /// Steer each block's gate towards `rescue_auto_target` (0.8) of its rescue budget.
+    rescue_auto_gate: Option<bool>,
+    rescue_auto_target: Option<f32>,
     async_per_token: Option<usize>,
     async_hysteresis: Option<f64>,
 }
@@ -785,6 +790,8 @@ fn engine_worker_loop(
                     rescue_budget,
                     rescue_zone_budgets,
                     loop_core_gate,
+                    rescue_auto_gate,
+                    rescue_auto_target,
                     async_per_token,
                     async_hysteresis,
                     reply_tx,
@@ -802,6 +809,18 @@ fn engine_worker_loop(
                     if let Some(g) = loop_core_gate {
                         s.loop_core_gate = Some(g);
                     }
+                    // A new gate, mode or auto setting: the steered gates start again from the
+                    // configured ones (a budget change alone keeps them).
+                    if rescue_policy.is_some() || loop_core_gate.is_some() || rescue_auto_gate.is_some() || rescue_auto_target.is_some() {
+                        let mut auto = s.auto_gate();
+                        if let Some(on) = rescue_auto_gate {
+                            auto.enabled = on;
+                        }
+                        if let Some(t) = rescue_auto_target {
+                            auto.target = t;
+                        }
+                        s.set_auto_gate(auto);
+                    }
                     if let Some(a) = async_per_token {
                         s.tide_cfg.max_async_vram_promotions_per_token = a;
                     }
@@ -814,6 +833,8 @@ fn engine_worker_loop(
                         "rescue_policy": format!("{:?}", s.tide_cfg.rescue_policy),
                         "rescue_zone_budgets": s.effective_zone_budgets(1),
                         "loop_core_gate": s.loop_core_gate,
+                        "rescue_auto_gate": s.auto_gate().enabled,
+                        "rescue_auto_target": s.auto_gate().target,
                         "async_per_token": s.tide_cfg.max_async_vram_promotions_per_token,
                         "async_hysteresis": s.async_hysteresis,
                         "rescue": crate::expert_map::rescue_json(&s.rescue_snapshot()),
@@ -1551,6 +1572,8 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     rescue_budget: req.rescue_budget,
                     rescue_zone_budgets: req.rescue_zone_budgets,
                     loop_core_gate: req.loop_core_gate,
+                    rescue_auto_gate: req.rescue_auto_gate,
+                    rescue_auto_target: req.rescue_auto_target,
                     async_per_token: req.async_per_token,
                     async_hysteresis: req.async_hysteresis,
                     reply_tx: tx,

@@ -246,7 +246,7 @@ const SYN_MAX = 30000, MAX_DROPS = 600, MAX_GLOWS = 400;
 const STAT_MS = 500, LIT_MS = 9000, READ_LIT_MS = 3500, DROP_MS = 650, NOTE_MS = 7000, MAX_NOTES = 5, PING_MS = 900;
 
 let data = null, demandRows = null, key = "", paused = false, timer = 0, polls = 0;
-let lastRouteSeq = 0, lastEventSeq = 0, firstPoll = true, bytes = 0;
+let lastRouteSeq = 0, lastEventSeq = 0, firstPoll = true, bytes = 0, bootId = null;
 let geom = null, order = [], A = null, B = null, raf = 0, lastFrame = 0, lastDraw = 0;
 let hover = -1, hoverRC = null;
 let routes = [];          // {seq, t (wall ms), start (perf ms), lane, pos, token, k, ex, sh, miss, nMiss, top, fed}
@@ -1235,7 +1235,7 @@ function overlays(x, now) {
 const SIG = {
   routes:   { group: "routing", name: "Token routes", desc: "each decoded token's path up through the layers", sw: "--fibre",
               n: () => fmt(sess.tokens) + " tokens", on: i => heat[i] > 0.05, rgb: () => C.fibre },
-  missed:   { group: "routing", name: "Missed picks", desc: "a token chose an expert that was not in memory", sw: "--miss",
+  missed:   { group: "routing", name: "Missed picks", desc: "a token chose an expert that was not in memory and was not rescued: the pick was skipped", sw: "--miss",
               n: () => sess.picks ? (100 * sess.missed / sess.picks).toFixed(1) + " %" : "", on: i => missHeat[i] > 0.05, rgb: () => C.miss },
   hot:      { group: "reads", name: "Read after a miss", desc: "fetched in the background, in use the next pass", sw: "--read",
               n: () => fmt(sess.hot), on: i => seen[i] & (1 << EV.HOT | 1 << EV.PREDICT), rgb: () => C.read },
@@ -1318,7 +1318,7 @@ function counts() {
   const d = data, ctr = d.counters || {};
   const rows = [
     ["resident", d.counts.resident, "of " + fmt(d.total_experts), ""],
-    ["missed", liveMiss(), "% of the last 64 tokens' picks", "pct"],
+    ["missed", liveMiss(), "% of the last 64 tokens' picks, not rescued", "pct"],
     ["pace", tps(), "tokens a second", "dec"],
     ["disk reads", diskRate(ctr["disk reads"] ?? null), "a second with the GPU waiting · " + fmt(ctr["background reads"] ?? 0) + " more in the background since boot", "warn"],
     ["rescued", ctr["inline rescues"] ?? null, "since boot", ""],
@@ -1423,7 +1423,11 @@ function renderRescue() {
     const budStr = Math.abs(z.avg_budget - z.base_budget) > 0.05
       ? z.base_budget + " (avg " + z.avg_budget.toFixed(1) + ")"
       : String(z.base_budget);
-    ui.cfg.textContent = "gate " + gateStr + " · cap " + budStr;
+    ui.cfg.textContent = "gate " + gateStr + (r.auto_gate ? " auto" : "") + " · cap " + budStr;
+    ui.cfg.title = r.auto_gate
+      ? "Auto gate: started at " + (z.base_gate * 100).toFixed(1).replace(/\.0$/, "") + "%, steered so this block uses about "
+        + Math.round(r.auto_target_pct) + "% of its rescue budget (kept within " + (r.auto_gate_min * 100).toFixed(0) + "–" + (r.auto_gate_max * 100).toFixed(0) + "%)."
+      : "";
     ui.st.textContent = z.status;
     ui.st.className = "rstat " + z.status;
 
@@ -1553,6 +1557,11 @@ async function poll() {
     const shape = data && (data.experts_per_layer !== d.experts_per_layer || data.layers.length !== d.layers.length);
     const first = !data || shape;
     if (shape) { A = null; B = null; firstPoll = true; lastRouteSeq = 0; lastEventSeq = 0; band = null; }
+    // The server restarted under an open page: its route and event numbers start again from 0, so ask from 0
+    // (this answer was filtered by the old numbers and holds nothing new).
+    const restarted = d.boot != null && bootId !== null && d.boot !== bootId;
+    if (d.boot != null) bootId = d.boot;
+    if (restarted) { lastRouteSeq = 0; lastEventSeq = 0; }
     if (d.demand) demandRows = d.demand; else if (!d.has_demand) demandRows = null;
     data = d;
     if (first) { caption0(d); renderRescue(); layout(); buildFocal(); }
@@ -1560,7 +1569,7 @@ async function poll() {
     if (first || wantDemand) reorder();
     retarget(first ? "first" : "poll");
     addEvents(d, now); addRoutes(d, now);
-    lastRouteSeq = Math.max(lastRouteSeq, d.route_seq || 0); lastEventSeq = Math.max(lastEventSeq, d.event_seq || 0);
+    if (!restarted) { lastRouteSeq = Math.max(lastRouteSeq, d.route_seq || 0); lastEventSeq = Math.max(lastEventSeq, d.event_seq || 0); }
     if (first) { buildSignals(); footer(); caption(); }
     firstPoll = false;
     counts(); renderRescue(); updateFocal();

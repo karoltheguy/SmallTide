@@ -108,7 +108,7 @@ The RX 9070 GRE and the Radeon AI PRO R9700 are `gfx1201` as well and load the s
 | `GET  /v1/models` | Lists `inkling-2-mini` |
 | `GET  /expert-map` | Live WebGL/Grid expert residency & routing visualizer |
 | `GET  /v1/tide/stats` | Live TideLM telemetry (tok/s, hit rates by zone, rescues, skipped weight, VRAM) |
-| `POST /v1/tide/config` | Live runtime tuning of `rescue_mode` and `rescue_threshold` |
+| `POST /v1/tide/config` | Live runtime tuning of `rescue_mode`, `rescue_threshold` and `rescue_auto_gate` |
 | `GET  /health` | Health check |
 
 Quick `curl.exe` smoke test:
@@ -161,8 +161,9 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 | `SMALLTIDE_KV_FMT` | `k8v4` | Global KV format: `k8v4` (FP8 keys + Q4 values, saves ~472 MiB @ 128K) or `fp8` (full FP8 K/V). |
 | `SMALLTIDE_LANES` | `2` | Concurrent serving lanes (each extra lane reserves ~124 MiB of local KV rings + slack page). |
 | `SMALLTIDE_RESCUE_MODE` | `threshold` | `threshold` (balanced), `exact` (copy every miss, bit-exact MoE), or `disabled` (fastest, skip inline misses). |
-| `SMALLTIDE_RESCUE_THRESHOLD` / `..._CORE` | `0.08` / `0.09` | Routing-weight gate for inline rescues (Prelude & Coda / Loop Core). Lower gates rescue more: better fidelity, slower decode (a rescue costs about 0.7 ms). |
-| `SMALLTIDE_RESCUE_BUDGET_PRELUDE` / `_CORE` / `_CODA` | `18` / `35` / `20` | Per-token inline rescue caps per architectural zone. |
+| `SMALLTIDE_RESCUE_THRESHOLD` / `..._CORE` | `0.07` / `0.07` | Routing-weight gate for inline rescues (Prelude & Coda / Loop Core). Lower gates rescue more: better fidelity, slower decode (a rescue costs about 0.7 ms). |
+| `SMALLTIDE_RESCUE_BUDGET_PRELUDE` / `_CORE` / `_CODA` | `18` / `35` / `35` | Per-token inline rescue caps per architectural zone. |
+| `SMALLTIDE_RESCUE_AUTO_GATE` | `1` | `1` adjusts each zone's gate while decoding so the zone uses about 80% of its rescue budget (`SMALLTIDE_RESCUE_AUTO_TARGET`): it starts at the threshold above, falls while budget is left over and rises when the zone goes over. The gate stays within `SMALLTIDE_RESCUE_AUTO_MIN`..`_MAX` (`0`, meaning 0.1%, ..`0.5`). A zone with fewer misses than its budget ends at the lower bound. |
 | `SMALLTIDE_PREFILL_CHUNK` | `1024` | Tokens per prefill chunk (64 to 1024). Larger chunks read a prompt faster for more scratch VRAM: 1024 costs about 80 resident experts against 256 and is almost twice as fast. |
 | `SMALLTIDE_ATTN_VTILES` | `all` | Prefill attention reads value vectors decoded once per layer pass. `all` spends 268 MiB of VRAM at 128K context (about 55 resident experts) and reads a 58K-token prompt a third faster; `local` spends 4 MiB; `0` is off. |
 | `SMALLTIDE_BATCH_RESCUE` | `1` | Two requests at once are decoded as one batch; `1` rescues missing experts for the batch like a draft-verify pass, `0` skips them (faster, lower fidelity). |

@@ -1104,6 +1104,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let published = self.tide.poll_pending()?;
             self.tide.scheduler.telemetry.stage1_async_published += published as u64;
             self.verify_rescued.clear();
+            self.tide.scheduler.clear_step_rescued();
         }
         let tokens: Vec<u32> = rows.iter().map(|r| r.1).collect();
         let lp: Vec<(usize, usize)> = rows.iter().map(|r| (r.0, r.2)).collect();
@@ -1900,7 +1901,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
     /// One token's picks over the logical layers from routing-log words (`off` its first word in
     /// layer 0, `stride` words a layer): (expert, share of the layer's routing weight, missed =
-    /// not resident in VRAM now).
+    /// not resident in VRAM now and not rescued inline in this step, i.e. the pick was skipped).
     fn route_picks(&self, words: &[u32], n_log: usize, off: usize, stride: usize) -> Vec<(u16, f32, bool)> {
         let mut picks = Vec::with_capacity(n_log * 8);
         for il in 0..n_log {
@@ -1910,7 +1911,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let inv = if tot > 1e-8 { 1.0 / tot } else { 0.0 };
             for k in 0..8 {
                 let e = w[k] as u16;
-                let missed = !self.tide.scheduler.cache.is_vram_hit(smalltide_core::ExpertId { layer: phys, expert: e });
+                let id = smalltide_core::ExpertId { layer: phys, expert: e };
+                let missed = !self.tide.scheduler.cache.is_vram_hit(id) && !self.tide.scheduler.was_rescued_this_step(id);
                 picks.push((e, f32::from_bits(w[8 + k]) * inv, missed));
             }
         }
@@ -2186,6 +2188,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let published = self.tide.poll_pending()?;
             self.tide.scheduler.telemetry.stage1_async_published += published as u64;
             self.verify_rescued.clear();
+            self.tide.scheduler.clear_step_rescued();
         }
         self.verify_rescue_active = use_verify_rescue;
         self.map_batch_rows = tokens.iter().enumerate().map(|(i, &t)| (self.active_lane, pos0 + i, t)).collect();

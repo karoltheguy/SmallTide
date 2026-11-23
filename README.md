@@ -2,6 +2,10 @@
 
 **Adaptive MoE inference for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (30B total / 3.8B active) on a single 16 GB AMD Radeon RX 9070 XT on Windows.**
 
+![The live expert map while the server decodes at 66 tokens a second: token routes climbing through the 48 layers, resident experts, rescues and background loads](docs/expert-map.png)
+
+*The live expert map (`http://127.0.0.1:8000/expert-map`) during a decode: each token's route through the 48 layers, the experts that are on the card, and the ones rescued or loaded in the background.*
+
 Inkling-2-Mini's routed experts (~14.7 GB across 3,072 NVFP4 & MXFP8 experts) plus dense weights, KV cache, and drafter (~6+ GB) exceed a 16 GB consumer GPU. SmallTide brings [TideLM](https://github.com/0xBakeer/tideLM)-style adaptive expert residency and custom RDNA 4 (`gfx1201`) HIP kernels to Windows: it keeps the highest-value experts resident in dedicated GDDR6 VRAM, promotes hot misses asynchronously from host RAM/NVMe, rescues high-weight misses inline on the GPU, and accelerates both greedy and sampled generation with Inkling-2-Mini's 3-layer DSpark speculative drafter.
 
 Pre-built Windows releases embed the compiled `gfx1201` `.hsaco` GPU kernels inside a single `smalltide-cli.exe` — **no Rust toolchain, no ROCm SDK, and no Python environment required** to install and serve.

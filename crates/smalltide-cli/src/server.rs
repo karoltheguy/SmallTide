@@ -656,13 +656,14 @@ fn disk_restore(
             return;
         }
     };
+    let t_alloc = t0.elapsed().as_secs_f64();
     let r = engine.snapshot_host_mut(&mut snap).map_err(|e| e.to_string()).and_then(|host| store.load(&chain, host, d).map_err(|e| e.to_string()));
     match r {
         Ok(()) => {
             pc.insert_tokens(prompt[..n].to_vec(), snap);
             let _ = engine.free_snapshots(pc.drain_pool());
             eprintln!(
-                "[prefix] disk: read positions [0, {n}) from {} segment(s) in {:.2} s (RAM had {have})",
+                "[prefix] disk: read positions [0, {n}) from {} segment(s) in {:.2} s ({t_alloc:.2} s of it making room) (RAM had {have})",
                 chain.len(),
                 t0.elapsed().as_secs_f64()
             );

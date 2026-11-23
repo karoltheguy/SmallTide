@@ -6,7 +6,7 @@
 
 *The live expert map (`http://127.0.0.1:8000/expert-map`) during a decode: each token's route through the 48 layers, the experts that are on the card, and the ones rescued or loaded in the background.*
 
-Inkling-2-Mini's routed experts (~14.7 GB across 3,072 NVFP4 & MXFP8 experts) plus dense weights, KV cache, and drafter (~6+ GB) exceed a 16 GB consumer GPU. SmallTide brings [TideLM](https://github.com/0xBakeer/tideLM)-style adaptive expert residency and custom RDNA 4 (`gfx1201`) HIP kernels to Windows: it keeps the highest-value experts resident in dedicated GDDR6 VRAM, promotes hot misses asynchronously from host RAM/NVMe, rescues high-weight misses inline on the GPU, and accelerates both greedy and sampled generation with Inkling-2-Mini's 3-layer DSpark speculative drafter.
+Inkling-2-Mini's routed experts (~14.7 GB across 3,072 NVFP4 & MXFP8 experts) plus dense weights, KV cache, and drafter (~6+ GB) exceed a 16 GB consumer GPU. SmallTide brings [TideLM](https://github.com/raspy135/tideLM)-style adaptive expert residency and custom RDNA 4 (`gfx1201`) HIP kernels to Windows: it keeps the highest-value experts resident in dedicated GDDR6 VRAM, promotes hot misses asynchronously from host RAM/NVMe, rescues high-weight misses inline on the GPU, and accelerates both greedy and sampled generation with Inkling-2-Mini's 3-layer DSpark speculative drafter.
 
 Pre-built Windows releases embed the compiled `gfx1201` `.hsaco` GPU kernels inside a single `smalltide-cli.exe` — **no Rust toolchain, no ROCm SDK, and no Python environment required** to install and serve.
 

@@ -4,7 +4,7 @@ SmallTide brings adaptive MoE expert residency and speculative decoding to consu
 
 ## Adaptive Expert Loading & TideLM
 
-- **[TideLM](https://github.com/0xBakeer/tideLM)** (MIT License, Khaled Bakeer / 0xBakeer and Ryan Kojima) — The core insight behind SmallTide: keeping the experts your traffic actually uses resident in GPU memory, learning routing demand online into persistent priors, overlapping hot-miss promotions with decoding, and rescuing high-weight misses inline. SmallTide's live `/expert-map` visualizer and `bench/bench.py` benchmark harness are adapted from TideLM so results and diagnostics follow the same conventions.
+- **[TideLM](https://github.com/raspy135/tideLM)** (MIT License, Khaled Bakeer / 0xBakeer and Ryan Kojima) — The core insight behind SmallTide: keeping the experts your traffic actually uses resident in GPU memory, learning routing demand online into persistent priors, overlapping hot-miss promotions with decoding, and rescuing high-weight misses inline. SmallTide's live `/expert-map` visualizer and `bench/bench.py` benchmark harness are adapted from TideLM so results and diagnostics follow the same conventions.
 
 ## Model & Drafter
 

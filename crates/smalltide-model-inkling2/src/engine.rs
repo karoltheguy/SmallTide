@@ -21,21 +21,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) const MAX_FLASH_SPLITS: usize = 64;
-static PREFILL_CHUNK_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(512);
-
-/// Maximum tokens per batched prefill chunk (`SMALLTIDE_PREFILL_CHUNK`, default 512). Local KV
-/// rings hold `window + prefill_chunk()` slots so a chunk's own keys never overwrite keys an
-/// earlier row of the same chunk still attends to. Larger chunks prefill faster (fewer host round
-/// trips, each weight read once per more rows) for more scratch VRAM.
-pub fn prefill_chunk() -> usize {
-    PREFILL_CHUNK_ROWS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Sets the prefill chunk (clamped to 64..=1024). Call before the drafter and engine are built:
-/// their buffers are sized by it.
-pub fn set_prefill_chunk(rows: usize) {
-    PREFILL_CHUNK_ROWS.store(rows.clamp(64, 1024), std::sync::atomic::Ordering::Relaxed);
-}
+/// Maximum tokens per batched prefill chunk. Local KV rings hold `window + PREFILL_CHUNK` slots so
+/// a chunk's own keys never overwrite keys an earlier row of the same chunk still attends to.
+pub const PREFILL_CHUNK: usize = 256;
 const MAX_ATTN_RES_BLOCKS: usize = 8;
 
 /// Optional per-component wall-clock breakdown (accumulated across steps when profiling is enabled).
@@ -94,61 +82,6 @@ impl SeqSnapshot {
     /// Pinned host bytes this snapshot holds.
     pub fn host_bytes(&self) -> usize {
         self.host.size_bytes
-    }
-}
-
-/// How a `SeqSnapshot`'s host bytes are laid out for a prefix of `pos` positions: the fixed
-/// part (local KV rings, short-conv histories), each engine global-KV region's rows `[0, pos)`,
-/// then - with the drafter's state - the drafter's fixed part and its global regions' rows.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnapLayout {
-    pub fixed: usize,
-    pub drafter_fixed: usize,
-    /// bytes a position of each global region: the engine's `n_engine`, then the drafter's
-    pub per_pos: Vec<usize>,
-    pub n_engine: usize,
-}
-
-impl SnapLayout {
-    fn engine_pp(&self) -> usize {
-        self.per_pos[..self.n_engine].iter().sum()
-    }
-    fn regions(&self, drafter: bool) -> usize {
-        if drafter { self.per_pos.len() } else { self.n_engine }
-    }
-    /// Bytes of a snapshot of `pos` positions.
-    pub fn total_bytes(&self, pos: usize, drafter: bool) -> usize {
-        self.tail_bytes(drafter) + self.rows_bytes(0, pos, drafter)
-    }
-    /// Bytes of the state that exists only at the snapshot's position.
-    pub fn tail_bytes(&self, drafter: bool) -> usize {
-        self.fixed + if drafter { self.drafter_fixed } else { 0 }
-    }
-    /// Bytes of the rows of positions `[start, end)`.
-    pub fn rows_bytes(&self, start: usize, end: usize, drafter: bool) -> usize {
-        (end - start) * self.per_pos[..self.regions(drafter)].iter().sum::<usize>()
-    }
-    /// (offset, bytes) of the tail's pieces in a snapshot of `pos` positions.
-    pub fn tail_ranges(&self, pos: usize, drafter: bool) -> Vec<(usize, usize)> {
-        let mut v = vec![(0, self.fixed)];
-        if drafter {
-            v.push((self.fixed + pos * self.engine_pp(), self.drafter_fixed));
-        }
-        v
-    }
-    /// (offset, bytes) of region `r`'s rows `[a, b)` in a snapshot of `pos` positions.
-    pub fn region_range(&self, pos: usize, r: usize, a: usize, b: usize, drafter: bool) -> Vec<(usize, usize)> {
-        let base = if r < self.n_engine {
-            self.fixed + pos * self.per_pos[..r].iter().sum::<usize>()
-        } else {
-            debug_assert!(drafter);
-            self.fixed + pos * self.engine_pp() + self.drafter_fixed + pos * self.per_pos[self.n_engine..r].iter().sum::<usize>()
-        };
-        vec![(base + a * self.per_pos[r], (b - a) * self.per_pos[r])]
-    }
-    /// (offset, bytes) of every region's rows `[start, end)`, in region order.
-    pub fn row_ranges(&self, pos: usize, start: usize, end: usize, drafter: bool) -> Vec<(usize, usize)> {
-        (0..self.regions(drafter)).flat_map(|r| self.region_range(pos, r, start, end, drafter)).collect()
     }
 }
 
@@ -338,7 +271,7 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     pub(crate) verify_hist: Option<DeviceBuf>,
     /// Per lane: device rewind table (hist, state, dim, 0) x 4 per logical layer.
     rewind_tables: Vec<Option<DeviceBuf>>,
-    /// Drafter taps of the last rows forward: `[4][prefill_chunk()][H]` (layer 4 / 22 / 40 outputs,
+    /// Drafter taps of the last rows forward: `[4][PREFILL_CHUNK][H]` (layer 4 / 22 / 40 outputs,
     /// final normed hidden), filled when `capture_taps`.
     pub(crate) taps_buf: Option<DeviceBuf>,
     pub capture_taps: bool,
@@ -418,7 +351,7 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
         let is_local = cfg.is_local_layer(phys.0 as usize);
         let v_q4 = !is_local && global_v_q4;
         let (max_seq, window) = if is_local {
-            (cfg.local_window_size + prefill_chunk(), cfg.local_window_size)
+            (cfg.local_window_size + PREFILL_CHUNK, cfg.local_window_size)
         } else {
             let g = global_max_seq.max(cfg.local_window_size);
             (g, g)
@@ -798,36 +731,6 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         Ok(())
     }
 
-    /// The layout of this engine's snapshots (see `SnapLayout`).
-    pub fn snapshot_layout(&self) -> SnapLayout {
-        let mut per_pos: Vec<usize> = self.global_kv_regions().iter().map(|r| r.1).collect();
-        let n_engine = per_pos.len();
-        let mut drafter_fixed = 0;
-        if let Some(d) = self.drafter.as_ref() {
-            drafter_fixed = d.local_kv_regions().iter().map(|b| b.size_bytes).sum();
-            per_pos.extend(d.global_kv_regions().iter().map(|r| r.1));
-        }
-        SnapLayout { fixed: self.snapshot_bytes(), drafter_fixed, per_pos, n_engine }
-    }
-
-    /// A snapshot's host bytes (complete: captures finish before they return).
-    pub fn snapshot_host(&self, snap: &SeqSnapshot) -> Result<&[u8]> {
-        unsafe { self.backend.pinned_as_mut_slice(snap.host).map(|s| &*s) }
-    }
-
-    /// A new snapshot of `pos` positions for the caller to fill through `snapshot_host_mut`
-    /// (`drafter_valid`: it will hold the drafter's state).
-    pub fn snapshot_new(&mut self, pos: usize, drafter_valid: bool) -> Result<SeqSnapshot> {
-        let drafter_valid = drafter_valid && self.drafter.is_some();
-        let total = self.snapshot_layout().total_bytes(pos, drafter_valid);
-        Ok(SeqSnapshot { pos, drafter_valid, host: self.backend.alloc_pinned(total)? })
-    }
-
-    /// A snapshot's host bytes, to fill.
-    pub fn snapshot_host_mut(&self, snap: &mut SeqSnapshot) -> Result<&mut [u8]> {
-        unsafe { self.backend.pinned_as_mut_slice(snap.host) }
-    }
-
     /// Frees a snapshot's pinned buffer.
     pub fn free_snapshot(&mut self, snap: SeqSnapshot) -> Result<()> {
         self.backend.sync_stream(self.tide.compute_stream)?;
@@ -1192,7 +1095,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let n_log = self.layer_states.len();
         if self.verify_hist.is_none() {
             self.verify_hist = Some(self.backend.alloc_device(n_log * (3 + MAX_BATCH_ROWS) * (2 * kv + 2 * h) * 4)?);
-            self.taps_buf = Some(self.backend.alloc_device(4 * prefill_chunk() * h * 4)?);
+            self.taps_buf = Some(self.backend.alloc_device(4 * PREFILL_CHUNK * h * 4)?);
             self.argmax_rows_buf = Some(self.backend.alloc_device(ARGMAX_FILTER_BUF_BYTES)?);
         }
         self.ensure_rows_buffers()
@@ -1972,7 +1875,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     pub(crate) fn drafter_ingest(&mut self, pos0: usize, m: usize) -> Result<()> {
         self.last_tap_rows = m;
         if let (Some(d), Some(taps)) = (self.drafter.as_ref(), self.taps_buf) {
-            d.ingest(taps, prefill_chunk(), pos0, m, self.tide.compute_stream)?;
+            d.ingest(taps, PREFILL_CHUNK, pos0, m, self.tide.compute_stream)?;
         }
         Ok(())
     }
@@ -1983,7 +1886,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let taps = self.taps_buf.expect("taps buffer");
         let s = self.tide.compute_stream;
         let d = self.drafter.as_mut().expect("drafter attached");
-        d.draft(&self.dense, anchor, p, taps, prefill_chunk(), tap_row, n, s)
+        d.draft(&self.dense, anchor, p, taps, PREFILL_CHUNK, tap_row, n, s)
     }
 
     /// Like `draft`, returning `(token_id, top1_minus_top2_logit_margin)` per drafted token.
@@ -1991,7 +1894,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let taps = self.taps_buf.expect("taps buffer");
         let s = self.tide.compute_stream;
         let d = self.drafter.as_mut().expect("drafter attached");
-        d.draft_with_margins(&self.dense, anchor, p, taps, prefill_chunk(), tap_row, n, s)
+        d.draft_with_margins(&self.dense, anchor, p, taps, PREFILL_CHUNK, tap_row, n, s)
     }
 
     /// Speculative verify (greedy): skips monotonic final logit softcap; follow with `rows_argmax`

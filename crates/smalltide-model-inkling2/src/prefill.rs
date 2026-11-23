@@ -1,4 +1,4 @@
-//! Rows-batched chunked prefill for `Inkling2Engine` (up to `prefill_chunk()` tokens per chunk).
+//! Rows-batched chunked prefill for `Inkling2Engine` (up to `PREFILL_CHUNK` tokens per chunk).
 //!
 //! Same math as `forward_token`, but every projection is a rows GEMM (weights read once per chunk
 //! instead of once per token), attention is a multi-row causal kernel over the FP8 KV cache, short
@@ -7,7 +7,7 @@
 //! streamed once for all of its rows. Experts that are not resident in VRAM are staged into the
 //! Scratch Rescue slots in waves, so prefill is always exact (no skipped experts).
 
-use crate::engine::{prefill_chunk, Inkling2Engine};
+use crate::engine::{Inkling2Engine, PREFILL_CHUNK};
 use smalltide_core::backend::GemvSegment;
 use crate::weights::{Fp8MatrixGpu, LoopControllerGpu};
 use smalltide_core::backend::{GroupedMoeParams, PrefillAttnParams};
@@ -23,7 +23,7 @@ const MOE_PAIRS_PER_ITEM: usize = 16;
 const DESC_BYTES: usize = 160 * 1024;
 const DESC_RING: usize = 4;
 
-/// Rows-batched activation buffers (sized for `prefill_chunk()` rows).
+/// Rows-batched activation buffers (sized for `PREFILL_CHUNK` rows).
 pub(crate) struct PrefillScratch {
     cur: DeviceBuf,
     embed: DeviceBuf,
@@ -80,7 +80,7 @@ const VERIFY_ATTN_SPLITS: usize = 16;
 
 impl PrefillScratch {
     pub(crate) fn new<B: ComputeBackend>(b: &B, cfg: &smalltide_core::Inkling2Config) -> Result<Self> {
-        let m = prefill_chunk();
+        let m = PREFILL_CHUNK;
         let h = cfg.hidden_size;
         let qd = cfg.num_attention_heads * cfg.head_dim;
         let kvd = cfg.num_key_value_heads * cfg.head_dim;
@@ -190,7 +190,7 @@ fn part(buf: DeviceBuf, idx: usize, m: usize, h: usize) -> DeviceBuf {
 }
 
 impl<B: ComputeBackend> Inkling2Engine<B> {
-    /// Prefills `tokens` at positions `pos0..` in chunks of up to `prefill_chunk()` rows. When
+    /// Prefills `tokens` at positions `pos0..` in chunks of up to `PREFILL_CHUNK` rows. When
     /// `need_logits`, the logits of the last token are left in the logits buffer for sampling.
     pub fn prefill(&mut self, tokens: &[u32], pos0: usize, need_logits: bool) -> Result<()> {
         if tokens.is_empty() {
@@ -208,7 +208,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.route_log_inflight = false;
         let mut off = 0usize;
         while off < tokens.len() {
-            let m = (tokens.len() - off).min(prefill_chunk());
+            let m = (tokens.len() - off).min(PREFILL_CHUNK);
             let last = off + m == tokens.len();
             if off > 0 {
                 // Prompt-aware loading: swaps queued after the previous chunk that have landed
@@ -317,7 +317,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 if let Some(t) = slot {
                     let taps = eng.taps_buf.expect("taps buffer");
                     let cur = eng.pf.as_ref().unwrap().cur;
-                    eng.backend.vec_copy(taps.slice(t * prefill_chunk() * h * 4, m * h * 4), cur.slice(0, m * h * 4), m * h, s)?;
+                    eng.backend.vec_copy(taps.slice(t * PREFILL_CHUNK * h * 4, m * h * 4), cur.slice(0, m * h * 4), m * h, s)?;
                 }
             }
             if let (Some(dh), Some(dr)) = (dump_hidden.as_mut(), dump_routes.as_mut()) {
@@ -388,7 +388,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.backend.rms_norm(moe_norm, moe_in, self.dense.final_norm, m, h, eps, s)?;
             if capture {
                 let taps = self.taps_buf.expect("taps buffer");
-                self.backend.vec_copy(taps.slice(3 * prefill_chunk() * h * 4, m * h * 4), moe_norm.slice(0, m * h * 4), m * h, s)?;
+                self.backend.vec_copy(taps.slice(3 * PREFILL_CHUNK * h * 4, m * h * 4), moe_norm.slice(0, m * h * 4), m * h, s)?;
             }
             let vocab = self.cfg.unpadded_vocab_size;
             let logits = self.batch_logits.expect("batch logits");
@@ -427,7 +427,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.backend.rms_norm(moe_norm, moe_in, self.dense.final_norm, m, h, eps, s)?;
             if capture {
                 let taps = self.taps_buf.expect("taps buffer");
-                self.backend.vec_copy(taps.slice(3 * prefill_chunk() * h * 4, m * h * 4), moe_norm.slice(0, m * h * 4), m * h, s)?;
+                self.backend.vec_copy(taps.slice(3 * PREFILL_CHUNK * h * 4, m * h * 4), moe_norm.slice(0, m * h * 4), m * h, s)?;
             }
             if self.dump.is_some() {
                 for r in 0..m {
@@ -1210,30 +1210,23 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             // Skipped pairs are never written by the expert kernels: their tmp rows must be 0.
             self.backend.zero_f32(tmp, m * 8 * h, s)?;
         }
-        // Wave 0: the resident experts. With missing experts too, it runs on its own while the
-        // first `ring` of them are copied into scratch (the copy starts at the fence, before the
-        // wave); each further wave stages and runs the next `ring` missing experts.
+        // Wave 0: resident experts plus the first `ring` missing ones (staged into scratch);
+        // further waves stage the next `ring` missing experts each.
         self.backend.seg_mark("pf: moe kernels (+staging)", s);
-        let split = !resident.is_empty() && !missing.is_empty();
-        if split {
-            self.tide.fence_scratch()?;
-        }
         let mut next_missing = 0usize;
-        let mut wave = 0usize;
-        while wave == 0 || next_missing < missing.len() {
+        let mut first = true;
+        while first || next_missing < missing.len() {
+            let take = (missing.len() - next_missing).min(ring);
+            let batch = &missing[next_missing..next_missing + take];
+            next_missing += take;
+            let ids_to_stage: Vec<ExpertId> = batch.iter().map(|(id, _)| *id).collect();
+            let staged = self.tide.stage_into_scratch(&ids_to_stage)?;
             let mut items: Vec<(u32, &[u32])> = Vec::new();
-            if wave == 0 {
+            if first {
                 items.extend(resident.iter().map(|(sl, p)| (*sl, p.as_slice())));
             }
-            if !(split && wave == 0) {
-                let take = (missing.len() - next_missing).min(ring);
-                let batch = &missing[next_missing..next_missing + take];
-                let ids_to_stage: Vec<ExpertId> = batch.iter().map(|(id, _)| *id).collect();
-                let staged = if split && next_missing == 0 { self.tide.stage_into_scratch_fenced(&ids_to_stage)? } else { self.tide.stage_into_scratch(&ids_to_stage)? };
-                next_missing += take;
-                items.extend(staged.iter().zip(batch).map(|(sl, (_, p))| (sl.0, p.as_slice())));
-            }
-            wave += 1;
+            items.extend(staged.iter().zip(batch).map(|(sl, (_, p))| (sl.0, p.as_slice())));
+            first = false;
             if items.is_empty() {
                 continue;
             }

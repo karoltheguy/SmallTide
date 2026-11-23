@@ -258,23 +258,6 @@ impl<S> PrefixCache<S> {
         self.snaps.push(Snap { tokens, tick: self.tick, shared, payload, demand: None });
     }
 
-    /// Stores a filled snapshot of exactly `tokens` that no lane produced (one read from disk).
-    pub fn insert_tokens(&mut self, tokens: Vec<u32>, payload: S) {
-        self.tick += 1;
-        if let Some(i) = self.snaps.iter().position(|s| s.tokens == tokens) {
-            let old = std::mem::replace(&mut self.snaps[i].payload, payload);
-            self.snaps[i].tick = self.tick;
-            self.pool.push(old);
-            return;
-        }
-        self.snaps.push(Snap { tokens, tick: self.tick, shared: false, payload, demand: None });
-    }
-
-    /// The snapshot of exactly `prefix`, if any.
-    pub fn snapshot_of(&self, prefix: &[u32]) -> Option<&S> {
-        self.snaps.iter().find(|s| s.tokens == prefix).map(|s| &s.payload)
-    }
-
     /// Attaches `demand` to the snapshot of exactly `prefix` (if any).
     pub fn set_demand(&mut self, prefix: &[u32], demand: &[f32]) {
         if let Some(sn) = self.snaps.iter_mut().find(|s| s.tokens == prefix) {

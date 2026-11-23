@@ -8,7 +8,7 @@ Pre-built Windows releases embed the compiled `gfx1201` `.hsaco` GPU kernels ins
 
 ## Measured Performance (RX 9070 XT 16 GB, Windows 11)
 
-Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver, the settings of `.env.example`, and the monitor on the motherboard output so the card holds nothing but the model (see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard)). *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
+Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver, the settings of `.env.example` with `SMALLTIDE_RAM_GB=10`, and the monitor on the motherboard output so the card holds nothing but the model (see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard)). *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
 
 | Workload | Prompt / output | Decode | TTFT |
 | --- | ---: | ---: | ---: |
@@ -44,7 +44,7 @@ The test says how often the top choice changes, not whether the answers are wors
 - **GPU:** AMD Radeon RX 9070 XT (16 GB, RDNA 4 `gfx1201`)
 - **OS:** Windows 11 (64-bit)
 - **Driver:** **AMD Software: Adrenalin Edition 26.10.44 or newer** (ships `amdhip64_7.dll` and fixes the 26.5.1–26.9.1 WDDM residency cap bug — no ROCm SDK needed)
-- **System RAM:** 32 GB recommended (10 GB of it holds the warm RAM expert tier so misses rescue over PCIe instead of NVMe)
+- **System RAM:** 32 GB recommended (16 GB of it holds the warm RAM expert tier so misses rescue over PCIe instead of NVMe; 10 GB with the monitor on the motherboard)
 - **Disk:** ~36 GB free on NVMe (~21 GB Hugging Face checkpoint + ~14.7 GB packed `experts.stide`)
 
 ---
@@ -74,6 +74,8 @@ The test says how often the top choice changes, not whether the answers are wors
 ```powershell
 .\smalltide.cmd run -p "Write a concise explanation of speculative decoding." -n 256
 ```
+
+5. **Optional: move the monitor cable to the motherboard for more resident experts.** With the monitor plugged into the RX 9070 XT, the desktop holds 3 to 5 GB of the card. If your CPU has integrated graphics, plug the monitor into the motherboard's video output instead and reboot: the card then holds nothing but the model, and about 2,100 of the 3,072 experts stay resident instead of about 1,750 (about 97% of the routing weight instead of about 90%). The numbers in [Measured Performance](#measured-performance-rx-9070-xt-16-gb-windows-11) were taken this way. Set `SMALLTIDE_RAM_GB=10` in `.env` for this setup; the details are in [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard). SmallTide works either way.
 
 *(`smalltide.cmd` invokes `smalltide.ps1` with `-ExecutionPolicy Bypass`, so it works out of the box on stock Windows 11 without changing PowerShell execution policies.)*
 
@@ -123,9 +125,9 @@ Send images as content parts of a user (or tool) message, in the OpenAI format w
 
 ## How SmallTide Works
 
-1. **Loop-aware adaptive residency (TideLM).** Inkling-2-Mini runs 24 physical MoE layers as 48 logical layers: 4 Prelude layers, 12 Loop Core layers executed **4 times per token**, and 8 Coda layers. SmallTide tracks every router pick into persistent routing priors (`<MODEL_DIR>/tide_priors.json`), automatically seeded on first boot from `profiles/inkling2-mini-priors.json` (aggregate routing shares only, zero user text). Value-per-byte placement prioritizes the 4× Loop Core first (~98%+ hit rate in VRAM), filling the rest of dedicated VRAM with the hottest Prelude NVFP4 and Coda MXFP8 experts.
+1. **Loop-aware adaptive residency (TideLM).** Inkling-2-Mini runs 24 physical MoE layers as 48 logical layers: 6 Prelude layers, 12 Loop Core layers executed **3 times per token**, and 6 Coda layers. SmallTide tracks every router pick into persistent routing priors (`<MODEL_DIR>/tide_priors.json`), automatically seeded on first boot from `profiles/inkling2-mini-priors.json` (aggregate routing shares only, zero user text). Value-per-byte placement prioritizes the 3× Loop Core first (~98%+ hit rate in VRAM), filling the rest of dedicated VRAM with the hottest Prelude NVFP4 and Coda MXFP8 experts.
 2. **Windows DXGI residency-aware sizing.** On Windows WDDM, `hipMemGetInfo` reports shared system RAM as free VRAM, causing oversized allocations to silently drop ~10× in bandwidth over PCIe. With `SMALLTIDE_POOL_BUDGET=resident` (default), SmallTide queries DXGI's local residency budget and probes copy bandwidth across every 256 MiB window at startup (`fit_pools_to_resident`) so 100% of active expert slots stay on dedicated GDDR6.
-3. **2-Stage Miss Handling + Fused GPU Spin-Wait Rescue.** Non-VRAM experts live warm in host RAM (`SMALLTIDE_RAM_GB=10`: every expert that is not on the card plus the ones most likely to leave it; a stray one is read back in the background) backed by 4 KB-aligned Win32 `FILE_FLAG_NO_BUFFERING` NVMe reads (`experts.stide`). High-weight misses (`>= 0.08` in Prelude/Coda, `>= 0.09` in Loop Core, per-zone budgets `18/35/20`) are copied over PCIe on a dedicated DMA stream and synchronized on-GPU by a fused HIP spin-wait + route-patch kernel (`SMALLTIDE_RESCUE_WAIT=spin`), while lower-weight misses are skipped and renormalized and hot misses promote asynchronously in the background.
+3. **2-Stage Miss Handling + Fused GPU Spin-Wait Rescue.** Non-VRAM experts live warm in host RAM (`SMALLTIDE_RAM_GB=16`: every expert that is not on the card plus the ones most likely to leave it; a stray one is read back in the background) backed by 4 KB-aligned Win32 `FILE_FLAG_NO_BUFFERING` NVMe reads (`experts.stide`). High-weight misses (`>= 0.08` in Prelude/Coda, `>= 0.09` in Loop Core, per-zone budgets `18/35/20`) are copied over PCIe on a dedicated DMA stream and synchronized on-GPU by a fused HIP spin-wait + route-patch kernel (`SMALLTIDE_RESCUE_WAIT=spin`), while lower-weight misses are skipped and renormalized and hot misses promote asynchronously in the background.
 4. **Lossless DSpark Speculative Decoding.** Inkling-2-Mini's 3-layer DSpark drafter (`mtp.safetensors`, ~418 MiB VRAM at 49K ctx) drafts up to 7 tokens per step with confidence-gated adaptive depth. Verification uses GPU-side top-k/top-p filtering (`smalltide_logits_filter_rows`) and exact stochastic rejection sampling, accelerating both `temperature = 0` and `temperature > 0` without altering the target distribution.
 5. **Paged K8/V4 Global KV & Prefix Caching.** Global-attention KV (8 target layers + 1 drafter layer) is paged from a shared `SMALLTIDE_KV_TOKENS` pool across lanes with asymmetric **`k8v4`** quantization (`SMALLTIDE_KV_FMT=k8v4`: FP8 E4M3 keys for exact attention scores + per-32-group asymmetric INT4 values, saving ~472 MiB at 128K for +115 more resident experts). Multi-turn conversations restore prefix snapshots (including drafter KV state) from pinned host RAM without re-prefilling.
 
@@ -150,7 +152,7 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 | `SMALLTIDE_SPEC` | `1` | Enable (`1`) or disable (`0`) DSpark speculative decoding. |
 | `SMALLTIDE_VISION` / `SMALLTIDE_VISION_MAX_TOKENS` | `1` / `1536` | Image input on (`1`) or off (`0`), and the most tokens one image takes (larger images are scaled down). |
 | `SMALLTIDE_RAM_PINNED_GB` | `0` | Experimental. This much of the RAM tier in page-locked memory: those experts upload to the card without a copy into the staging buffer (`2`: about 3% faster decode on a 12K-token prompt). Capped at 3; with 5 the server lost the GPU context, see [LIMITATIONS.md](LIMITATIONS.md). |
-| `SMALLTIDE_RAM_GB` | `10` | Host RAM tier for non-VRAM experts. It has to hold every expert that is not on the card (about 4.8 MiB each) with room to spare; `16` holds all 3,072. |
+| `SMALLTIDE_RAM_GB` | `16` | Host RAM tier for non-VRAM experts. It has to hold every expert that is not on the card (about 4.8 MiB each) with room to spare; `16` holds all 3,072. Set `10` when the monitor is on the motherboard (see below). |
 | `SMALLTIDE_HOST` / `SMALLTIDE_PORT` | `0.0.0.0` / `8000` | Server bind address (`127.0.0.1` for local-only) and port. |
 
 > **Getting maximum resident experts on Windows:** Closing VRAM-heavy desktop apps (browsers with many tabs, Adobe Creative Cloud, games, hardware-accelerated Electron apps) before launching `.\smalltide.cmd serve` directly increases the number of experts SmallTide can keep resident on the card. Run `.\smalltide.cmd vram-probe` anytime to inspect your card's current resident headroom.
@@ -175,11 +177,10 @@ Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K 
 **Setting it up with the monitor on the motherboard**
 
 1. Move the cable to the motherboard's video output and **reboot**: programs keep using the graphics card they started on, so until then the desktop still sits on the 9070 XT.
-2. Start the server. The startup line should show `VRAM free: … /15.92 GiB` (the engine picks the discrete card by itself; `SMALLTIDE_HIP_DEVICE` overrides it) and a resident count well above 2,000.
-3. Leave these at their defaults:
-   - `SMALLTIDE_IDLE_HEARTBEAT_MS=1000`. Radeon drivers 26.5.1 and later put a card with no display to sleep about 10 seconds after its last GPU work, and Windows first moves everything in the card's memory - the whole model - into system RAM, which exhausts a 32 GB machine within seconds ([ROCm/TheRock#7221](https://github.com/ROCm/TheRock/issues/7221)). The heartbeat is a few milliseconds of GPU work once a second from the moment the server starts, loading included, and keeps the card awake. AMD reports the driver bug fixed in Adrenalin 26.9.2; that was not verified here, and 26.10.44 (build 32.0.31044.16) still has it.
-   - `SMALLTIDE_RAM_GB=10`, not 16: the desktop now lives in system RAM too.
-4. Run one server at a time. A second one would load a second copy of the model next to the first; it now stops at once with `cannot listen on …`.
+2. Set `SMALLTIDE_RAM_GB=10` in `.env` (`.env.example` has 16): the desktop now lives in system RAM too.
+3. Start the server. The startup line should show `VRAM free: … /15.92 GiB` (the engine picks the discrete card by itself; `SMALLTIDE_HIP_DEVICE` overrides it) and a resident count well above 2,000.
+4. Leave `SMALLTIDE_IDLE_HEARTBEAT_MS=1000` at its default. Radeon drivers 26.5.1 and later put a card with no display to sleep about 10 seconds after its last GPU work, and Windows first moves everything in the card's memory - the whole model - into system RAM, which exhausts a 32 GB machine within seconds ([ROCm/TheRock#7221](https://github.com/ROCm/TheRock/issues/7221)). The heartbeat is a few milliseconds of GPU work once a second from the moment the server starts, loading included, and keeps the card awake. AMD reports the driver bug fixed in Adrenalin 26.9.2; that was not verified here, and 26.10.44 (build 32.0.31044.16) still has it.
+5. Run one server at a time. A second one would load a second copy of the model next to the first; it now stops at once with `cannot listen on …`.
 
 With the monitor on the card none of this is needed, and closing VRAM-heavy apps before starting the server is what buys resident experts.
 

@@ -265,7 +265,7 @@ impl HipBackend {
     pub fn new(device_id: i32) -> Result<Self> {
         let rt = HipRuntime::load()?;
         let _ = rt.probe_device(device_id)?;
-        let kernels = rt.load_core_kernels()?;
+        let kernels = rt.load_core_kernels(device_id)?;
         Ok(Self {
             rt,
             kernels,
@@ -634,7 +634,7 @@ impl ComputeBackend for HipBackend {
         Ok(DeviceInfo {
             backend_name: "hip",
             device_name: r.device_name,
-            arch_name: "gfx1201".into(),
+            arch_name: r.kernel_arch,
             total_vram_bytes: r.total_vram_bytes,
             free_vram_bytes: r.free_vram_bytes,
             supports_fp8_wmma: true,

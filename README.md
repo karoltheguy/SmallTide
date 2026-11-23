@@ -6,9 +6,9 @@
 
 *The live expert map (`http://127.0.0.1:8000/expert-map`) during a decode: each token's route through the 48 layers, the experts that are on the card, and the ones rescued or loaded in the background.*
 
-Inkling-2-Mini's routed experts (~14.7 GB across 3,072 NVFP4 & MXFP8 experts) plus dense weights, KV cache, and drafter (~6+ GB) exceed a 16 GB consumer GPU. SmallTide brings [TideLM](https://github.com/raspy135/tideLM)-style adaptive expert residency and custom RDNA 4 (`gfx1201`) HIP kernels to Windows: it keeps the highest-value experts resident in dedicated GDDR6 VRAM, promotes hot misses asynchronously from host RAM/NVMe, rescues high-weight misses inline on the GPU, and accelerates both greedy and sampled generation with Inkling-2-Mini's 3-layer DSpark speculative drafter.
+Inkling-2-Mini's routed experts (~14.7 GB across 3,072 NVFP4 & MXFP8 experts) plus dense weights, KV cache, and drafter (~6+ GB) exceed a 16 GB consumer GPU. SmallTide brings [TideLM](https://github.com/raspy135/tideLM)-style adaptive expert residency and custom RDNA 4 HIP kernels to Windows: it keeps the highest-value experts resident in dedicated GDDR6 VRAM, promotes hot misses asynchronously from host RAM/NVMe, rescues high-weight misses inline on the GPU, and accelerates both greedy and sampled generation with Inkling-2-Mini's 3-layer DSpark speculative drafter.
 
-Pre-built Windows releases embed the compiled `gfx1201` `.hsaco` GPU kernels inside a single `smalltide-cli.exe` — **no Rust toolchain, no ROCm SDK, and no Python environment required** to install and serve.
+Pre-built Windows releases embed the compiled `.hsaco` GPU kernels (`gfx1201` and `gfx1200`) inside a single `smalltide-cli.exe` — **no Rust toolchain, no ROCm SDK, and no Python environment required** to install and serve.
 
 ## Measured Performance (RX 9070 XT 16 GB, Windows 11)
 
@@ -45,11 +45,25 @@ The test says how often the top choice changes, not whether the answers are wors
 
 ## Requirements
 
-- **GPU:** AMD Radeon RX 9070 XT (16 GB, RDNA 4 `gfx1201`)
+- **GPU:** an AMD Radeon RDNA 4 card with 16 GB: the RX 9070 XT (developed and measured here), or the RX 9070 or RX 9060 XT 16 GB (untested). See [Supported cards](#supported-cards).
 - **OS:** Windows 11 (64-bit)
 - **Driver:** **AMD Software: Adrenalin Edition 26.10.44 or newer** (ships `amdhip64_7.dll` and fixes the 26.5.1–26.9.1 WDDM residency cap bug — no ROCm SDK needed)
 - **System RAM:** 32 GB recommended (16 GB of it holds the warm RAM expert tier so misses rescue over PCIe instead of NVMe; 10 GB with the monitor on the motherboard)
 - **Disk:** ~36 GB free on NVMe (~21 GB Hugging Face checkpoint + ~14.7 GB packed `experts.stide`)
+
+### Supported cards
+
+The release carries two builds of the GPU kernels and loads the one for the card it finds.
+
+| Card | Kernel build | Status |
+| --- | --- | --- |
+| Radeon RX 9070 XT (16 GB) | `gfx1201` | Developed and measured on this card. Every number in this README is from it. |
+| Radeon RX 9070 (16 GB) | `gfx1201` | **Untested.** Same architecture and the same kernels as the XT, so it is expected to work. |
+| Radeon RX 9060 XT 16 GB | `gfx1200` | **Untested: no such card was available.** It has its own kernel build, which compiles but has never run on the card. Expect a clearly lower speed: the card has about half the compute units and half the memory bandwidth of the RX 9070 XT. |
+
+`.\smalltide.cmd probe` (the first step of `setup`, before the model download) prints the card, its architecture and the kernel build chosen, and runs a test kernel on the card. If you run an RX 9070 or an RX 9060 XT, please open an issue with that output, whether it works or not.
+
+The RX 9070 GRE and the Radeon AI PRO R9700 are `gfx1201` as well and load the same kernels as the RX 9070 XT; they are untested too. The 8 GB RX 9060 XT and RX 9060 are not a target: the dense weights, KV cache and drafter take about 6 GB before the first expert. RDNA 3 and older cards are not supported. Details in [LIMITATIONS.md](LIMITATIONS.md).
 
 ---
 
@@ -62,7 +76,7 @@ The test says how often the top choice changes, not whether the answers are wors
 .\smalltide.cmd setup
 ```
 
-`setup` copies `.env.example` → `.env`, verifies your RX 9070 XT & HIP driver (`probe`), downloads [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) via built-in `curl.exe` (resumable, ~21 GB; set `$env:HF_TOKEN` only if you want higher Hugging Face rate limits), and packs all 3,072 routed experts into 4 KB-aligned `experts.stide` (~15 s).
+`setup` copies `.env.example` → `.env`, verifies your GPU, its kernels & the HIP driver (`probe`), downloads [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) via built-in `curl.exe` (resumable, ~21 GB; set `$env:HF_TOKEN` only if you want higher Hugging Face rate limits), and packs all 3,072 routed experts into 4 KB-aligned `experts.stide` (~15 s).
 
 3. **Start the server:**
 
@@ -219,7 +233,7 @@ The results are in [Measured Performance](#measured-performance-rx-9070-xt-16-gb
 
 ## Building from Source
 
-Only needed if you want to modify the Rust engine/HIP kernels or compile for another RDNA 4 architecture (`SMALLTIDE_HIP_ARCH`):
+Only needed if you want to modify the Rust engine/HIP kernels or choose which architectures the kernels are compiled for (`SMALLTIDE_HIP_ARCH`, comma-separated, default `gfx1201,gfx1200`):
 
 - **Prerequisites:** [Rust](https://rustup.rs/) (MSVC toolchain) + **AMD ROCm HIP SDK for Windows** (`hipcc.exe`, auto-detected under `C:\Program Files\AMD\ROCm\*\bin\` or `ROCM_PATH` / `SMALLTIDE_HIPCC`).
 

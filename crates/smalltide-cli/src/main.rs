@@ -116,7 +116,7 @@ fn main() {
             println!("SmallTide CLI");
             println!("Commands:");
             println!("  probe                         Probe AMD HIP GPU + Stage 1 H2D DMA microbenchmark");
-            println!("  bench-gpu                     Verify gfx1201 kernels vs CPU + benchmark BW / hipGraph / overlap");
+            println!("  bench-gpu                     Verify GPU kernels vs CPU + benchmark BW / hipGraph / overlap");
             println!("  bench-nvme                    Run Stage 2 Win32 NO_BUFFERING random expert read benchmark");
             println!("  pack <in.safetensors> <out.stide>  Pack 3,072 experts into 4KB-aligned .stide store");
             println!("  load-test [model-dir]         Verify real tokenizer + FP8 dense load + Mode 1 Tide pre-prefill on GPU");
@@ -138,7 +138,24 @@ fn run_probe() {
     println!("HIP Driver     : {}", info.driver_version);
     println!("Device Count   : {}", info.device_count);
     println!("Device[{dev}]      : {}", info.device_name);
+    println!("Device arch    : {}", info.device_arch.as_deref().unwrap_or("not reported by the runtime"));
+    if info.hsaco_bytes == 0 {
+        // No kernels for this card (or a build without hipcc): say why and fail the probe.
+        let why = hip.kernels_for_device(dev).err().map(|e| e.to_string()).unwrap_or_default();
+        println!("Embedded HSACO : 0 bytes");
+        eprintln!("error: {why}");
+        std::process::exit(1);
+    }
+    println!("Kernel arch    : {}", info.kernel_arch);
     println!("Embedded HSACO : {} bytes", info.hsaco_bytes);
+    match hip.check_kernels(dev) {
+        Ok(()) => println!("Kernel check   : module loaded, test kernel ran on the card"),
+        Err(e) => {
+            println!("Kernel check   : FAILED");
+            eprintln!("error: the {} kernels do not run on this card: {e}", info.kernel_arch);
+            std::process::exit(1);
+        }
+    }
     println!(
         "VRAM           : {:.2} GiB free / {:.2} GiB total",
         info.free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -168,11 +185,11 @@ fn run_bench_gpu() {
     let dev = hip.select_device().expect("select HIP device");
     let info = hip.probe_device(dev).expect("probe HIP device");
     println!(
-        "=== SmallTide Phase 1 gfx1201 Kernel Verify & Benchmark ({}) ===",
-        info.device_name
+        "=== SmallTide Phase 1 {} Kernel Verify & Benchmark ({}) ===",
+        info.kernel_arch, info.device_name
     );
     println!("Embedded HSACO: {} bytes", info.hsaco_bytes);
-    let kernels = hip.load_core_kernels().expect("load embedded .hsaco kernels");
+    let kernels = hip.load_core_kernels(dev).expect("load embedded .hsaco kernels");
 
     // --- 1. Numerical Parity Checks (GPU vs CPU Reference) ---
     let k_cols = 2304usize;

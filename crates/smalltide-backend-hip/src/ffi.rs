@@ -7,7 +7,9 @@ use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
 use std::time::Instant;
 
-pub static EMBEDDED_HSACO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/smalltide_gfx1201.hsaco"));
+// `EMBEDDED_HSACOS`: one compiled kernel module per GPU architecture, as (architecture, code
+// object), in the order of `SMALLTIDE_HIP_ARCH` at build time (default: gfx1201, gfx1200).
+include!(concat!(env!("OUT_DIR"), "/hsaco_table.rs"));
 
 pub type HipError = c_int;
 pub type HipStream = *mut c_void;
@@ -30,6 +32,8 @@ pub const HIP_STREAM_CAPTURE_MODE_GLOBAL: c_int = 0;
 type FnHipGetDeviceCount = unsafe extern "C" fn(*mut c_int) -> HipError;
 type FnHipSetDevice = unsafe extern "C" fn(c_int) -> HipError;
 type FnHipDeviceGetName = unsafe extern "C" fn(*mut c_char, c_int, c_int) -> HipError;
+/// `hipGetDeviceProperties(hipDeviceProp_t*, int)`; the struct is only read as raw bytes.
+type FnHipGetDeviceProperties = unsafe extern "C" fn(*mut c_void, c_int) -> HipError;
 type FnHipMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> HipError;
 type FnHipRuntimeGetVersion = unsafe extern "C" fn(*mut c_int) -> HipError;
 type FnHipDriverGetVersion = unsafe extern "C" fn(*mut c_int) -> HipError;
@@ -126,8 +130,13 @@ pub struct HipProbeReport {
     pub driver_version: i32,
     pub device_count: i32,
     pub device_name: String,
+    /// The architecture the runtime reports for the device ("gfx1201"), if it reports one.
+    pub device_arch: Option<String>,
+    /// The architecture of the embedded kernels chosen for the device; empty if none fits.
+    pub kernel_arch: String,
     pub free_vram_bytes: usize,
     pub total_vram_bytes: usize,
+    /// Size of the chosen embedded kernel module (0 if none fits or the build had no hipcc).
     pub hsaco_bytes: usize,
 }
 
@@ -280,6 +289,8 @@ pub struct HipRuntime {
     pub hip_get_device_count: FnHipGetDeviceCount,
     pub hip_set_device: FnHipSetDevice,
     pub hip_device_get_name: FnHipDeviceGetName,
+    /// Optional: only used to read the device's architecture name.
+    pub hip_get_device_properties: Option<FnHipGetDeviceProperties>,
     pub hip_mem_get_info: FnHipMemGetInfo,
     pub hip_runtime_get_version: FnHipRuntimeGetVersion,
     pub hip_driver_get_version: FnHipDriverGetVersion,
@@ -329,6 +340,39 @@ pub fn check_hip(code: HipError, op: &'static str) -> Result<()> {
     }
 }
 
+/// The first "gfx..." token in a `hipDeviceProp_t` read as bytes: "gfx1201" from "gfx1201",
+/// "gfx90a" from "gfx90a:sramecc+:xnack-".
+fn parse_gcn_arch(bytes: &[u8]) -> Option<String> {
+    let start = bytes.windows(3).position(|w| w == b"gfx")?;
+    let len = bytes[start..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'-').count();
+    (len > 3).then(|| String::from_utf8_lossy(&bytes[start..start + len]).into_owned())
+}
+
+#[cfg(test)]
+mod arch_tests {
+    use super::{parse_gcn_arch, EMBEDDED_HSACOS};
+
+    #[test]
+    fn gcn_arch_is_found_anywhere_in_the_struct() {
+        let mut prop = vec![0u8; 2048];
+        prop[..21].copy_from_slice(b"AMD Radeon RX 9060 XT");
+        prop[1400..1407].copy_from_slice(b"gfx1200");
+        assert_eq!(parse_gcn_arch(&prop).as_deref(), Some("gfx1200"));
+        prop[1400..1422].copy_from_slice(b"gfx90a:sramecc+:xnack-");
+        assert_eq!(parse_gcn_arch(&prop).as_deref(), Some("gfx90a"));
+        assert_eq!(parse_gcn_arch(&[0u8; 2048]), None);
+        assert_eq!(parse_gcn_arch(b"AMD Radeon RX 9070 XT "), None);
+    }
+
+    #[test]
+    fn kernel_table_has_distinct_architectures() {
+        assert!(!EMBEDDED_HSACOS.is_empty());
+        for (i, (a, _)) in EMBEDDED_HSACOS.iter().enumerate() {
+            assert!(EMBEDDED_HSACOS[..i].iter().all(|(b, _)| b != a), "{a} listed twice");
+        }
+    }
+}
+
 impl HipRuntime {
     pub fn load() -> Result<Self> {
         let candidates = ["amdhip64_7.dll", "amdhip64_6.dll", "amdhip64.dll"];
@@ -340,7 +384,7 @@ impl HipRuntime {
             }
         }
         Err(SmallTideError::BackendUnavailable(format!(
-            "failed to load any AMD HIP runtime DLL ({last_err}). Install AMD Software: Adrenalin Edition (26.10.44+ recommended for RX 9070 XT)."
+            "failed to load any AMD HIP runtime DLL ({last_err}). Install AMD Software: Adrenalin Edition (26.10.44+ recommended)."
         )))
     }
 
@@ -361,6 +405,12 @@ impl HipRuntime {
             hip_get_device_count: load_sym!(b"hipGetDeviceCount\0", FnHipGetDeviceCount),
             hip_set_device: load_sym!(b"hipSetDevice\0", FnHipSetDevice),
             hip_device_get_name: load_sym!(b"hipDeviceGetName\0", FnHipDeviceGetName),
+            hip_get_device_properties: unsafe {
+                lib.get::<FnHipGetDeviceProperties>(b"hipGetDevicePropertiesR0600\0")
+                    .or_else(|_| lib.get::<FnHipGetDeviceProperties>(b"hipGetDeviceProperties\0"))
+                    .ok()
+                    .map(|f| *f)
+            },
             hip_mem_get_info: load_sym!(b"hipMemGetInfo\0", FnHipMemGetInfo),
             hip_runtime_get_version: load_sym!(b"hipRuntimeGetVersion\0", FnHipRuntimeGetVersion),
             hip_driver_get_version: load_sym!(b"hipDriverGetVersion\0", FnHipDriverGetVersion),
@@ -421,18 +471,70 @@ impl HipRuntime {
         })
     }
 
-    pub fn load_core_kernels(&self) -> Result<CoreKernels> {
-        if EMBEDDED_HSACO.is_empty() {
-            return Err(SmallTideError::BackendUnavailable(
-                "embedded gfx1201 .hsaco is empty (rebuild after installing ROCm HIP SDK)".into(),
-            ));
+    /// The architecture name the runtime reports for a device ("gfx1201", "gfx1200"), or `None`
+    /// if it does not say. `hipDeviceProp_t` changes layout between HIP versions, so its
+    /// `gcnArchName` field is found by scanning the returned bytes for "gfx" instead of by offset
+    /// (the device name, the only other text in the struct, is a product name).
+    pub fn device_arch(&self, device_id: i32) -> Option<String> {
+        let get_props = self.hip_get_device_properties?;
+        // Far larger than any hipDeviceProp_t (about 1.5 KiB); u64 for alignment.
+        let mut buf = vec![0u64; 2048];
+        if unsafe { get_props(buf.as_mut_ptr() as *mut c_void, device_id) } != HIP_SUCCESS {
+            return None;
         }
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
+        parse_gcn_arch(bytes)
+    }
+
+    /// The embedded kernel module for a device, as (architecture, code object).
+    /// `SMALLTIDE_KERNEL_ARCH` forces one; otherwise the device's architecture picks it, and a
+    /// runtime that does not name the architecture gets the first one built.
+    pub fn kernels_for_device(&self, device_id: i32) -> Result<(&'static str, &'static [u8])> {
+        let built = || EMBEDDED_HSACOS.iter().map(|(a, _)| *a).collect::<Vec<_>>().join(", ");
+        let forced = std::env::var("SMALLTIDE_KERNEL_ARCH").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let (arch, code) = if let Some(want) = forced {
+            *EMBEDDED_HSACOS.iter().find(|(a, _)| *a == want).ok_or_else(|| {
+                SmallTideError::BackendUnavailable(format!(
+                    "SMALLTIDE_KERNEL_ARCH={want}: this build has kernels for {} only",
+                    built()
+                ))
+            })?
+        } else {
+            match self.device_arch(device_id) {
+                Some(dev_arch) => *EMBEDDED_HSACOS.iter().find(|(a, _)| *a == dev_arch).ok_or_else(|| {
+                    SmallTideError::BackendUnavailable(format!(
+                        "this GPU is {dev_arch}; this build has kernels for {} only (RDNA 4: RX 9070 / 9060 families). \
+                         Build from source with SMALLTIDE_HIP_ARCH={dev_arch} if the kernels compile for it, or set \
+                         SMALLTIDE_KERNEL_ARCH to try one of the built ones",
+                        built()
+                    ))
+                })?,
+                None => *EMBEDDED_HSACOS.first().ok_or_else(|| {
+                    SmallTideError::BackendUnavailable("no kernel module was built into this binary".into())
+                })?,
+            }
+        };
+        if code.is_empty() {
+            return Err(SmallTideError::BackendUnavailable(format!(
+                "embedded {arch} .hsaco is empty (rebuild after installing ROCm HIP SDK)"
+            )));
+        }
+        Ok((arch, code))
+    }
+
+    /// Load the kernel module built for `device_id`'s architecture (see `kernels_for_device`).
+    pub fn load_core_kernels(&self, device_id: i32) -> Result<CoreKernels> {
+        let (arch, code) = self.kernels_for_device(device_id)?;
         let mut module: HipModule = ptr::null_mut();
         unsafe {
-            check_hip(
-                (self.hip_module_load_data)(&mut module, EMBEDDED_HSACO.as_ptr() as *const c_void),
-                "hipModuleLoadData",
-            )?;
+            check_hip((self.hip_set_device)(device_id), "hipSetDevice")?;
+            let rc = (self.hip_module_load_data)(&mut module, code.as_ptr() as *const c_void);
+            if rc != HIP_SUCCESS {
+                return Err(SmallTideError::Backend {
+                    backend: "hip",
+                    message: format!("hipModuleLoadData failed with hipError_t={rc} loading the {arch} kernels"),
+                });
+            }
         }
         let get_fn = |name: &str| -> Result<HipFunction> {
             let c = CString::new(name).unwrap();
@@ -557,6 +659,51 @@ impl HipRuntime {
         })
     }
 
+    /// Load the device's kernel module, resolve every kernel and run one on the card (a counter
+    /// increment on 4 bytes of VRAM). `probe` runs it, so a card whose kernels do not load or
+    /// run is reported by `setup` before the model download.
+    pub fn check_kernels(&self, device_id: i32) -> Result<()> {
+        let kernels = self.load_core_kernels(device_id)?;
+        let run = || -> Result<()> {
+            let mut d_counter: *mut c_void = ptr::null_mut();
+            unsafe { check_hip((self.hip_malloc)(&mut d_counter, 4), "hipMalloc(counter)")? };
+            let counted = (|| -> Result<u32> {
+                let mut count: u32 = 0;
+                let mut arg_ptr = d_counter;
+                let mut params: [*mut c_void; 1] = [&mut arg_ptr as *mut *mut c_void as *mut c_void];
+                unsafe {
+                    check_hip(
+                        (self.hip_memcpy)(d_counter, &count as *const u32 as *const c_void, 4, HIP_MEMCPY_HOST_TO_DEVICE),
+                        "hipMemcpy(counter)",
+                    )?;
+                    check_hip(
+                        (self.hip_module_launch_kernel)(
+                            kernels.noop, 1, 1, 1, 32, 1, 1, 0, ptr::null_mut(), params.as_mut_ptr(), ptr::null_mut(),
+                        ),
+                        "launch(noop)",
+                    )?;
+                    check_hip((self.hip_stream_synchronize)(ptr::null_mut()), "hipStreamSynchronize(noop)")?;
+                    check_hip(
+                        (self.hip_memcpy)(&mut count as *mut u32 as *mut c_void, d_counter, 4, HIP_MEMCPY_DEVICE_TO_HOST),
+                        "hipMemcpy(counter back)",
+                    )?;
+                }
+                Ok(count)
+            })();
+            unsafe { let _ = (self.hip_free)(d_counter); }
+            match counted? {
+                1 => Ok(()),
+                n => Err(SmallTideError::Backend {
+                    backend: "hip",
+                    message: format!("test kernel ran but wrote {n} instead of 1"),
+                }),
+            }
+        };
+        let res = run();
+        self.unload_kernels(kernels);
+        res
+    }
+
     pub fn unload_kernels(&self, kernels: CoreKernels) {
         unsafe {
             let _ = (self.hip_module_unload)(kernels.module);
@@ -621,6 +768,10 @@ impl HipRuntime {
         let device_name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+        let (kernel_arch, hsaco_bytes) = match self.kernels_for_device(device_id) {
+            Ok((arch, code)) => (arch.to_string(), code.len()),
+            Err(_) => (String::new(), 0),
+        };
 
         Ok(HipProbeReport {
             loaded_dll: self.loaded_dll.clone(),
@@ -628,9 +779,11 @@ impl HipRuntime {
             driver_version,
             device_count,
             device_name,
+            device_arch: self.device_arch(device_id),
+            kernel_arch,
             free_vram_bytes: free_vram,
             total_vram_bytes: total_vram,
-            hsaco_bytes: EMBEDDED_HSACO.len(),
+            hsaco_bytes,
         })
     }
 

@@ -10,7 +10,8 @@
 param(
     [switch]$SkipBuild,
     [switch]$NoProbe,
-    [string]$Arch = "gfx1201",
+    # Kernel builds to embed, comma-separated; the first one names the package.
+    [string]$Arch = "gfx1201,gfx1200",
     [string]$TargetDir = ""
 )
 
@@ -58,7 +59,8 @@ try {
         Write-Host "[package] $hsacoLine"
     }
 
-    $pkgName = "smalltide-v$version-windows-x64-$Arch"
+    $pkgArch = ($Arch -split ",")[0].Trim()
+    $pkgName = "smalltide-v$version-windows-x64-$pkgArch"
     $distDir = Join-Path $repoRoot "dist"
     $stageDir = Join-Path $distDir $pkgName
     $zipPath = Join-Path $distDir "$pkgName.zip"
@@ -73,7 +75,7 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "profiles") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "bench") | Out-Null
 
-    # Core binary (self-contained, with embedded gfx1201 .hsaco kernels)
+    # Core binary (self-contained, with the embedded .hsaco kernels of every architecture in $Arch)
     Copy-Item $exePath (Join-Path $stageDir "smalltide-cli.exe")
 
     # Launcher, config template, docs & license

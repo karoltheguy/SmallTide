@@ -1,6 +1,12 @@
 use std::env;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Kernel targets built when `SMALLTIDE_HIP_ARCH` is not set: the two RDNA 4 chips.
+/// `gfx1201` = RX 9070 XT / 9070 / 9070 GRE / Radeon AI PRO R9700, `gfx1200` = RX 9060 XT / 9060.
+/// The first entry is the fallback when the runtime cannot name the card's architecture.
+const DEFAULT_ARCHS: &str = "gfx1201,gfx1200";
 
 fn find_hipcc() -> Option<PathBuf> {
     if let Ok(p) = env::var("SMALLTIDE_HIPCC") {
@@ -49,33 +55,60 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SMALLTIDE_HIP_ARCH");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let hsaco_out = out_dir.join("smalltide_gfx1201.hsaco");
-    let arch = env::var("SMALLTIDE_HIP_ARCH").unwrap_or_else(|_| "gfx1201".to_string());
+
+    // One .hsaco per architecture, comma-separated (e.g. SMALLTIDE_HIP_ARCH=gfx1201 for one).
+    let arch_list = env::var("SMALLTIDE_HIP_ARCH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_ARCHS.to_string());
+    let mut archs: Vec<String> = Vec::new();
+    for a in arch_list.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+        if !a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            panic!("SMALLTIDE_HIP_ARCH: {a:?} is not an architecture name (expected e.g. gfx1201,gfx1200)");
+        }
+        if !archs.iter().any(|x| x == a) {
+            archs.push(a.to_string());
+        }
+    }
+    if archs.is_empty() {
+        panic!("SMALLTIDE_HIP_ARCH lists no architecture");
+    }
+
+    // `hsaco_table.rs` is included by src/ffi.rs: (architecture, code object) in list order.
+    let mut table = String::from("pub static EMBEDDED_HSACOS: &[(&str, &[u8])] = &[\n");
+    for a in &archs {
+        writeln!(table, "    (\"{a}\", include_bytes!(concat!(env!(\"OUT_DIR\"), \"/smalltide_{a}.hsaco\"))),").unwrap();
+    }
+    table.push_str("];\n");
+    std::fs::write(out_dir.join("hsaco_table.rs"), table).expect("write hsaco_table.rs");
 
     let Some(hipcc) = find_hipcc() else {
         // Allow compiling the workspace even on machines without ROCm SDK installed;
-        // emit an empty marker file and fail gracefully at runtime if kernels are invoked.
+        // emit empty marker files and fail gracefully at runtime if kernels are invoked.
         println!("cargo:warning=hipcc not found; building smalltide-backend-hip without compiled .hsaco kernels");
-        std::fs::write(&hsaco_out, []).expect("write empty hsaco placeholder");
+        for a in &archs {
+            std::fs::write(out_dir.join(format!("smalltide_{a}.hsaco")), []).expect("write empty hsaco placeholder");
+        }
         return;
     };
 
-    let status = Command::new(&hipcc)
-        .args([
-            "--genco",
-            &format!("--offload-arch={arch}"),
-            "-O3",
-            "-ffast-math",
-            "kernels/core_ops.hip",
-            "-o",
-        ])
-        .arg(&hsaco_out)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to execute {}: {e}", hipcc.display()));
+    for arch in &archs {
+        let hsaco_out = out_dir.join(format!("smalltide_{arch}.hsaco"));
+        let status = Command::new(&hipcc)
+            .args([
+                "--genco",
+                &format!("--offload-arch={arch}"),
+                "-O3",
+                "-ffast-math",
+                "kernels/core_ops.hip",
+                "-o",
+            ])
+            .arg(&hsaco_out)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to execute {}: {e}", hipcc.display()));
 
-    if !status.success() {
-        panic!(
-            "hipcc failed with status {status} compiling kernels/core_ops.hip for {arch}"
-        );
+        if !status.success() {
+            panic!("hipcc failed with status {status} compiling kernels/core_ops.hip for {arch}");
+        }
     }
 }

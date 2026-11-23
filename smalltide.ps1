@@ -9,7 +9,7 @@
       run ...     Run one-shot generation (forwards all flags to `smalltide-cli run`)
       probe       Verify AMD HIP DLL, GPU device, embedded kernels, and PCIe DMA bandwidth
       vram-probe  Measure on-card resident VRAM vs Windows system-memory spillover
-      bench-gpu   Verify gfx1201 kernels and run GPU microbenchmarks
+      bench-gpu   Verify the GPU kernels and run GPU microbenchmarks
       bench ...   Run bench/bench.py against the running server (http://127.0.0.1:8000)
       pack        Pack model-00001-of-00001.safetensors into 4KB-aligned experts.stide
       build       Build smalltide-cli.exe from source (requires Rust + AMD ROCm HIP SDK)
@@ -100,9 +100,9 @@ function Show-Help {
     Write-Host "  setup       Create .env, verify AMD HIP GPU, download Inkling-2-Mini (~21 GB), pack experts.stide"
     Write-Host "  serve       Start OpenAI-compatible server (http://127.0.0.1:8000) + /expert-map"
     Write-Host "  run ...     Generate from the CLI (e.g. .\smalltide.cmd run -p `"Hello`" -n 256)"
-    Write-Host "  probe       Verify AMD HIP runtime DLL, GPU, embedded gfx1201 kernels, and DMA bandwidth"
+    Write-Host "  probe       Verify AMD HIP runtime DLL, GPU, embedded kernels (gfx1201 / gfx1200), and DMA bandwidth"
     Write-Host "  vram-probe  Measure on-card resident VRAM vs Windows system-memory spillover"
-    Write-Host "  bench-gpu   Run gfx1201 kernel verification and GPU microbenchmarks"
+    Write-Host "  bench-gpu   Run GPU kernel verification and GPU microbenchmarks"
     Write-Host "  bench ...   Run bench/bench.py against the running server"
     Write-Host "  pack        Build 4KB-aligned experts.stide from model-00001-of-00001.safetensors"
     Write-Host "  build       Compile smalltide-cli.exe from source (requires Rust + AMD ROCm HIP SDK)"
@@ -148,7 +148,7 @@ try {
             Write-Host "[setup] 1/3 Probing AMD HIP GPU..."
             & $exe probe
             if ($LASTEXITCODE -ne 0) {
-                throw "GPU probe failed. Ensure an AMD Radeon RX 9070 XT and Adrenalin 26.10.44+ driver are installed."
+                throw "GPU probe failed (see the message above). SmallTide needs an AMD Radeon RDNA 4 card (RX 9070 or RX 9060 family) and the Adrenalin 26.10.44+ driver."
             }
 
             $modelDirRel = if ($env:SMALLTIDE_MODEL_DIR) { $env:SMALLTIDE_MODEL_DIR } else { Read-DotEnvValue -EnvPath $envPath -Key "SMALLTIDE_MODEL_DIR" -Default "models/Inkling-2-Mini" }

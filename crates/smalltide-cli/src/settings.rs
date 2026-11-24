@@ -535,6 +535,8 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     engine.anticipate_swaps = parse("SMALLTIDE_ANTICIPATE_SWAPS", 256usize, "a swap count");
     engine.periodic_rebalance_swaps = parse("SMALLTIDE_PERIODIC_REBALANCE_SWAPS", 0usize, "a swap count");
     engine.anticipate_wait = parse::<u8>("SMALLTIDE_ANTICIPATE_WAIT", 0, "0 or 1") != 0;
+    engine.tide.scheduler.cache.swap_hysteresis =
+        parse("SMALLTIDE_SWAP_HYSTERESIS", smalltide_tide::cache::SWAP_HYSTERESIS, "a factor >= 1").max(1.0);
     engine.tide.scheduler.async_hysteresis = parse("SMALLTIDE_ASYNC_HYSTERESIS", 1.10f64, "a factor >= 1");
     let preload_ops = engine.tide.scheduler.plan_pre_prefill(None);
     engine.tide.execute_transfers(&preload_ops, true, false).expect("Mode 1 pre-prefill");

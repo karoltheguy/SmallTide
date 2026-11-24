@@ -148,12 +148,14 @@ pub struct TideCache {
     /// prompt-aware loading); `current_lane` receives the touches.
     lane_demand: Vec<Vec<f32>>,
     current_lane: usize,
+    /// Hysteresis factor for resident swaps (rescue promotion, prefill swaps, post-prefill rebalance).
+    pub swap_hysteresis: f64,
 }
 
 /// Per-token heat decay (half-life ~46 tokens).
 pub const HEAT_DECAY: f32 = 0.985;
-/// Hysteresis: a candidate must beat the coldest resident of its class by this factor.
-pub const SWAP_HYSTERESIS: f64 = 1.10;
+/// Default hysteresis: a candidate must beat the coldest resident of its class by this factor.
+pub const SWAP_HYSTERESIS: f64 = 1.05;
 
 impl TideCache {
     pub fn new(
@@ -202,6 +204,7 @@ impl TideCache {
             prior_heat_equiv: 0.0,
             lane_demand: vec![vec![0.0; total]],
             current_lane: 0,
+            swap_hysteresis: SWAP_HYSTERESIS,
         }
     }
 
@@ -298,9 +301,9 @@ impl TideCache {
     }
 
     /// True if `id` would get a resident slot without evicting anything, or is worth more than the
-    /// coldest evictable resident of its pool by `SWAP_HYSTERESIS`.
+    /// coldest evictable resident of its pool by `self.swap_hysteresis`.
     pub fn worth_promoting(&self, id: ExpertId) -> bool {
-        self.worth_promoting_with(id, SWAP_HYSTERESIS)
+        self.worth_promoting_with(id, self.swap_hysteresis)
     }
 
     /// `worth_promoting` with an explicit hysteresis factor.

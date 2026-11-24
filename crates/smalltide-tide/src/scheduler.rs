@@ -526,7 +526,7 @@ impl TideScheduler {
             let need = self.cache.expert_bytes(id);
             let floor = *floors[ci].get_or_insert_with(|| self.cache.promotion_floor(cls, need));
             if let Some(f) = floor {
-                if val <= f * crate::cache::SWAP_HYSTERESIS + 1e-9 {
+                if val <= f * self.cache.swap_hysteresis + 1e-9 {
                     continue;
                 }
             }
@@ -1595,7 +1595,7 @@ impl TideScheduler {
             let need = self.cache.expert_bytes(id);
             let floor = *floors[ci].get_or_insert_with(|| self.cache.promotion_floor(cls, need));
             if let Some(f) = floor {
-                if val <= f * crate::cache::SWAP_HYSTERESIS + 1e-9 {
+                if val <= f * self.cache.swap_hysteresis + 1e-9 {
                     continue;
                 }
             }

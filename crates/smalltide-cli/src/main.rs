@@ -23,9 +23,63 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+fn extract_env_flag(raw: Vec<String>) -> (Option<std::path::PathBuf>, Vec<String>) {
+    let mut env_path: Option<std::path::PathBuf> = None;
+    let mut out = Vec::with_capacity(raw.len());
+    let mut it = raw.into_iter();
+    if let Some(prog) = it.next() {
+        out.push(prog);
+    }
+    let mut after_dd = false;
+    while let Some(arg) = it.next() {
+        if after_dd {
+            out.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            after_dd = true;
+            out.push(arg);
+            continue;
+        }
+        // Never interpret the prompt value following -p/--prompt as a flag.
+        if arg == "-p" || arg == "--prompt" {
+            out.push(arg);
+            if let Some(v) = it.next() {
+                out.push(v);
+            }
+            continue;
+        }
+        if arg == "--env" || arg == "-e" {
+            let Some(p) = it.next() else {
+                eprintln!("error: {arg} requires a file path");
+                std::process::exit(2);
+            };
+            env_path = Some(std::path::PathBuf::from(p));
+            continue;
+        }
+        if let Some(p) = arg.strip_prefix("--env=") {
+            if p.is_empty() {
+                eprintln!("error: --env= requires a file path");
+                std::process::exit(2);
+            }
+            env_path = Some(std::path::PathBuf::from(p));
+            continue;
+        }
+        out.push(arg);
+    }
+    // Convenience positional form for `serve`: `smalltide-cli serve .env.monitor`
+    if env_path.is_none()
+        && out.get(1).map(String::as_str) == Some("serve")
+        && out.get(2).is_some_and(|a| !a.starts_with('-'))
+    {
+        env_path = Some(std::path::PathBuf::from(out.remove(2)));
+    }
+    (env_path, out)
+}
+
 fn main() {
-    let env_file = settings::load_dotenv();
-    let args: Vec<String> = env::args().collect();
+    let (env_override, args) = extract_env_flag(env::args().collect());
+    let env_file = settings::load_dotenv(env_override.as_deref());
     if matches!(args.get(1).map(String::as_str), Some("run") | Some("serve")) {
         settings::describe_source(&env_file);
     }
@@ -121,10 +175,12 @@ fn main() {
             println!("  pack <in.safetensors> <out.stide>  Pack 3,072 experts into 4KB-aligned .stide store");
             println!("  load-test [model-dir]         Verify real tokenizer + FP8 dense load + Mode 1 Tide pre-prefill on GPU");
             println!("  run -p <prompt> [-n N] [--temp T] [--effort E] [--raw]   Generate once (config: .env)");
-            println!("  serve                         Serve OpenAI API as inkling-2-mini (config: .env)");
+            println!("  serve [env-file]              Serve OpenAI API as inkling-2-mini (default: .env)");
             println!("  vram-probe                    Measure resident vs system-memory-backed VRAM");
-            println!("Configuration: .env in the working directory (or SMALLTIDE_ENV=path); see .env.example.");
             println!("  inspect <file.safetensors>    Inspect tensor names, dtypes, and shapes");
+            println!("Options:");
+            println!("  --env <path>, -e <path>       Load configuration from <path> (overrides .env and SMALLTIDE_ENV)");
+            println!("Configuration: .env in the working directory (or `serve <path>` / `--env <path>` / SMALLTIDE_ENV=path); see .env.example & .env.monitor.example.");
         }
     }
 }
@@ -1985,5 +2041,38 @@ fn run_vision_check(args: &[String]) {
     println!("rows: {} x {hidden}, finite {finite}, rms {rms:.4}", rows * cols);
     if let Some(p) = arg("--out") {
         std::fs::write(p, out.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).expect("out");
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::extract_env_flag;
+    use std::path::PathBuf;
+
+    fn sv(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_env_flag_before_and_after_subcommand() {
+        let (p, a) = extract_env_flag(sv(&["smalltide-cli", "--env", ".env.monitor", "serve"]));
+        assert_eq!(p, Some(PathBuf::from(".env.monitor")));
+        assert_eq!(a, sv(&["smalltide-cli", "serve"]));
+
+        let (p, a) = extract_env_flag(sv(&["smalltide-cli", "serve", "--env=.env.headless"]));
+        assert_eq!(p, Some(PathBuf::from(".env.headless")));
+        assert_eq!(a, sv(&["smalltide-cli", "serve"]));
+
+        let (p, a) = extract_env_flag(sv(&["smalltide-cli", "run", "-e", "my.env", "-p", "--env not-a-flag"]));
+        assert_eq!(p, Some(PathBuf::from("my.env")));
+        assert_eq!(a, sv(&["smalltide-cli", "run", "-p", "--env not-a-flag"]));
+
+        let (p, a) = extract_env_flag(sv(&["smalltide-cli", "serve", ".env.monitor"]));
+        assert_eq!(p, Some(PathBuf::from(".env.monitor")));
+        assert_eq!(a, sv(&["smalltide-cli", "serve"]));
+
+        let (p, a) = extract_env_flag(sv(&["smalltide-cli", "serve", "--unknown"]));
+        assert_eq!(p, None);
+        assert_eq!(a, sv(&["smalltide-cli", "serve", "--unknown"]));
     }
 }

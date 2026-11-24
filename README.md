@@ -78,11 +78,17 @@ The RX 9070 GRE and the Radeon AI PRO R9700 are `gfx1201` as well and load the s
 
 `setup` copies `.env.example` → `.env`, verifies your GPU, its kernels & the HIP driver (`probe`), downloads [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) via built-in `curl.exe` (resumable, ~21 GB; set `$env:HF_TOKEN` only if you want higher Hugging Face rate limits), and packs all 3,072 routed experts into 4 KB-aligned `experts.stide` (~15 s).
 
-3. **Start the server:**
+3. **Start the server** (pick the config matching where your monitor cable is plugged in):
 
 ```powershell
+# Monitor on motherboard / iGPU (headless 9070 XT; uses .env copied from .env.example):
 .\smalltide.cmd serve
+
+# Monitor plugged into the RX 9070 XT (copy .env.monitor.example -> .env, or pass it directly):
+.\smalltide.cmd serve .env.monitor.example
 ```
+
+*(If your monitor is on the RX 9070 XT and you see tile glitches or slow streaming in Edge/Chrome, assign your browser to integrated graphics in Windows Settings — see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard).)*
 
 4. **Use it:**
    - **OpenAI API:** `http://127.0.0.1:8000/v1` (model name: `inkling-2-mini`) — works with Open WebUI, Continue, Cline, OpenCode, and any OpenAI-compatible client.
@@ -203,7 +209,7 @@ Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K 
 
 **Keeping the monitor on the RX 9070 XT (avoiding glitches and interference)**
 
-1. Copy `.env.monitor.example` to `.env` (or launch with `$env:SMALLTIDE_ENV=".env.monitor.example"`). It uses elastic 128K KV starting at 32K (`SMALLTIDE_KV_INITIAL_TOKENS=32768`), `SMALLTIDE_PREFILL_CHUNK=256`, and `SMALLTIDE_ATTN_VTILES=local` to reclaim VRAM for resident experts while leaving headroom for the desktop. (Use `.env.example` when the monitor is on the motherboard.)
+1. Copy `.env.monitor.example` to `.env` (or launch directly with `.\smalltide.cmd serve .env.monitor.example`). It uses elastic 128K KV starting at 32K (`SMALLTIDE_KV_INITIAL_TOKENS=32768`), `SMALLTIDE_PREFILL_CHUNK=256`, and `SMALLTIDE_ATTN_VTILES=local` to reclaim VRAM for resident experts while leaving headroom for the desktop. (Use `.env.example` when the monitor is on the motherboard.)
 2. **Move your browser / chat client to integrated graphics** if your CPU has an iGPU. Running Edge/Chromium on the 9070 XT alongside HIP compute can cause AMD D3D11/MPO speckled tile glitches inside browser windows and lowers decode tok/s because every streamed token repaints on the same GPU:
    - Open **Windows Settings → System → Display → Graphics**.
    - Select your browser or chat app. If it is not in the list, click **Add desktop app** (or **Browse**) and pick its `.exe` — for Microsoft Edge, `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`.

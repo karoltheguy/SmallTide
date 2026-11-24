@@ -19,8 +19,12 @@ use std::time::Instant;
 
 /// Loads `.env` into the process environment (existing variables are kept). Returns the file
 /// that was loaded, if any. Call first thing in `main`.
-pub fn load_dotenv() -> Option<PathBuf> {
-    let path = if let Some(p) = std::env::var_os("SMALLTIDE_ENV") {
+/// When `explicit` is `Some(path)` (from `--env <path>`), exits with an error if the file cannot
+/// be read instead of silently falling back to defaults.
+pub fn load_dotenv(explicit: Option<&std::path::Path>) -> Option<PathBuf> {
+    let path = if let Some(p) = explicit {
+        p.to_path_buf()
+    } else if let Some(p) = std::env::var_os("SMALLTIDE_ENV") {
         PathBuf::from(p)
     } else {
         let cwd_env = PathBuf::from(".env");
@@ -32,7 +36,14 @@ pub fn load_dotenv() -> Option<PathBuf> {
             cwd_env
         }
     };
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if explicit.is_some() => {
+            eprintln!("error: could not read env file {}: {e}", path.display());
+            std::process::exit(2);
+        }
+        Err(_) => return None,
+    };
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {

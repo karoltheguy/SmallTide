@@ -70,15 +70,20 @@ The RX 9070 GRE and the Radeon AI PRO R9700 are `gfx1201` as well and load the s
 ## Quick Start (Pre-built Release — No SDKs Needed)
 
 1. **Download and extract** `smalltide-v0.1.0-windows-x64-gfx1201.zip` from [GitHub Releases](../../releases).
-2. **Run one-time setup** in PowerShell or Command Prompt inside the extracted folder:
+2. **Choose your display setup (monitor on the card vs. motherboard / iGPU):** this is the main decision that determines how much of the 16 GB card the model gets and which config you use:
+   - **Monitor on the motherboard / CPU iGPU (recommended for best speed):** plug your monitor into the motherboard's video output and reboot. The RX 9070 XT then holds nothing but the model (~2,100 of 3,072 experts resident, ~97% routing weight, zero desktop interference). The numbers in [Measured Performance](#measured-performance-rx-9070-xt-16-gb-windows-11) were taken this way. Use **`.env.headless`** (`SMALLTIDE_RAM_GB=10`).
+   - **Monitor plugged into the RX 9070 XT:** Windows and desktop apps hold 3 to 5 GB of VRAM (~1,750 experts resident, ~90% routing weight). Use **`.env.monitor`**, and assign your browser / chat client to integrated graphics in Windows Settings to avoid Edge/Chrome tile glitches and streaming interference.
+   - Full comparison and setup steps: [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard).
+
+3. **Run one-time setup** in PowerShell or Command Prompt inside the extracted folder:
 
 ```powershell
 .\smalltide.cmd setup
 ```
 
-`setup` copies `.env.headless.example` → `.env.headless` (and `.env`), `.env.monitor.example` → `.env.monitor`, verifies your GPU, its kernels & the HIP driver (`probe`), downloads [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) via built-in `curl.exe` (resumable, ~21 GB; set `$env:HF_TOKEN` only if you want higher Hugging Face rate limits), and packs all 3,072 routed experts into 4 KB-aligned `experts.stide` (~15 s).
+`setup` creates `.env.headless`, `.env.monitor`, and `.env` from the `.example` templates, verifies your GPU, its kernels & the HIP driver (`probe`), downloads [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) via built-in `curl.exe` (resumable, ~21 GB; set `$env:HF_TOKEN` only if you want higher Hugging Face rate limits), and packs all 3,072 routed experts into 4 KB-aligned `experts.stide` (~15 s).
 
-3. **Create your local config (if not created by `setup`) and start the server** — do not edit or run `.example` files directly; copy the one matching where your monitor cable is plugged in:
+4. **Start the server** with the config matching your display setup (do not edit or run `.example` files directly — copy them first if not created by `setup`):
 
 ```powershell
 # Monitor plugged into the RX 9070 XT:
@@ -90,9 +95,7 @@ copy .env.headless.example .env.headless
 .\smalltide.cmd serve .env.headless
 ```
 
-*(If your monitor is on the RX 9070 XT and you see tile glitches or slow streaming in Edge/Chrome, assign your browser to integrated graphics in Windows Settings — see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard).)*
-
-4. **Use it:**
+5. **Use it:**
    - **OpenAI API:** `http://127.0.0.1:8000/v1` (model name: `inkling-2-mini`) — works with Open WebUI, Continue, Cline, OpenCode, and any OpenAI-compatible client.
    - **Live Expert Map:** open **`http://127.0.0.1:8000/expert-map`** in your browser to watch routed experts, VRAM residency, inline rescues, and async promotions live.
    - **One-shot CLI test:**
@@ -100,8 +103,6 @@ copy .env.headless.example .env.headless
 ```powershell
 .\smalltide.cmd run -p "Write a concise explanation of speculative decoding." -n 256
 ```
-
-5. **Optional: move the monitor cable to the motherboard for more resident experts.** With the monitor plugged into the RX 9070 XT, the desktop holds 3 to 5 GB of the card. If your CPU has integrated graphics, plug the monitor into the motherboard's video output instead and reboot: the card then holds nothing but the model, and about 2,100 of the 3,072 experts stay resident instead of about 1,750 (about 97% of the routing weight instead of about 90%). The numbers in [Measured Performance](#measured-performance-rx-9070-xt-16-gb-windows-11) were taken this way. Set `SMALLTIDE_RAM_GB=10` in `.env` for this setup; the details are in [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard). SmallTide works either way.
 
 *(`smalltide.cmd` invokes `smalltide.ps1` with `-ExecutionPolicy Bypass`, so it works out of the box on stock Windows 11 without changing PowerShell execution policies.)*
 

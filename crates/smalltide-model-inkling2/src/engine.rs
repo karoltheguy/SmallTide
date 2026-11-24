@@ -1283,6 +1283,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 release_flag(&*self.backend, il);
                 continue;
             }
+            // A rescue's copy is taking far longer than it should (see `TideExecutor::copy_stalled`):
+            // no rescue until it has landed, the GPU must not wait behind it.
+            if self.tide.copy_stalled() {
+                self.layer_deferred[il] = true;
+                release_flag(&*self.backend, il);
+                continue;
+            }
             let tw = Instant::now();
             if trace {
                 eprintln!("[rescue-trace]   layer {il}: waiting for routing row");
@@ -1652,6 +1659,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let (phys_chk, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
             if self.tide.scheduler.rescue_budget_spent_for_layer(phys_chk, m) {
                 self.tide.scheduler.note_zone_budget_capped_layer(phys_chk);
+                release_flag(&*self.backend, il);
+                continue;
+            }
+            if self.tide.copy_stalled() {
                 release_flag(&*self.backend, il);
                 continue;
             }

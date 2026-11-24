@@ -7,10 +7,13 @@
 //! interleave title / tag / autocomplete requests with the conversation's turns).
 //!
 //! Snapshots are taken at (a) the first user-message boundary of a prompt (shared system /
-//! tool-declaration prefix across conversations) and (b) one token before every prompt end: the
+//! tool-declaration prefix across conversations), (b) one token before every prompt end: the
 //! last prompt token is always re-processed for fresh logits, so this serves exact repeats
 //! (regenerate) as well as follow-up turns whose re-templated history diverges after the
-//! previous prompt (e.g. when the client drops `reasoning_content`).
+//! previous prompt (e.g. when the client drops `reasoning_content`), and (c) the start of the
+//! prompt's last user message (the turn's anchor): a client that rewrites what follows it between
+//! the requests of one turn (a replaced screenshot, an edited or dropped reply) then costs that
+//! turn's tokens, not the whole conversation.
 //!
 //! Eviction: least recently used, bounded by a snapshot count and a total token budget (each
 //! snapshot's host size is a fixed part for the rings plus a per-token part for the global KV).
@@ -42,12 +45,21 @@ pub struct PrefixStats {
     pub evictions: u64,
 }
 
+/// Where in a prompt a snapshot was taken; decides how long it is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapKind {
+    /// One token before a prompt's end.
+    Turn,
+    /// The start of a prompt's last user message.
+    Anchor,
+    /// The first user-message boundary (system / tool prompt before it): evicted last.
+    Shared,
+}
+
 struct Snap<S> {
     tokens: Vec<u32>,
     tick: u64,
-    /// Taken at a shared-prefix point (system / tool prompt before the first user message):
-    /// evicted last.
-    shared: bool,
+    kind: SnapKind,
     payload: S,
     /// Routing demand of the request that produced this snapshot (prompt + answer): expected
     /// routing of the conversation's next turn (prompt-aware expert loading).
@@ -176,18 +188,20 @@ impl<S> PrefixCache<S> {
 
     /// Eviction order: per-turn snapshots that a longer snapshot already extends (superseded by
     /// the same conversation's later turn), then other per-turn snapshots, then shared prefixes;
-    /// least recently used first within a class.
+    /// least recently used first within a class. A turn's anchor is superseded only by a later
+    /// anchor: the prompt-end snapshots that extend it are the ones a rewritten turn cannot use.
     fn eviction_victim(&self) -> usize {
         let class = |i: usize| -> u8 {
             let sn = &self.snaps[i];
-            if sn.shared {
+            if sn.kind == SnapKind::Shared {
                 return 2;
             }
-            let superseded = self
-                .snaps
-                .iter()
-                .enumerate()
-                .any(|(j, o)| j != i && o.tokens.len() > sn.tokens.len() && o.tokens.starts_with(&sn.tokens));
+            let superseded = self.snaps.iter().enumerate().any(|(j, o)| {
+                j != i
+                    && o.tokens.len() > sn.tokens.len()
+                    && o.tokens.starts_with(&sn.tokens)
+                    && (sn.kind == SnapKind::Turn || o.kind == SnapKind::Anchor)
+            });
             if superseded { 0 } else { 1 }
         };
         (0..self.snaps.len()).min_by_key(|&i| (class(i), self.snaps[i].tick)).unwrap()
@@ -244,18 +258,36 @@ impl<S> PrefixCache<S> {
     }
 
     /// `insert`; `shared`: a shared-prefix point (evicted last).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert_kind(&mut self, lane: usize, pos: usize, payload: S, shared: bool) {
+        self.insert_as(lane, pos, payload, if shared { SnapKind::Shared } else { SnapKind::Turn })
+    }
+
+    /// `insert` of a snapshot taken at a `kind` point. A snapshot of the same tokens is replaced
+    /// and keeps the longer-lived of the two kinds.
+    pub fn insert_as(&mut self, lane: usize, pos: usize, payload: S, kind: SnapKind) {
         debug_assert!(pos <= self.live[lane].len());
         self.tick += 1;
         self.stats.snapshots_taken += 1;
         let tokens = self.live[lane][..pos].to_vec();
+        let rank = |k: SnapKind| match k {
+            SnapKind::Turn => 0,
+            SnapKind::Anchor => 1,
+            SnapKind::Shared => 2,
+        };
         if let Some(i) = self.snaps.iter().position(|s| s.tokens == tokens) {
-            let shared = shared || self.snaps[i].shared;
-            let old = std::mem::replace(&mut self.snaps[i], Snap { tokens, tick: self.tick, shared, payload, demand: None });
+            let kind = if rank(self.snaps[i].kind) > rank(kind) { self.snaps[i].kind } else { kind };
+            let old = std::mem::replace(&mut self.snaps[i], Snap { tokens, tick: self.tick, kind, payload, demand: None });
             self.pool.push(old.payload);
             return;
         }
-        self.snaps.push(Snap { tokens, tick: self.tick, shared, payload, demand: None });
+        self.snaps.push(Snap { tokens, tick: self.tick, kind, payload, demand: None });
+    }
+
+    /// How many leading tokens of `new` some lane's live sequence shares (where a prompt first
+    /// differs from what the engine last held; for the log).
+    pub fn longest_live_match(&self, new: &[u32]) -> usize {
+        self.live.iter().map(|l| common_prefix(l, new)).max().unwrap_or(0)
     }
 
     /// Attaches `demand` to the snapshot of exactly `prefix` (if any).
@@ -366,6 +398,59 @@ mod tests {
             PrefixPlan::Restore { pos, .. } => assert_eq!(pos, 10),
             p => panic!("expected a restore of the shared prefix, got {p:?}"),
         }
+    }
+
+    #[test]
+    fn a_rewritten_turn_restores_its_anchor() {
+        // An agent turn: history (0..100), the turn's user message at 100, then tool rounds.
+        // The client replaces something right after the user message in every round (a
+        // screenshot), so each prompt differs from the previous one from token 101 on.
+        let mut pc: PrefixCache<u32> = PrefixCache::new(1, 4, 1000);
+        let hist: Vec<u32> = (0..100).collect();
+        let round = |r: u32, extra: usize| -> Vec<u32> {
+            let mut p = hist.clone();
+            p.push(7_000); // the user message's first token (the same every round)
+            p.extend((0..40 + extra as u32).map(|i| 10_000 * (r + 1) + i)); // rewritten every round
+            p
+        };
+        let mut payload = 0u32;
+        let mut serve = |pc: &mut PrefixCache<u32>, p: &[u32]| -> PrefixPlan {
+            let plan = pc.plan(0, p);
+            let pos = PrefixCache::<u32>::plan_reuse(&plan);
+            pc.rewound_to(0, &plan, pos);
+            pc.touch_prefixes(p);
+            // The server's snapshot points: the anchor (start of the last user message) and one
+            // token before the end, each as the prefill passes it.
+            for (at, kind) in [(100usize, SnapKind::Anchor), (p.len() - 1, SnapKind::Turn)] {
+                let have = pc.live[0].len();
+                pc.live[0].extend_from_slice(&p[have..at.max(have)]);
+                if at > pos && !pc.has_snapshot_of(&p[..at]) {
+                    payload += 1;
+                    let s = pc.take_payload(at).unwrap_or(payload);
+                    pc.insert_as(0, at, s, kind);
+                }
+            }
+            let have = pc.live[0].len();
+            pc.live[0].extend_from_slice(&p[have..]);
+            plan
+        };
+        assert_eq!(serve(&mut pc, &round(0, 0)), PrefixPlan::Reset);
+        // Every later round resumes at the anchor, however many prompt-end snapshots came and
+        // went (budget: 1000 tokens, 4 snapshots; each round's end snapshot is about 140).
+        for r in 1..12u32 {
+            let plan = serve(&mut pc, &round(r, r as usize));
+            assert_eq!(plan, PrefixPlan::Restore { snap_idx: pc.snaps.iter().position(|s| s.tokens.len() == 100).unwrap(), pos: 100, global: false }, "round {r}");
+        }
+        assert!(pc.snapshot_positions().contains(&100));
+        // The next user turn's anchor supersedes this one: it may go first.
+        let mut next = round(11, 11);
+        next.push(7_000);
+        next.extend(20_000..20_010);
+        pc.live[0] = next.clone();
+        let s = pc.take_payload(next.len() - 11).unwrap_or(99);
+        pc.insert_as(0, next.len() - 11, s, SnapKind::Anchor);
+        let old_anchor = pc.snaps.iter().position(|s| s.tokens.len() == 100).unwrap();
+        assert_eq!(pc.eviction_victim(), old_anchor);
     }
 
     #[test]

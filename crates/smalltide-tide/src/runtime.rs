@@ -108,6 +108,15 @@ pub struct TideExecutor<B: ComputeBackend> {
     /// Async promotion batches whose DMA may still be in flight (copy-stream order).
     pending_batches: VecDeque<(Event, Vec<(ExpertId, SlotIndex)>)>,
     free_events: Vec<Event>,
+    /// Longest an inline rescue keeps the GPU inside its wait kernel for the copy to land
+    /// (`SMALLTIDE_RESCUE_HOLD_MS`, default 250). Windows resets a GPU whose engine does not
+    /// answer for about 2 s (hipError_t=719), and a copy to VRAM has been seen to take 2.6 s.
+    rescue_hold_limit: std::time::Duration,
+    /// A rescue's copy outlived the hold limit and has not landed yet (since when; the event is
+    /// recorded behind it on the copy stream). Inline rescues pause until it lands.
+    copy_stall: Option<(std::time::Instant, Event)>,
+    /// Rescues whose copy outlived the hold limit, since start.
+    pub rescue_hold_timeouts: u64,
 
     pub compute_stream: Stream,
     pub copy_stream: Stream,
@@ -217,6 +226,11 @@ impl<B: ComputeBackend> TideExecutor<B> {
             stage2_worker,
             pending_batches: VecDeque::new(),
             free_events: Vec::new(),
+            rescue_hold_limit: std::time::Duration::from_millis(
+                std::env::var("SMALLTIDE_RESCUE_HOLD_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(250),
+            ),
+            copy_stall: None,
+            rescue_hold_timeouts: 0,
             compute_stream,
             copy_stream,
             dma_event,
@@ -639,13 +653,63 @@ impl<B: ComputeBackend> TideExecutor<B> {
     pub fn execute_rescue_now(&mut self, ops: &[TransferOp]) -> Result<Vec<(usize, u32)>> {
         self.allocate_pools()?;
         let t0 = std::time::Instant::now();
-        let _ = self.issue_ops(ops, false)?;
+        let batch = self.issue_ops(ops, false)?;
         let t1 = std::time::Instant::now();
-        // The copy stream is in order: once it is idle, every slab DMA has landed in VRAM.
-        self.backend.sync_stream(self.copy_stream).map_err(|e| SmallTideError::Backend {
-            backend: "tide",
-            message: format!("execute_rescue_now sync copy_stream ({} ops): {e}", ops.len()),
-        })?;
+        // The copy stream is in order: once an event recorded behind the copies is complete,
+        // every slab DMA has landed in VRAM. The GPU sits in this layer's wait kernel meanwhile,
+        // so the wait is bounded (see `rescue_hold_limit`).
+        let ev = match self.free_events.pop() {
+            Some(e) => e,
+            None => self.backend.create_event()?,
+        };
+        self.backend.record_event(ev, self.copy_stream)?;
+        let deadline = t1 + self.rescue_hold_limit;
+        let landed = loop {
+            let done = self.backend.query_event(ev).map_err(|e| SmallTideError::Backend {
+                backend: "tide",
+                message: format!("execute_rescue_now wait for copy_stream ({} ops): {e}", ops.len()),
+            })?;
+            if done {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::hint::spin_loop();
+        };
+        if !landed {
+            // The copy is still on its way. Nothing of it is published: the experts stay pending
+            // (`poll_pending` publishes them once the copy has landed) and this step skips them.
+            // The returned table changes unmap what the copies overwrite, so no kernel reads a
+            // slot that is being written. Inline rescues pause until the copy stream is clear.
+            self.rescue_hold_timeouts += 1;
+            if !batch.is_empty() {
+                self.pending_batches.push_back((ev, batch));
+            } else {
+                self.free_events.push(ev);
+            }
+            let stall_ev = match self.copy_stall.take() {
+                Some((_, e)) => e,
+                None => match self.free_events.pop() {
+                    Some(e) => e,
+                    None => self.backend.create_event()?,
+                },
+            };
+            self.backend.record_event(stall_ev, self.copy_stream)?;
+            self.copy_stall = Some((t1, stall_ev));
+            if self.rescue_hold_timeouts <= 5 || self.rescue_hold_timeouts % 100 == 0 {
+                eprintln!(
+                    "[rescue] a copy of {} expert(s) to VRAM did not land within {} ms: the GPU wait was released and \
+                     those experts are skipped for this step; inline rescues pause until the copy lands ({} such stalls since start)",
+                    ops.len(),
+                    self.rescue_hold_limit.as_millis(),
+                    self.rescue_hold_timeouts
+                );
+            }
+            self.last_rescue_ms = ((t1 - t0).as_secs_f64() * 1000.0, t1.elapsed().as_secs_f64() * 1000.0);
+            return Ok(self.scheduler.cache.take_dirty_gpu_updates());
+        }
+        self.free_events.push(ev);
         self.uploads_synced = self.uploads_issued;
         self.rescue_stats.0 += 1;
         self.rescue_stats.1 += (t1 - t0).as_secs_f64() * 1000.0;
@@ -662,6 +726,49 @@ impl<B: ComputeBackend> TideExecutor<B> {
         }
         self.scheduler.cache.publish_all_pending();
         Ok(self.scheduler.cache.take_dirty_gpu_updates())
+    }
+
+    /// True when an inline rescue must not start now: a rescue's copy that outlived the hold limit
+    /// is still on its way, or the staging buffer is full and cannot be reused yet. The engine
+    /// then skips the layer's rescues (as when a block's budget is spent) instead of making the
+    /// GPU wait behind copies with no time limit.
+    pub fn copy_stalled(&mut self) -> bool {
+        if let Some((since, ev)) = self.copy_stall {
+            match self.backend.query_event(ev) {
+                Ok(true) => {
+                    if self.rescue_hold_timeouts <= 5 || self.rescue_hold_timeouts % 100 == 0 {
+                        eprintln!("[rescue] the stalled copy landed after {:.0} ms; inline rescues resume", since.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    self.copy_stall = None;
+                    self.free_events.push(ev);
+                }
+                // An error here is the GPU context's: the next GPU call reports it.
+                _ => return true,
+            }
+        }
+        // The staging buffer must hold this layer's copies without wrapping: a wrap waits for
+        // every copy still reading the buffer, with no time limit, and the GPU would be waiting
+        // behind it (this lost the GPU context once the 250 ms limit above was in place). So wrap
+        // here, before anything is planned, and only if the copy stream is idle.
+        let need = (DEFAULT_SCRATCH_RING_SLOTS * self.nvfp4_layout.aligned_slab_bytes.max(self.mxfp8_layout.aligned_slab_bytes))
+            .min(self.pinned_staging.size_bytes);
+        if self.staging_cursor + need > self.pinned_staging.size_bytes {
+            if self.backend.record_event(self.kick_event, self.copy_stream).is_err() {
+                return true;
+            }
+            // Normally idle (every rescue waits for its copies); 2 ms covers the event's own latency.
+            let t = std::time::Instant::now();
+            loop {
+                match self.backend.query_event(self.kick_event) {
+                    Ok(true) => break,
+                    Ok(false) if t.elapsed() < std::time::Duration::from_millis(2) => std::hint::spin_loop(),
+                    _ => return true,
+                }
+            }
+            self.staging_cursor = 0;
+            self.uploads_synced = self.uploads_issued;
+        }
+        false
     }
 
     /// Frees the Scratch Rescue Ring for direct use (unmaps occupants on the compute stream).

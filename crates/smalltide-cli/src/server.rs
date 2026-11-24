@@ -1247,17 +1247,25 @@ fn admit(
             return None;
         }
     };
+    // Where the prompt first differs from what a lane last held: when that is well past the
+    // reused prefix, the client rewrote earlier history and the tokens between were read again.
+    let live_match = pc.longest_live_match(&prompt_ids);
     pc.rewound_to(lane, &plan, reuse_len);
     pc.touch_prefixes(&prompt_ids);
     eprintln!(
-        "[prefix] lane {lane}: {} - reused {reuse_len} of {} prompt tokens",
+        "[prefix] lane {lane}: {} - reused {reuse_len} of {} prompt tokens{}",
         match &plan {
             PrefixPlan::Extend { .. } => "same conversation",
             PrefixPlan::Restore { global: true, .. } => "restored a snapshot from another conversation",
             PrefixPlan::Restore { .. } => "restored a snapshot",
             PrefixPlan::Reset => "no cached prefix",
         },
-        prompt_ids.len()
+        prompt_ids.len(),
+        if live_match > reuse_len + 256 && live_match + 1 < prompt_ids.len() {
+            format!(" (the prompt matches the previous one up to token {live_match}; no snapshot there)")
+        } else {
+            String::new()
+        }
     );
 
     // Images the prefill reaches (not wholly inside the reused prefix): the vision tower's rows
@@ -1303,6 +1311,14 @@ fn admit(
             points.push(bd);
         }
     }
+    // The turn's anchor: the start of the last user message. A client that rewrites what follows
+    // it between the requests of one turn (a replaced screenshot, an edited reply) resumes here.
+    let anchor_point = prompt_ids.iter().rposition(|&t| t == TOK_MESSAGE_USER).filter(|&bd| Some(bd) != shared_point);
+    if let Some(bd) = anchor_point {
+        if bd > reuse_len && bd >= 16 {
+            points.push(bd);
+        }
+    }
     if end >= 2 && end - 1 > reuse_len {
         points.push(end - 1);
     }
@@ -1321,7 +1337,14 @@ fn admit(
             let _ = engine.free_snapshots(pc.drain_pool());
             match engine.snapshot_state_opt(a, &mut slot, drafter_coherent) {
                 Ok(()) => {
-                    pc.insert_kind(lane, a, slot.unwrap(), Some(a) == shared_point);
+                    let kind = if Some(a) == shared_point {
+                        crate::prefix_cache::SnapKind::Shared
+                    } else if Some(a) == anchor_point {
+                        crate::prefix_cache::SnapKind::Anchor
+                    } else {
+                        crate::prefix_cache::SnapKind::Turn
+                    };
+                    pc.insert_as(lane, a, slot.unwrap(), kind);
                     let _ = engine.free_snapshots(pc.drain_pool());
                 }
                 Err(e) => {

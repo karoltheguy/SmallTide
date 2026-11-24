@@ -83,6 +83,9 @@ pub struct TideExecutor<B: ComputeBackend> {
     /// Bounded page-locked DMA staging ring (read only by the copy stream).
     pinned_staging: PinnedBuf,
     staging_cursor: usize,
+    /// True when at least one DMA from `pinned_staging` on `copy_stream` has not yet been
+    /// observed complete; false means `staging_cursor` can wrap to 0 without syncing `copy_stream`.
+    staging_sync_needed: bool,
 
     /// Ring of dedicated pinned buffers for compute-stream slot-table uploads.
     table_ring: Vec<TableUploadBuf>,
@@ -127,9 +130,9 @@ pub struct TideExecutor<B: ComputeBackend> {
     /// (`SMALLTIDE_RESCUE_HOLD_MS`, default 250). Windows resets a GPU whose engine does not
     /// answer for about 2 s (hipError_t=719), and a copy to VRAM has been seen to take 2.6 s.
     rescue_hold_limit: std::time::Duration,
-    /// A rescue's copy outlived the hold limit and has not landed yet (since when; the event is
-    /// recorded behind it on the copy stream). Inline rescues pause until it lands.
-    copy_stall: Option<(std::time::Instant, Event)>,
+    /// A copy on `copy_stream` did not finish within its wait limit (since when, event recorded
+    /// behind it, whether to log recovery). Inline rescues pause until it lands.
+    copy_stall: Option<(std::time::Instant, Event, bool)>,
     /// Rescues whose copy outlived the hold limit, since start.
     pub rescue_hold_timeouts: u64,
 
@@ -218,6 +221,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             gpu_slot_table,
             pinned_staging,
             staging_cursor: 0,
+            staging_sync_needed: false,
             table_ring,
             table_ring_cursor: 0,
             ram_slabs: HashMap::new(),
@@ -440,6 +444,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             }
             Ok(())
         } else {
+            self.staging_sync_needed = true;
             self.backend.memcpy_h2d_async(dst_pool, dst_off, self.pinned_staging, src_offset, len, self.copy_stream)
         }
     }
@@ -655,6 +660,41 @@ impl<B: ComputeBackend> TideExecutor<B> {
         Ok(batch)
     }
 
+    /// Polls `ev` until it completes or `limit` elapses, without hammering `hipEventQuery` (which
+    /// acquires HIP/WDDM driver locks and flushes queues on Windows). Issues one immediate query
+    /// to kick/check the queue, then backs off to ~30 us local spin intervals (250 us + yield
+    /// once stalled past 2 ms).
+    fn poll_event_throttled(&self, ev: Event, limit: std::time::Duration) -> Result<bool> {
+        if self.backend.query_event(ev)? {
+            return Ok(true);
+        }
+        let start = std::time::Instant::now();
+        let deadline = start + limit;
+        let fast_phase = std::time::Duration::from_millis(2);
+        let fast_step = std::time::Duration::from_micros(30);
+        let slow_step = std::time::Duration::from_micros(250);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let slow = now.saturating_duration_since(start) >= fast_phase;
+            let step = if slow { slow_step } else { fast_step };
+            let next_poll = (now + step).min(deadline);
+            if slow {
+                std::thread::yield_now();
+            }
+            while std::time::Instant::now() < next_poll {
+                for _ in 0..64 {
+                    std::hint::spin_loop();
+                }
+            }
+            if self.backend.query_event(ev)? {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Synchronous rescue while the compute stream is parked at a GPU-side wait right before the
     /// layer that needs it (every earlier kernel finished, no later one started): copies the slab(s)
     /// on the copy stream, waits for the copy stream, publishes pending entries in the host table
@@ -674,20 +714,10 @@ impl<B: ComputeBackend> TideExecutor<B> {
             None => self.backend.create_event()?,
         };
         self.backend.record_event(ev, self.copy_stream)?;
-        let deadline = t1 + self.rescue_hold_limit;
-        let landed = loop {
-            let done = self.backend.query_event(ev).map_err(|e| SmallTideError::Backend {
-                backend: "tide",
-                message: format!("execute_rescue_now wait for copy_stream ({} ops): {e}", ops.len()),
-            })?;
-            if done {
-                break true;
-            }
-            if std::time::Instant::now() >= deadline {
-                break false;
-            }
-            std::hint::spin_loop();
-        };
+        let landed = self.poll_event_throttled(ev, self.rescue_hold_limit).map_err(|e| SmallTideError::Backend {
+            backend: "tide",
+            message: format!("execute_rescue_now wait for copy_stream ({} ops): {e}", ops.len()),
+        })?;
         if !landed {
             // The copy is still on its way. Nothing of it is published: the experts stay pending
             // (`poll_pending` publishes them once the copy has landed) and this step skips them.
@@ -700,14 +730,14 @@ impl<B: ComputeBackend> TideExecutor<B> {
                 self.free_events.push(ev);
             }
             let stall_ev = match self.copy_stall.take() {
-                Some((_, e)) => e,
+                Some((_, e, _)) => e,
                 None => match self.free_events.pop() {
                     Some(e) => e,
                     None => self.backend.create_event()?,
                 },
             };
             self.backend.record_event(stall_ev, self.copy_stream)?;
-            self.copy_stall = Some((t1, stall_ev));
+            self.copy_stall = Some((t1, stall_ev, true));
             if self.rescue_hold_timeouts <= 5 || self.rescue_hold_timeouts % 100 == 0 {
                 eprintln!(
                     "[rescue] a copy of {} expert(s) to VRAM did not land within {} ms: the GPU wait was released and \
@@ -721,6 +751,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             return Ok(self.scheduler.cache.take_dirty_gpu_updates());
         }
         self.free_events.push(ev);
+        self.staging_sync_needed = false;
         self.uploads_synced = self.uploads_issued;
         self.rescue_stats.0 += 1;
         self.rescue_stats.1 += (t1 - t0).as_secs_f64() * 1000.0;
@@ -744,14 +775,16 @@ impl<B: ComputeBackend> TideExecutor<B> {
     /// then skips the layer's rescues (as when a block's budget is spent) instead of making the
     /// GPU wait behind copies with no time limit.
     pub fn copy_stalled(&mut self) -> bool {
-        if let Some((since, ev)) = self.copy_stall {
+        if let Some((since, ev, log_recovery)) = self.copy_stall {
             match self.backend.query_event(ev) {
                 Ok(true) => {
-                    if self.rescue_hold_timeouts <= 5 || self.rescue_hold_timeouts % 100 == 0 {
+                    if log_recovery && (self.rescue_hold_timeouts <= 5 || self.rescue_hold_timeouts % 100 == 0) {
                         eprintln!("[rescue] the stalled copy landed after {:.0} ms; inline rescues resume", since.elapsed().as_secs_f64() * 1000.0);
                     }
                     self.copy_stall = None;
                     self.free_events.push(ev);
+                    self.staging_sync_needed = false;
+                    self.uploads_synced = self.uploads_issued;
                 }
                 // An error here is the GPU context's: the next GPU call reports it.
                 _ => return true,
@@ -764,20 +797,37 @@ impl<B: ComputeBackend> TideExecutor<B> {
         let need = (DEFAULT_SCRATCH_RING_SLOTS * self.nvfp4_layout.aligned_slab_bytes.max(self.mxfp8_layout.aligned_slab_bytes))
             .min(self.pinned_staging.size_bytes);
         if self.staging_cursor + need > self.pinned_staging.size_bytes {
-            if self.backend.record_event(self.kick_event, self.copy_stream).is_err() {
-                return true;
-            }
-            // Normally idle (every rescue waits for its copies); 2 ms covers the event's own latency.
-            let t = std::time::Instant::now();
-            loop {
-                match self.backend.query_event(self.kick_event) {
-                    Ok(true) => break,
-                    Ok(false) if t.elapsed() < std::time::Duration::from_millis(2) => std::hint::spin_loop(),
-                    _ => return true,
+            if self.staging_sync_needed {
+                let ev = match self.free_events.pop() {
+                    Some(e) => e,
+                    None => match self.backend.create_event() {
+                        Ok(e) => e,
+                        Err(_) => return true,
+                    },
+                };
+                if self.backend.record_event(ev, self.copy_stream).is_err() {
+                    self.free_events.push(ev);
+                    return true;
+                }
+                match self.poll_event_throttled(ev, std::time::Duration::from_millis(2)) {
+                    Ok(true) => {
+                        self.free_events.push(ev);
+                        self.staging_sync_needed = false;
+                        self.uploads_synced = self.uploads_issued;
+                    }
+                    Ok(false) => {
+                        // Record the stall event so subsequent layers in this pass return immediately
+                        // via one non-blocking query_event instead of burning another 2 ms each.
+                        self.copy_stall = Some((std::time::Instant::now(), ev, false));
+                        return true;
+                    }
+                    Err(_) => {
+                        self.free_events.push(ev);
+                        return true;
+                    }
                 }
             }
             self.staging_cursor = 0;
-            self.uploads_synced = self.uploads_issued;
         }
         false
     }
@@ -1027,13 +1077,17 @@ impl<B: ComputeBackend> TideExecutor<B> {
 
     fn reserve_staging(&mut self, len: usize) -> Result<usize> {
         if self.staging_cursor + len > self.pinned_staging.size_bytes {
-            self.backend.sync_stream(self.copy_stream).map_err(|e| SmallTideError::Backend {
-                backend: "tide",
-                message: format!(
-                    "reserve_staging wrap sync copy_stream (cursor={}, len={}, cap={}): {e}",
-                    self.staging_cursor, len, self.pinned_staging.size_bytes
-                ),
-            })?;
+            if self.staging_sync_needed {
+                self.backend.sync_stream(self.copy_stream).map_err(|e| SmallTideError::Backend {
+                    backend: "tide",
+                    message: format!(
+                        "reserve_staging wrap sync copy_stream (cursor={}, len={}, cap={}): {e}",
+                        self.staging_cursor, len, self.pinned_staging.size_bytes
+                    ),
+                })?;
+                self.staging_sync_needed = false;
+                self.uploads_synced = self.uploads_issued;
+            }
             self.staging_cursor = 0;
         }
         let off = self.staging_cursor;
@@ -1097,6 +1151,10 @@ impl<B: ComputeBackend> Drop for TideExecutor<B> {
             let _ = self.backend.destroy_event(t.done);
             let _ = self.backend.free_pinned(t.pinned);
         }
+        if let Some((_, ev, _)) = self.copy_stall.take() {
+            let _ = self.backend.destroy_event(ev);
+        }
+        let _ = self.backend.destroy_event(self.kick_event);
         let _ = self.backend.destroy_event(self.compute_fence);
         let _ = self.backend.destroy_event(self.dma_event);
         let _ = self.backend.destroy_stream(self.copy_stream);

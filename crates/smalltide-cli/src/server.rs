@@ -1198,15 +1198,20 @@ fn engine_worker_loop(
                                     done = true;
                                 }
                                 Ok((c, next_tok)) => {
+                                    // Read back batch_route_log BEFORE verify_rewind queues drafter_ingest +
+                                    // sconv_rewind: compute_stream is already idle from verify_sample, so
+                                    // post_batch_tide_step avoids waiting behind drafter_ingest/sconv_rewind,
+                                    // and those kernels overlap token streaming and chain into draft_with_margins.
+                                    engine.commit_batch_rows(c + 1);
+                                    if let Err(e) = engine.post_batch_tide_step() {
+                                        let _ = engine_error("post verify tide step", &e.to_string());
+                                    }
                                     if let Err(e) = engine.verify_rewind(spec_width, c + 1) {
                                         let _ = req.event_tx.send(StreamEvent::Error(engine_error("verify rewind error", &e.to_string())));
                                         pc.invalidate(l);
                                         drafter_pos[l] = None;
                                         done = true;
                                     } else {
-                                        if let Err(e) = engine.post_batch_tide_step() {
-                                            let _ = engine_error("post verify tide step", &e.to_string());
-                                        }
                                         let dt_v = tv.elapsed().as_secs_f64() * 1000.0;
                                         req.t_steps = (req.t_steps.0 + 1, req.t_steps.1 + dt_d, req.t_steps.2 + dt_v);
                                         spec_vbase_ema = 0.85 * spec_vbase_ema + 0.15 * (dt_v - 2.3 * n as f64).clamp(10.0, 30.0);
@@ -1259,10 +1264,10 @@ fn engine_worker_loop(
                 pc.invalidate(l);
                 done = true;
             } else {
-                let _ = engine.post_decode_tide_step();
                 pc.live[l].push(req.next_tok);
                 req.pos += 1;
                 let sampled = engine.sample_next_token(&req.sampling, &req.generated);
+                let _ = engine.post_decode_tide_step();
                 req.t_single = (req.t_single.0 + 1, req.t_single.1 + t_one.elapsed().as_secs_f64() * 1000.0);
                 match sampled {
                     Ok(t) => {
@@ -1463,7 +1468,13 @@ fn admit(
     if new_pf_toks > 0 {
         *last_prefill_tok_s = new_pf_toks as f64 / pf_secs.max(1e-6);
     }
-    let _ = engine.rebalance_after_prefill(128);
+    let reb_swaps: usize = std::env::var("SMALLTIDE_REBALANCE_SWAPS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(128);
+    if reb_swaps > 0 {
+        let _ = engine.rebalance_after_prefill(reb_swaps);
+    }
 
     let next_tok = match engine.sample_next_token(&sampling, &[]) {
         Ok(t) => t,

@@ -413,7 +413,7 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     let mut tide_cfg = TideConfig::default();
     tide_cfg.pinned_staging_mib = 256;
     tide_cfg.rescue_policy = s.rescue_policy;
-    tide_cfg.max_async_vram_promotions_per_token = parse("SMALLTIDE_ASYNC_PER_TOKEN", tide_cfg.max_async_vram_promotions_per_token, "a count per token");
+    tide_cfg.max_async_vram_promotions_per_token = parse("SMALLTIDE_ASYNC_PER_TOKEN", 0usize, "a count per token");
     let ram_budget_bytes = (s.ram_gb * (1u64 << 30) as f64) as usize;
     let mut tide = TideExecutor::new(backend.clone(), cfg.clone(), tide_cfg, nvfp4_slots, mxfp8_slots, ram_budget_bytes, Some(pack))
         .expect("create TideExecutor");
@@ -533,6 +533,7 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     }
     engine.prefill_chunk_swaps = parse("SMALLTIDE_PREFILL_CHUNK_SWAPS", 96usize, "a swap count");
     engine.anticipate_swaps = parse("SMALLTIDE_ANTICIPATE_SWAPS", 256usize, "a swap count");
+    engine.periodic_rebalance_swaps = parse("SMALLTIDE_PERIODIC_REBALANCE_SWAPS", 0usize, "a swap count");
     engine.anticipate_wait = parse::<u8>("SMALLTIDE_ANTICIPATE_WAIT", 0, "0 or 1") != 0;
     engine.tide.scheduler.async_hysteresis = parse("SMALLTIDE_ASYNC_HYSTERESIS", 1.10f64, "a factor >= 1");
     let preload_ops = engine.tide.scheduler.plan_pre_prefill(None);

@@ -329,6 +329,8 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// Prompt-aware loading: max async swaps between prefill chunks / before a request.
     pub prefill_chunk_swaps: usize,
     pub anticipate_swaps: usize,
+    /// Periodic mid-decode rebalance swap cap (every 24 decoded tokens; 0 = off).
+    pub periodic_rebalance_swaps: usize,
     /// Wait for the anticipated swaps before prefill (the prompt itself then hits them).
     pub anticipate_wait: bool,
     /// DSpark drafter (speculative decoding); its context follows the active lane's prefill /
@@ -593,6 +595,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             verify_ingest_pos0: None,
             prefill_chunk_swaps: 96,
             anticipate_swaps: 256,
+            periodic_rebalance_swaps: 0,
             anticipate_wait: true,
             profile: StepProfile::default(),
         })
@@ -926,14 +929,18 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             // Stage 2 Disk->RAM runs asynchronously on dedicated OS thread; Stage 1 RAM->VRAM on copy stream
             self.tide.execute_transfers(&async_ops, false, true)?;
         }
-        let reb_ops = self
-            .tide
-            .scheduler
-            .maybe_periodic_rebalance(self.tokens_decoded, 24, 32, false);
-        if !reb_ops.is_empty() {
-            // DiskToRam ops emitted by periodic rebalance are flagged in-flight for the background
-            // Stage 2 I/O thread; passing async_disk_io = true avoids blocking decode/verify on NVMe.
-            self.tide.execute_transfers(&reb_ops, false, true)?;
+        if self.periodic_rebalance_swaps > 0 {
+            let reb_ops = self.tide.scheduler.maybe_periodic_rebalance(
+                self.tokens_decoded,
+                24,
+                self.periodic_rebalance_swaps,
+                false,
+            );
+            if !reb_ops.is_empty() {
+                // DiskToRam ops emitted by periodic rebalance are flagged in-flight for the background
+                // Stage 2 I/O thread; passing async_disk_io = true avoids blocking decode/verify on NVMe.
+                self.tide.execute_transfers(&reb_ops, false, true)?;
+            }
         }
         Ok(())
     }
@@ -2370,11 +2377,19 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         Ok(verify_sample_rows(&mut all_logits, vocab, block, params, recent_tokens, &mut self.rng_state))
     }
 
+    /// Limits pending batch routing bookkeeping to the `keep` committed rows of a speculative
+    /// verify pass. Call before `post_batch_tide_step` so `post_batch_tide_step` can read back
+    /// `batch_route_log` while `compute_stream` is still idle from `verify_sample`, before
+    /// `verify_rewind` queues `drafter_ingest` and `sconv_rewind`.
+    pub fn commit_batch_rows(&mut self, keep: usize) {
+        self.batch_pending_rows = self.batch_pending_rows.min(keep);
+    }
+
     /// After a verify of `m` rows of which `keep` are committed: ingests ONLY the `keep`
     /// committed rows into the drafter's context KV, and rewinds every short conv of the active
     /// lane to its state after `keep` rows (the KV of later positions is overwritten later).
     pub fn verify_rewind(&mut self, m: usize, keep: usize) -> Result<()> {
-        // Only committed rows count for Tide (heat / demand); call before post_batch_tide_step.
+        // Only committed rows count for Tide (heat / demand); no-op if `commit_batch_rows` ran already.
         self.batch_pending_rows = self.batch_pending_rows.min(keep);
         if let Some(pos0) = self.verify_ingest_pos0.take() {
             self.drafter_ingest(pos0, keep)?;

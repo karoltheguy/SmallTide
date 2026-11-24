@@ -34,6 +34,14 @@ struct PinnedAlloc {
 }
 unsafe impl Send for PinnedAlloc {}
 
+/// Reusable pinned bounce buffer for `memcpy_d2h_sync` so small/medium readbacks do one
+/// stream-ordered `hipMemcpyAsync` + `hipStreamSynchronize` instead of two GPU syncs.
+struct D2hBounce {
+    ptr: *mut c_void,
+    cap: usize,
+}
+unsafe impl Send for D2hBounce {}
+
 struct GraphEntry {
     graph: HipGraph,
     exec: HipGraphExec,
@@ -58,6 +66,8 @@ pub struct HipBackend {
     graphs: Mutex<HashMap<u64, GraphEntry>>,
     /// f16 copy of a many-row GEMM's activations (`gemm_fp8_rows`), grown on demand.
     gemm_x16: Mutex<Option<DeviceBuf>>,
+    /// Reusable pinned bounce buffer for single-sync `memcpy_d2h_sync` (up to 1 MiB).
+    d2h_bounce: Mutex<Option<D2hBounce>>,
     /// Host-side instrumentation (see `HipBackend::take_host_stats`).
     stat_launches: AtomicU64,
     /// Kernel launches since the backend was created (never reset: `launch_epoch`).
@@ -277,6 +287,7 @@ impl HipBackend {
             events: Mutex::new(HashMap::new()),
             graphs: Mutex::new(HashMap::new()),
             gemm_x16: Mutex::new(None),
+            d2h_bounce: Mutex::new(None),
             stat_launches: AtomicU64::new(0),
             launch_epoch: AtomicU64::new(0),
             seg_kernels: std::env::var_os("SMALLTIDE_SEGTIME_KERNELS").is_some(),
@@ -612,6 +623,9 @@ impl Drop for HipBackend {
         }
         for (_, s) in self.streams.get_mut().unwrap().drain() {
             unsafe { let _ = (self.rt.hip_stream_destroy)(s.0); }
+        }
+        if let Some(b) = self.d2h_bounce.get_mut().unwrap().take() {
+            unsafe { let _ = (self.rt.hip_host_free)(b.ptr); }
         }
         for (_, p) in self.pinned_bufs.get_mut().unwrap().drain() {
             unsafe { let _ = (self.rt.hip_host_free)(p.ptr); }
@@ -1102,6 +1116,9 @@ impl ComputeBackend for HipBackend {
         src_offset: usize,
         stream: Stream,
     ) -> Result<()> {
+        if dst.is_empty() {
+            return self.sync_stream(stream);
+        }
         let d = self.dev_ptr(src)?;
         if src_offset + dst.len() > src.size_bytes {
             return Err(SmallTideError::Backend {
@@ -1109,9 +1126,40 @@ impl ComputeBackend for HipBackend {
                 message: "memcpy_d2h_sync out of bounds".into(),
             });
         }
+        let src_p = unsafe { (d as *const u8).add(src_offset) as *const c_void };
+        // Single-sync path for decode-sized readbacks (drafts, argmax, filtered logits, route logs):
+        // stream-ordered async D2H into a reusable pinned bounce buffer + one hipStreamSynchronize,
+        // avoiding a second blocking default-stream hipMemcpy round-trip on WDDM.
+        const MAX_BOUNCE_BYTES: usize = 1 << 20;
+        if dst.len() <= MAX_BOUNCE_BYTES {
+            let s = self.raw_stream(stream)?;
+            let mut guard = self.d2h_bounce.lock().unwrap();
+            let need = dst.len().max(64 * 1024);
+            if guard.as_ref().map_or(true, |b| b.cap < dst.len()) {
+                let mut hptr: *mut c_void = ptr::null_mut();
+                let r = unsafe { (self.rt.hip_host_malloc)(&mut hptr, need, HIP_HOST_MALLOC_DEFAULT) };
+                if r == 0 && !hptr.is_null() {
+                    if let Some(old) = guard.replace(D2hBounce { ptr: hptr, cap: need }) {
+                        unsafe { let _ = (self.rt.hip_host_free)(old.ptr); }
+                    }
+                }
+            }
+            if let Some(b) = guard.as_ref().filter(|b| b.cap >= dst.len()) {
+                unsafe {
+                    check_hip(
+                        (self.rt.hip_memcpy_async)(b.ptr, src_p, dst.len(), HIP_MEMCPY_DEVICE_TO_HOST, s),
+                        "hipMemcpyAsync(D2H sync)",
+                    )?;
+                }
+                self.sync_stream(stream)?;
+                unsafe {
+                    ptr::copy_nonoverlapping(b.ptr as *const u8, dst.as_mut_ptr(), dst.len());
+                }
+                return Ok(());
+            }
+        }
         self.sync_stream(stream)?;
         unsafe {
-            let src_p = (d as *const u8).add(src_offset) as *const c_void;
             check_hip(
                 (self.rt.hip_memcpy)(
                     dst.as_mut_ptr() as *mut c_void,

@@ -1195,8 +1195,9 @@ fn run_generate(args: &[String]) {
             while c < width - 1 && block[c + 1] == am[c] {
                 c += 1;
             }
-            engine.verify_rewind(width, c + 1).expect("rewind");
+            engine.commit_batch_rows(c + 1);
             engine.post_batch_tide_step().expect("post batch");
+            engine.verify_rewind(width, c + 1).expect("rewind");
             out.extend_from_slice(&block[1..=c]);
             out.push(am[c]);
             i += c + 1;
@@ -1466,8 +1467,9 @@ fn run_generate(args: &[String]) {
             let tv = Instant::now();
             engine.verify_for_sampling(&block, pos, spec_greedy).expect("verify");
             let (c, sampled_next) = engine.verify_sample(&block, &sampling, &generated).expect("verify sample");
-            engine.verify_rewind(spec_width, c + 1).expect("verify rewind");
+            engine.commit_batch_rows(c + 1);
             engine.post_batch_tide_step().expect("post verify");
+            engine.verify_rewind(spec_width, c + 1).expect("verify rewind");
             let dt_v = tv.elapsed().as_secs_f64() * 1000.0;
             verify_ms += dt_v;
             verify_base_ema = 0.85 * verify_base_ema + 0.15 * (dt_v - 2.3 * n as f64).clamp(10.0, 30.0);
@@ -1517,13 +1519,13 @@ fn run_generate(args: &[String]) {
         engine
             .forward_token(next_tok, pos, false, true)
             .expect("decode forward_token");
-        let tp = Instant::now();
-        engine.post_decode_tide_step().expect("post_decode_tide_step");
-        post_ms += tp.elapsed().as_secs_f64() * 1000.0;
         pos += 1;
         next_tok = engine
             .sample_next_token(&sampling, &generated)
             .expect("sample token");
+        let tp = Instant::now();
+        engine.post_decode_tide_step().expect("post_decode_tide_step");
+        post_ms += tp.elapsed().as_secs_f64() * 1000.0;
     }
     let dec_secs = t_dec.elapsed().as_secs_f64();
     let dec_toks = generated.len();

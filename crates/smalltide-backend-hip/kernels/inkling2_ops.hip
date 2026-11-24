@@ -529,7 +529,7 @@ extern "C" __global__ void smalltide_rescue_wait_and_patch(
             __scoped_atomic_store_n(probe + 0, (ticket << 12) | ((layer_id & 0xFFu) << 4) | 2u, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
         }
         while (__scoped_atomic_load_n(flag, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) < ticket) {
-            __builtin_amdgcn_s_sleep(2);
+            __builtin_amdgcn_s_sleep(64);
         }
         // Broadcast patch header count from thread 0 after system-acquire so all 8 wavefronts
         // observe the exact same `n` without inter-wave cache divergence.

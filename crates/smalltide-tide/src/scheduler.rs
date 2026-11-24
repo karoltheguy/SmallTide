@@ -1479,9 +1479,9 @@ impl TideScheduler {
         // Stage 1: RAM -> VRAM (paced, only promoting experts whose RAM slot is Ready!).
         // Candidates in value order; each class's eviction floor is computed once and refreshed
         // only after a promotion (a full scan per candidate cost ~10 ms of CPU per token).
-        if !self.pending_async_vram.is_empty()
-            && self.tide_cfg.max_async_vram_promotions_per_token > 0
-        {
+        if self.tide_cfg.max_async_vram_promotions_per_token == 0 {
+            self.pending_async_vram.clear();
+        } else if !self.pending_async_vram.is_empty() {
             let drained: Vec<(ExpertId, f32)> = self.pending_async_vram.drain().collect();
             let mut cands: Vec<(ExpertId, f32, f64)> = drained
                 .into_iter()

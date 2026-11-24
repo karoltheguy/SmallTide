@@ -1066,4 +1066,22 @@ impl TideCache {
     pub fn count_ram_resident(&self) -> usize {
         self.entries.iter().filter(|e| !e.ram_slot.is_missing()).count()
     }
+
+    /// Returns `(disk_only, ram_in_flight, ram_duplicate_of_vram)` expert counts for RAM-tier diagnostics.
+    pub fn ram_tier_breakdown(&self) -> (usize, usize, usize) {
+        let (mut disk_only, mut in_flight, mut dup) = (0usize, 0usize, 0usize);
+        for e in &self.entries {
+            let on_card = !e.vram_slot.is_missing() && !e.is_scratch_slot;
+            if e.ram_slot.is_missing() {
+                if !on_card {
+                    disk_only += 1;
+                }
+            } else if e.ram_in_flight {
+                in_flight += 1;
+            } else if on_card {
+                dup += 1;
+            }
+        }
+        (disk_only, in_flight, dup)
+    }
 }

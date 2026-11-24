@@ -621,7 +621,7 @@ fn finish_req(
     pc: &mut PrefixCache<SeqSnapshot>,
     lane_demand: &mut [Option<Vec<f32>>],
     req: ActiveReq,
-) -> f64 {
+) -> (f64, serde_json::Value) {
     let lane = req.lane;
     let req_learn = req.learn_routing;
     engine.set_lane_pinned(lane, false);
@@ -654,17 +654,18 @@ fn finish_req(
         dd as f64 / ntok,
         req.log_tail
     );
+    let (n, d_ms, v_ms) = req.t_steps;
+    let (n1, ms1) = req.t_single;
+    let (rb, rf, rw) = engine.tide.rescue_stats;
+    let (b, f, w) = (rb - req.t_rescue0.0, rf - req.t_rescue0.1, rw - req.t_rescue0.2);
+    let toks_spec = (req.generated.len() as f64 - n1 as f64).max(0.0);
+    let total_decode_ms = (d_ms + v_ms + ms1).max(1e-9);
     {
-        let (n, d_ms, v_ms) = req.t_steps;
-        let (n1, ms1) = req.t_single;
-        let (rb, rf, rw) = engine.tide.rescue_stats;
-        let (b, f, w) = (rb - req.t_rescue0.0, rf - req.t_rescue0.1, rw - req.t_rescue0.2);
         let mut parts: Vec<String> = Vec::new();
         if n > 0 {
-            let toks = (req.generated.len() as f64 - n1 as f64).max(0.0);
             parts.push(format!(
                 "{n} draft-verify steps of {:.2} tokens: {:.1} ms draft + {:.1} ms verify each",
-                toks / n as f64,
+                toks_spec / n as f64,
                 d_ms / n as f64,
                 v_ms / n as f64
             ));
@@ -677,20 +678,37 @@ fn finish_req(
                 "{b} rescue batches: {:.2} ms staging + {:.2} ms waiting for the copy each ({:.0}% of the decode time)",
                 f / b as f64,
                 w / b as f64,
-                100.0 * (f + w) / (d_ms + v_ms + ms1).max(1e-9)
+                100.0 * (f + w) / total_decode_ms
             ));
         }
         if !parts.is_empty() {
             eprintln!("[req] lane {lane}: decode time: {}", parts.join(" | "));
         }
     }
+    let gen_len = req.generated.len();
     let tps = req.finish(hit);
+    let probe = json!({
+        "tokens": gen_len,
+        "decode_tok_s": tps,
+        "spec_steps": n,
+        "tokens_per_step": if n > 0 { toks_spec / n as f64 } else { 0.0 },
+        "draft_ms": if n > 0 { d_ms / n as f64 } else { 0.0 },
+        "verify_ms": if n > 0 { v_ms / n as f64 } else { 0.0 },
+        "single_steps": n1,
+        "single_ms": if n1 > 0 { ms1 / n1 as f64 } else { 0.0 },
+        "rescue_batches": b,
+        "rescue_staging_ms": if b > 0 { f / b as f64 } else { 0.0 },
+        "rescue_wait_ms": if b > 0 { w / b as f64 } else { 0.0 },
+        "rescue_pct": 100.0 * (f + w) / total_decode_ms,
+        "rescue_disk_reads": dd,
+        "skipped_weight_pct": if dw > 0.0 { 100.0 * ds / dw } else { 0.0 },
+    });
     if !req_learn {
         engine.tide.scheduler.discard_request_demand();
     } else if let Some(line) = engine.tide.scheduler.finish_request() {
         println!("{line}");
     }
-    tps
+    (tps, probe)
 }
 
 /// Engine worker: owns the engine and serves up to `engine.num_lanes()` requests at once.
@@ -736,6 +754,7 @@ fn engine_worker_loop(
     let mut lane_demand: Vec<Option<Vec<f32>>> = vec![None; n_lanes];
     let mut queue: std::collections::VecDeque<EngineCommand> = std::collections::VecDeque::new();
     let mut last_decode_tok_s: f64 = 0.0;
+    let mut last_req_probe: Option<serde_json::Value> = None;
     let mut last_prefill_tok_s: f64 = 0.0;
     let max_lane_ctx = (0..n_lanes).map(|l| engine.lane_max_seq(l)).max().unwrap_or(0);
     let batch_decode = std::env::var("SMALLTIDE_BATCH_DECODE").map(|v| v != "0").unwrap_or(true);
@@ -789,6 +808,9 @@ fn engine_worker_loop(
                     let tel = engine.telemetry();
                     let (pre, core, coda) = engine.tide.scheduler.cache.count_vram_resident();
                     let ram = engine.tide.scheduler.cache.count_ram_resident();
+                    let (disk_only, ram_in_flight, ram_dup) = engine.tide.scheduler.cache.ram_tier_breakdown();
+                    let (nvfp4_slots, mxfp8_slots) = engine.tide.pool_slots();
+                    let dxgi = engine.backend.resident_vram_info();
                     let vram_info = engine.backend.device_info().ok();
                     let pct = |h: u64, m: u64| {
                         let tot = h + m;
@@ -799,6 +821,7 @@ fn engine_worker_loop(
                         "rescue_policy": format!("{:?}", engine.tide.scheduler.tide_cfg.rescue_policy),
                         "last_prefill_tok_s": last_prefill_tok_s,
                         "last_decode_tok_s": last_decode_tok_s,
+                        "last_req": last_req_probe,
                         "lanes": {
                             "count": n_lanes,
                             "active": active.iter().filter(|a| a.is_some()).count(),
@@ -813,6 +836,7 @@ fn engine_worker_loop(
                         "stage1_async_promotions": tel.stage1_async_promotions,
                         "stage1_skipped_tail_misses": tel.stage1_skipped_tail_misses,
                         "stage2_disk_reads": tel.stage2_disk_reads,
+                        "rescue_disk_reads": tel.rescue_disk_reads,
                         "stage1_bytes_transferred": tel.stage1_bytes_transferred,
                         "routed_weight_total": tel.routed_weight_total,
                         "routed_weight_skipped": tel.routed_weight_skipped,
@@ -822,6 +846,16 @@ fn engine_worker_loop(
                         "prompt_aware_swaps": tel.prompt_aware_swaps,
                         "experts_vram_resident": { "prelude": pre, "loop_core": core, "coda": coda },
                         "experts_ram_warm": ram,
+                        "residency_probe": {
+                            "nvfp4_slots": nvfp4_slots,
+                            "mxfp8_slots": mxfp8_slots,
+                            "disk_only_experts": disk_only,
+                            "ram_in_flight_experts": ram_in_flight,
+                            "ram_duplicate_experts": ram_dup,
+                            "pool_bw_gbs": engine.tide.last_pool_bw_gbs,
+                            "dxgi_usage_gib": dxgi.map(|(u, _)| u as f64 / (1024.0 * 1024.0 * 1024.0)),
+                            "dxgi_budget_gib": dxgi.map(|(_, b)| b as f64 / (1024.0 * 1024.0 * 1024.0)),
+                        },
                         "rescue": crate::expert_map::rescue_json(&engine.tide.scheduler.rescue_snapshot()),
                         "kv_pool": engine.kv_pool_info().map(|(pages, free, per, _)| json!({"pages": pages, "free": free, "positions_per_page": per})),
                         "prefix_cache": {
@@ -1038,7 +1072,9 @@ fn engine_worker_loop(
                             if req.accept(&tok, engine.lane_max_seq(lane)) {
                                 active[lane] = Some(req);
                             } else {
-                                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                                let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                                last_decode_tok_s = tps;
+                                last_req_probe = Some(probe);
                             }
                         } else {
                             drafter_pos[lane] = None;
@@ -1062,14 +1098,18 @@ fn engine_worker_loop(
                 Ok(false) => {
                     eprintln!("[kv] lane {l}: the KV pool cannot hold position {} - request ends (length)", req.pos + 1);
                     let req = active[l].take().unwrap();
-                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    last_decode_tok_s = tps;
+                    last_req_probe = Some(probe);
                 }
                 Err(e) => {
                     let msg = engine_error("kv reserve", &e.to_string());
                     let req = active[l].take().unwrap();
                     let _ = req.event_tx.send(StreamEvent::Error(msg));
                     pc.invalidate(l);
-                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    last_decode_tok_s = tps;
+                    last_req_probe = Some(probe);
                 }
             }
         }
@@ -1117,7 +1157,9 @@ fn engine_worker_loop(
                 };
                 if done {
                     let req = active[l].take().unwrap();
-                    last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    last_decode_tok_s = tps;
+                    last_req_probe = Some(probe);
                 }
             }
             continue;
@@ -1246,7 +1288,9 @@ fn engine_worker_loop(
                     }
                     if done {
                         let req = active[l].take().unwrap();
-                        last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                        let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                    last_decode_tok_s = tps;
+                    last_req_probe = Some(probe);
                     }
                     continue;
                 }
@@ -1284,7 +1328,9 @@ fn engine_worker_loop(
             }
             if done {
                 let req = active[l].take().unwrap();
-                last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                last_decode_tok_s = tps;
+                last_req_probe = Some(probe);
             }
         }
     }

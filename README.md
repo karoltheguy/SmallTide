@@ -12,18 +12,18 @@ Pre-built Windows releases embed the compiled `.hsaco` GPU kernels (`gfx1201` an
 
 ## Measured Performance (RX 9070 XT 16 GB, Windows 11)
 
-Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver, the settings of `.env.headless.example` with `SMALLTIDE_RAM_GB=10`, and the monitor on the motherboard output so the card holds nothing but the model (see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard)). *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
+Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver, the settings of `.env.headless.example`, and the monitor on the motherboard output so the card holds nothing but the model (see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard)). *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
 
 | Workload | Prompt / output | Decode | TTFT |
 | --- | ---: | ---: | ---: |
-| `prose` (essay) | 58 / 1,024 | **68.6 tok/s** | 238 ms |
-| `code` (LRU cache module + tests) | 74 / 1,024 | **68.7 tok/s** | 247 ms |
-| `edit` (refactor a 1.4K-token file) | 1,425 / 1,024 | **72.3 tok/s** | 0.97 s |
-| `random` (8K-token random prompt) | 8,256 / 1,024 | **87.9 tok/s** | 4.00 s |
+| `prose` (essay) | 58 / 1,024 | **75.6 tok/s** | 216 ms |
+| `code` (LRU cache module + tests) | 74 / 1,024 | **89.3 tok/s** | 250 ms |
+| `edit` (refactor a 1.4K-token file) | 1,425 / 1,024 | **80.4 tok/s** | 0.98 s |
+| `random` (8K-token random prompt) | 8,256 / 1,024 | **95.0 tok/s** | 3.98 s |
 | `angry-birds` (one-shot HTML game) | 76 / 8,192 | **75.7 tok/s** | 342 ms |
 | `mario` (one-shot HTML game) | 66 / 8,192 | **93.8 tok/s** | 355 ms |
 
-*`random` uses a prompt of random tokens, a worst case for the engine. Its answers are sampled and can end early: the three runs produced 527, 1,024, 1,024 tokens at 50, 88, 90 tok/s. Decode speed depends on how many experts a run has to copy in: the three runs of `edit` were 73, 72, 69 tok/s.*
+*`random` uses a prompt of random tokens, a worst case for the engine: the three runs hit 95, 114, 89 tok/s (0.50% skipped routing weight). Decode speed depends on draft acceptance and how many experts a run copies in: the three runs of `edit` were 72, 80, 83 tok/s (0.48% skipped routing weight) and `prose` / `code` held 98.9%–99.1% VRAM hit rate (0.35%–0.58% skipped weight).*
 
 Reading a prompt (prefill) runs at about 1,750 tokens a second on a cold 11,658-token prompt and about 1,450 on a 58,000-token one.
 
@@ -71,7 +71,7 @@ The RX 9070 GRE and the Radeon AI PRO R9700 are `gfx1201` as well and load the s
 
 1. **Download and extract** `smalltide-v0.1.0-windows-x64-gfx1201.zip` from [GitHub Releases](../../releases).
 2. **Choose your display setup (monitor on the card vs. motherboard / iGPU):** this is the main decision that determines how much of the 16 GB card the model gets and which config you use:
-   - **Monitor on the motherboard / CPU iGPU (recommended for best speed):** plug your monitor into the motherboard's video output and reboot. The RX 9070 XT then holds nothing but the model (~2,100 of 3,072 experts resident, ~97% routing weight, zero desktop interference). The numbers in [Measured Performance](#measured-performance-rx-9070-xt-16-gb-windows-11) were taken this way. Use **`.env.headless`** (`SMALLTIDE_RAM_GB=10`).
+   - **Monitor on the motherboard / CPU iGPU (recommended for best speed):** plug your monitor into the motherboard's video output and reboot. The RX 9070 XT then holds nothing but the model (~2,350 of 3,072 experts resident with elastic 32K→128K KV, ~98–99% hit rate, zero desktop interference). The numbers in [Measured Performance](#measured-performance-rx-9070-xt-16-gb-windows-11) were taken this way. Use **`.env.headless`** (`SMALLTIDE_RAM_GB=10`).
    - **Monitor plugged into the RX 9070 XT:** Windows and desktop apps hold 3 to 5 GB of VRAM (~1,750 experts resident, ~90% routing weight). Use **`.env.monitor`**, and assign your browser / chat client to integrated graphics in Windows Settings to avoid Edge/Chrome tile glitches and streaming interference.
    - Full comparison and setup steps: [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard).
 
@@ -195,8 +195,8 @@ Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K 
 
 | | Monitor on the RX 9070 XT | Monitor on the motherboard |
 | --- | --- | --- |
-| Resident experts (2 lanes, 128K context, drafter on) | about 1,750 of 3,072 | about 2,100 |
-| Routing weight they cover | about 90% | about 97% |
+| Resident experts (2 lanes, elastic 32K→128K KV, drafter on) | about 1,750–1,900 of 3,072 | about 2,350 of 3,072 |
+| Routing weight they cover | about 91–94% | about 98–99% |
 | Desktop apps and the model | compete for VRAM: when the desktop's share grows, Windows moves part of the model to system RAM and decode drops to a quarter of its speed until the server is restarted | separate: the desktop uses system RAM through the integrated graphics |
 | A rescue that stalls for more than about 2 s | Windows resets the graphics driver (`hipError_t=719`), the server exits | no driver reset was seen (nothing else asks for the card) |
 | An idle card | stays awake (it draws the desktop) | is put to sleep by the driver unless the heartbeat runs: see below |

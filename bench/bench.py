@@ -206,8 +206,9 @@ def compute_tide_delta(before, after, completion_tokens):
     d_rescues = max(0, after.get("stage1_sync_rescues", 0) - before.get("stage1_sync_rescues", 0))
     d_bytes = max(0, after.get("stage1_bytes_transferred", 0) - before.get("stage1_bytes_transferred", 0))
     d_disk = max(0, after.get("stage2_disk_reads", 0) - before.get("stage2_disk_reads", 0))
+    d_disk_wait = max(0, after.get("rescue_disk_reads", 0) - before.get("rescue_disk_reads", 0))
     skipped_pct = (100.0 * d_w_skip / d_w_tot) if d_w_tot > 0 else None
-    return {
+    out = {
         "expert_hit_rate": round(after.get("vram_hit_rate_pct", 0.0) / 100.0, 4),
         "prelude_hit_pct": round(after.get("prelude_hit_rate_pct", 0.0), 2),
         "core_hit_pct": round(after.get("loop_core_hit_rate_pct", 0.0), 2),
@@ -217,7 +218,14 @@ def compute_tide_delta(before, after, completion_tokens):
         "rescues_per_tok": round(d_rescues / max(completion_tokens, 1), 2),
         "rescue_gb": round(d_bytes / 1e9, 3),
         "disk_reads": d_disk,
+        "disk_wait": d_disk_wait,
+        "disk_bg": max(0, d_disk - d_disk_wait),
     }
+    if after.get("last_req"):
+        out["last_req"] = after["last_req"]
+    if after.get("residency_probe"):
+        out["residency_probe"] = after["residency_probe"]
+    return out
 
 
 def run_once(base, model, prompt, osl, api_key, thinking, effort, temperature, seed=None, cache_prompt=False):
@@ -412,8 +420,17 @@ def main():
             f"          hit={st.get('expert_hit_rate')} (pre={st.get('prelude_hit_pct')}% "
             f"core={st.get('core_hit_pct')}% coda={st.get('coda_hit_pct')}%)  "
             f"skip_w={st.get('skipped_weight_pct')}%  rescues/tok={st.get('rescues_per_tok')}  "
-            f"dma={st.get('rescue_gb')} GB  disk={st.get('disk_reads')}"
+            f"dma={st.get('rescue_gb')} GB  disk_wait={st.get('disk_wait', 0)} disk_bg={st.get('disk_bg', st.get('disk_reads'))}"
         )
+        lr = st.get("last_req") or {}
+        rp = st.get("residency_probe") or {}
+        if lr:
+            print(
+                f"          probe: {lr.get('spec_steps', 0)} steps x {lr.get('tokens_per_step', 0.0):.2f} tok/step "
+                f"(draft {lr.get('draft_ms', 0.0):.1f}ms + verify {lr.get('verify_ms', 0.0):.1f}ms) | "
+                f"rescues {lr.get('rescue_batches', 0)}x ({lr.get('rescue_staging_ms', 0.0):.2f}ms stage + {lr.get('rescue_wait_ms', 0.0):.2f}ms wait, {lr.get('rescue_pct', 0.0):.0f}%) | "
+                f"pool={rp.get('pool_bw_gbs', 0.0):.0f} GB/s disk_only={rp.get('disk_only_experts', '?')} ram_dup={rp.get('ram_duplicate_experts', '?')}"
+            )
         if "artifact" in r:
             print(f"          wrote {os.path.relpath(r['artifact'], REPO_ROOT)}")
         if measured:

@@ -142,6 +142,8 @@ pub struct TideExecutor<B: ComputeBackend> {
     /// Resident slots (excluding the scratch ring) the full pools are allocated with.
     pool_slots: (usize, usize),
     pools_allocated: bool,
+    /// Measured copy bandwidth (GB/s) of the fast resident NVFP4 pool from the last residency check.
+    pub last_pool_bw_gbs: f64,
     /// When set, the MXFP8 pool lives in pinned, device-mapped host memory (zero-copy over
     /// PCIe) and slabs are written by CPU copies instead of DMA.
     mxfp8_host_mapped: bool,
@@ -252,6 +254,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             compute_fence,
             pool_slots: (resident_nvfp4, resident_mxfp8),
             pools_allocated: false,
+            last_pool_bw_gbs: 0.0,
             mxfp8_host_mapped: false,
             mxfp8_host: None,
         };
@@ -369,6 +372,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             fit
         };
         let (fast4, best4, worst4) = self.fast_prefix_bytes(self.vram_pool_nvfp4, win)?;
+        self.last_pool_bw_gbs = best4;
         let n4_fit = (fast4 / s4).saturating_sub(ring4).min(n4);
         if n4_fit < n4 {
             notes.push(format!("nvfp4 fast {:.2} GiB (then {worst4:.0} GB/s)", fast4 as f64 / (1u64 << 30) as f64));
@@ -1172,12 +1176,31 @@ impl<B: ComputeBackend> TideExecutor<B> {
     /// with the highest-value NVFP4 experts from `ranked_nvfp4`, then queues async RAM warm-up for
     /// experts just outside the new resident cutoff.
     pub fn restore_nvfp4_pool_after_resize(&mut self, new_n4: usize, ranked_nvfp4: &[ExpertId]) -> Result<()> {
-        let new_n4 = new_n4.max(1);
+        let mut new_n4 = new_n4.max(1);
         let (ring4, _) = rescue_ring_slots();
         let s4 = self.nvfp4_layout.aligned_slab_bytes;
         let s8 = self.mxfp8_layout.aligned_slab_bytes;
         let m8 = self.pool_slots.1;
         self.vram_pool_nvfp4 = self.backend.alloc_device((new_n4 + ring4) * s4)?;
+        // Verify the reallocated NVFP4 pool stays 100% in fast GDDR6 VRAM (Windows WDDM can
+        // silently spill the tail into ~27 GB/s system RAM after a dynamic reallocation).
+        let win = (256usize << 20).min(self.vram_pool_nvfp4.size_bytes & !0xFFFF);
+        if win >= (64 << 20) {
+            if let Ok((fast4, best4, worst4)) = self.fast_prefix_bytes(self.vram_pool_nvfp4, win) {
+                self.last_pool_bw_gbs = best4;
+                let fit = (fast4 / s4).saturating_sub(ring4).min(new_n4).max(1);
+                if fit < new_n4 {
+                    eprintln!(
+                        "[kv-elastic] residency guard: nvfp4 fast {:.2} GiB (then {worst4:.0} GB/s) -> trimmed {new_n4} -> {fit} slots",
+                        fast4 as f64 / (1u64 << 30) as f64
+                    );
+                    self.backend.sync_stream(self.compute_stream)?;
+                    self.backend.free_device(self.vram_pool_nvfp4)?;
+                    self.vram_pool_nvfp4 = self.backend.alloc_device((fit + ring4) * s4)?;
+                    new_n4 = fit;
+                }
+            }
+        }
         self.pool_slots.0 = new_n4;
         self.scheduler
             .cache

@@ -31,6 +31,8 @@ __pycache__/
 
 # Local configuration
 .env
+.env.monitor
+.env.headless
 
 # Benchmark outputs & generated one-shot artifacts
 results/

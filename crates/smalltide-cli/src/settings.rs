@@ -3,7 +3,7 @@
 //!
 //! `.env` is read from the path in `SMALLTIDE_ENV`, else `./.env`. Variables already present in
 //! the process environment win over `.env` (standard dotenv semantics), so a one-off override is
-//! `SMALLTIDE_MAX_CTX=4096 smalltide-cli run ...`. See `.env.example` for every key.
+//! `SMALLTIDE_MAX_CTX=4096 smalltide-cli run ...`. See `.env.headless.example` / `.env.monitor.example` for every key.
 
 use smalltide_backend_hip::HipBackend;
 use smalltide_core::{ComputeBackend, DType, Inkling2Config, RescuePolicy, TideConfig};
@@ -651,6 +651,6 @@ fn load_seed_priors() -> Option<(PathBuf, TidePriors)> {
 pub fn describe_source(loaded: &Option<PathBuf>) {
     match loaded {
         Some(p) => println!("[config] loaded {}", p.display()),
-        None => println!("[config] no .env found (using defaults / process environment; see .env.example)"),
+        None => println!("[config] no .env found (using defaults / process environment; see .env.headless.example & .env.monitor.example)"),
     }
 }

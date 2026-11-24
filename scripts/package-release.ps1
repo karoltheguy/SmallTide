@@ -79,7 +79,7 @@ try {
     Copy-Item $exePath (Join-Path $stageDir "smalltide-cli.exe")
 
     # Launcher, config template, docs & license
-    foreach ($f in @("smalltide.cmd", "smalltide.ps1", ".env.example", "README.md", "LICENSE", "LIMITATIONS.md", "CREDITS.md", "VERSION")) {
+    foreach ($f in @("smalltide.cmd", "smalltide.ps1", ".env.headless.example", ".env.monitor.example", "README.md", "LICENSE", "LIMITATIONS.md", "CREDITS.md", "VERSION")) {
         $src = Join-Path $repoRoot $f
         if (-not (Test-Path $src)) { throw "Missing required release file: $f" }
         Copy-Item $src (Join-Path $stageDir $f)

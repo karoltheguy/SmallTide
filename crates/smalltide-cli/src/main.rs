@@ -180,7 +180,7 @@ fn main() {
             println!("  inspect <file.safetensors>    Inspect tensor names, dtypes, and shapes");
             println!("Options:");
             println!("  --env <path>, -e <path>       Load configuration from <path> (overrides .env and SMALLTIDE_ENV)");
-            println!("Configuration: .env in the working directory (or `serve <path>` / `--env <path>` / SMALLTIDE_ENV=path); see .env.example & .env.monitor.example.");
+            println!("Configuration: .env in the working directory (or `serve <path>` / `--env <path>` / SMALLTIDE_ENV=path); see .env.headless.example & .env.monitor.example.");
         }
     }
 }
@@ -742,7 +742,7 @@ fn run_load_test(model_dir: &Path) {
     );
 }
 
-/// Engine/server configuration lives in `.env` (see `.env.example`); only per-request inputs
+/// Engine/server configuration lives in `.env` (see `.env.headless.example` / `.env.monitor.example`); only per-request inputs
 /// are flags. Old configuration flags are rejected with a pointer to the variable.
 fn moved_to_env(flag: &str) -> Option<&'static str> {
     Some(match flag {
@@ -764,7 +764,7 @@ fn moved_to_env(flag: &str) -> Option<&'static str> {
 
 pub fn reject_config_flag(flag: &str) -> ! {
     match moved_to_env(flag) {
-        Some(var) => eprintln!("{flag} is configured in .env now: set {var}=... (see .env.example)"),
+        Some(var) => eprintln!("{flag} is configured in your .env file now: set {var}=... (see .env.headless.example / .env.monitor.example)"),
         None => eprintln!("unknown flag: {flag}"),
     }
     std::process::exit(2);

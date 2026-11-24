@@ -12,7 +12,7 @@ Pre-built Windows releases embed the compiled `.hsaco` GPU kernels (`gfx1201` an
 
 ## Measured Performance (RX 9070 XT 16 GB, Windows 11)
 
-Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver, the settings of `.env.example` with `SMALLTIDE_RAM_GB=10`, and the monitor on the motherboard output so the card holds nothing but the model (see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard)). *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
+Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver, the settings of `.env.headless.example` with `SMALLTIDE_RAM_GB=10`, and the monitor on the motherboard output so the card holds nothing but the model (see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard)). *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
 
 | Workload | Prompt / output | Decode | TTFT |
 | --- | ---: | ---: | ---: |
@@ -76,16 +76,18 @@ The RX 9070 GRE and the Radeon AI PRO R9700 are `gfx1201` as well and load the s
 .\smalltide.cmd setup
 ```
 
-`setup` copies `.env.example` → `.env`, verifies your GPU, its kernels & the HIP driver (`probe`), downloads [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) via built-in `curl.exe` (resumable, ~21 GB; set `$env:HF_TOKEN` only if you want higher Hugging Face rate limits), and packs all 3,072 routed experts into 4 KB-aligned `experts.stide` (~15 s).
+`setup` copies `.env.headless.example` → `.env.headless` (and `.env`), `.env.monitor.example` → `.env.monitor`, verifies your GPU, its kernels & the HIP driver (`probe`), downloads [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) via built-in `curl.exe` (resumable, ~21 GB; set `$env:HF_TOKEN` only if you want higher Hugging Face rate limits), and packs all 3,072 routed experts into 4 KB-aligned `experts.stide` (~15 s).
 
-3. **Start the server** (pick the config matching where your monitor cable is plugged in):
+3. **Create your local config (if not created by `setup`) and start the server** — do not edit or run `.example` files directly; copy the one matching where your monitor cable is plugged in:
 
 ```powershell
-# Monitor on motherboard / iGPU (headless 9070 XT; uses .env copied from .env.example):
-.\smalltide.cmd serve
+# Monitor plugged into the RX 9070 XT:
+copy .env.monitor.example .env.monitor
+.\smalltide.cmd serve .env.monitor
 
-# Monitor plugged into the RX 9070 XT (copy .env.monitor.example -> .env, or pass it directly):
-.\smalltide.cmd serve .env.monitor.example
+# Monitor on motherboard / iGPU (headless RX 9070 XT):
+copy .env.headless.example .env.headless
+.\smalltide.cmd serve .env.headless
 ```
 
 *(If your monitor is on the RX 9070 XT and you see tile glitches or slow streaming in Edge/Chrome, assign your browser to integrated graphics in Windows Settings — see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard).)*
@@ -202,14 +204,14 @@ Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K 
 **Setting it up with the monitor on the motherboard**
 
 1. Move the cable to the motherboard's video output and **reboot**: programs keep using the graphics card they started on, so until then the desktop still sits on the 9070 XT.
-2. Set `SMALLTIDE_RAM_GB=10` in `.env` (`.env.example` has 16): the desktop now lives in system RAM too.
-3. Start the server. The startup line should show `VRAM free: … /15.92 GiB` (the engine picks the discrete card by itself; `SMALLTIDE_HIP_DEVICE` overrides it) and a resident count well above 2,000.
+2. Copy `.env.headless.example` to `.env.headless` (`copy .env.headless.example .env.headless`) and set `SMALLTIDE_RAM_GB=10`: the desktop now lives in system RAM too.
+3. Start the server (`.\smalltide.cmd serve .env.headless`). The startup line should show `VRAM free: … /15.92 GiB` (the engine picks the discrete card by itself; `SMALLTIDE_HIP_DEVICE` overrides it) and a resident count well above 2,000.
 4. Leave `SMALLTIDE_IDLE_HEARTBEAT_MS=1000` at its default. Radeon drivers 26.5.1 and later put a card with no display to sleep about 10 seconds after its last GPU work, and Windows first moves everything in the card's memory - the whole model - into system RAM, which exhausts a 32 GB machine within seconds ([ROCm/TheRock#7221](https://github.com/ROCm/TheRock/issues/7221)). The heartbeat is a few milliseconds of GPU work once a second from the moment the server starts, loading included, and keeps the card awake. AMD reports the driver bug fixed in Adrenalin 26.9.2; that was not verified here, and 26.10.44 (build 32.0.31044.16) still has it.
 5. Run one server at a time. A second one would load a second copy of the model next to the first; it now stops at once with `cannot listen on …`.
 
 **Keeping the monitor on the RX 9070 XT (avoiding glitches and interference)**
 
-1. Copy `.env.monitor.example` to `.env` (or launch directly with `.\smalltide.cmd serve .env.monitor.example`). It uses elastic 128K KV starting at 32K (`SMALLTIDE_KV_INITIAL_TOKENS=32768`), `SMALLTIDE_PREFILL_CHUNK=256`, and `SMALLTIDE_ATTN_VTILES=local` to reclaim VRAM for resident experts while leaving headroom for the desktop. (Use `.env.example` when the monitor is on the motherboard.)
+1. Copy `.env.monitor.example` to `.env.monitor` (`copy .env.monitor.example .env.monitor`) and launch with `.\smalltide.cmd serve .env.monitor`. It uses elastic 128K KV starting at 32K (`SMALLTIDE_KV_INITIAL_TOKENS=32768`), `SMALLTIDE_PREFILL_CHUNK=256`, and `SMALLTIDE_ATTN_VTILES=local` to reclaim VRAM for resident experts while leaving headroom for the desktop. (Use `.env.headless.example` → `.env.headless` when the monitor is on the motherboard.)
 2. **Move your browser / chat client to integrated graphics** if your CPU has an iGPU. Running Edge/Chromium on the 9070 XT alongside HIP compute can cause AMD D3D11/MPO speckled tile glitches inside browser windows and lowers decode tok/s because every streamed token repaints on the same GPU:
    - Open **Windows Settings → System → Display → Graphics**.
    - Select your browser or chat app. If it is not in the list, click **Add desktop app** (or **Browse**) and pick its `.exe` — for Microsoft Edge, `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`.

@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Commands:
-      setup       Copy .env.example -> .env, verify AMD HIP GPU, download Inkling-2-Mini, pack experts.stide
+      setup       Copy .env.*.example -> local .env files, verify AMD HIP GPU, download Inkling-2-Mini, pack experts.stide
       serve       Start the OpenAI-compatible HTTP server and /expert-map dashboard
       run ...     Run one-shot generation (forwards all flags to `smalltide-cli run`)
       probe       Verify AMD HIP DLL, GPU device, embedded kernels, and PCIe DMA bandwidth
@@ -130,17 +130,23 @@ try {
         }
 
         "setup" {
+            $headlessExample = Join-Path $Root ".env.headless.example"
+            $monitorExample = Join-Path $Root ".env.monitor.example"
             $envPath = Join-Path $Root ".env"
-            $envExample = Join-Path $Root ".env.example"
-            if (-not (Test-Path $envPath)) {
-                if (Test-Path $envExample) {
-                    Copy-Item $envExample $envPath
-                    Write-Host "[setup] Created .env from .env.example"
+            foreach ($pair in @(
+                @($headlessExample, (Join-Path $Root ".env.headless"), ".env.headless"),
+                @($monitorExample, (Join-Path $Root ".env.monitor"), ".env.monitor"),
+                @($headlessExample, $envPath, ".env")
+            )) {
+                $src = $pair[0]; $dst = $pair[1]; $label = $pair[2]
+                if (-not (Test-Path $dst)) {
+                    if (Test-Path $src) {
+                        Copy-Item $src $dst
+                        Write-Host "[setup] Created $label from $(Split-Path -Leaf $src)"
+                    }
                 } else {
-                    Write-Warning ".env.example not found; continuing with built-in defaults."
+                    Write-Host "[setup] Keeping existing $label"
                 }
-            } else {
-                Write-Host "[setup] Keeping existing .env"
             }
 
             $exe = Resolve-SmallTideExe
@@ -174,7 +180,8 @@ try {
 
             Write-Host ""
             Write-Host "[setup] Done! Start SmallTide with:"
-            Write-Host "  .\smalltide.cmd serve"
+            Write-Host "  .\smalltide.cmd serve .env.monitor    # monitor plugged into RX 9070 XT"
+            Write-Host "  .\smalltide.cmd serve .env.headless   # monitor on motherboard / iGPU"
             Write-Host "Then open http://127.0.0.1:8000/expert-map or connect any OpenAI client to http://127.0.0.1:8000/v1"
         }
 

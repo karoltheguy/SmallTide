@@ -374,7 +374,28 @@ impl<B: ComputeBackend> TideExecutor<B> {
             notes.push(format!("nvfp4 fast {:.2} GiB (then {worst4:.0} GB/s)", fast4 as f64 / (1u64 << 30) as f64));
         }
         let (n4_fit, m8_fit) = (n4_fit.max(1), m8_fit.max(1));
+        let mut freed_bytes = 0usize;
         if (n4_fit, m8_fit) != (n4, m8) {
+            // Reallocate trimmed pools to their exact fast size so Windows WDDM actually gets
+            // the spilled slow-tail memory back instead of staying pinned at the eviction cliff.
+            self.backend.sync_stream(self.compute_stream)?;
+            if m8_fit < m8 && !self.mxfp8_host_mapped {
+                let old_mx = self.vram_pool_mxfp8.size_bytes;
+                let old_nv = self.vram_pool_nvfp4.size_bytes;
+                self.backend.free_device(self.vram_pool_nvfp4)?;
+                self.backend.free_device(self.vram_pool_mxfp8)?;
+                let new_mx = (m8_fit + ring8) * s8;
+                let new_nv = (n4_fit + ring4) * s4;
+                self.vram_pool_mxfp8 = self.backend.alloc_device(new_mx)?;
+                self.vram_pool_nvfp4 = self.backend.alloc_device(new_nv)?;
+                freed_bytes = (old_mx + old_nv).saturating_sub(new_mx + new_nv);
+            } else if n4_fit < n4 {
+                let old_nv = self.vram_pool_nvfp4.size_bytes;
+                self.backend.free_device(self.vram_pool_nvfp4)?;
+                let new_nv = (n4_fit + ring4) * s4;
+                self.vram_pool_nvfp4 = self.backend.alloc_device(new_nv)?;
+                freed_bytes = old_nv.saturating_sub(new_nv);
+            }
             self.pool_slots = (n4_fit, m8_fit);
             self.scheduler.cache.set_unified_vram_budget(n4_fit * s4 + m8_fit * s8);
             self.scheduler.cache.configure_scratch_rings(n4_fit as u32, m8_fit as u32, ring4 as u32, ring8 as u32);
@@ -383,8 +404,9 @@ impl<B: ComputeBackend> TideExecutor<B> {
             format!("[pools] residency check: both pools fully at VRAM speed (~{best4:.0} GB/s copy)")
         } else {
             format!(
-                "[pools] residency check: {} -> usable slots nvfp4 {n4} -> {n4_fit}, mxfp8 {m8} -> {m8_fit} (the slow tail stays unused)",
-                notes.join(", ")
+                "[pools] residency check: {} -> usable slots nvfp4 {n4} -> {n4_fit}, mxfp8 {m8} -> {m8_fit} (freed {:.0} MiB slow tail)",
+                notes.join(", "),
+                freed_bytes as f64 / (1u64 << 20) as f64
             )
         };
         Ok((n4_fit, m8_fit, line))
@@ -1131,6 +1153,72 @@ impl<B: ComputeBackend> TideExecutor<B> {
         Ok(())
     }
 
+    /// Releases the NVFP4 VRAM pool so an elastic KV resize can reallocate KV buffers in resident
+    /// VRAM before reallocating NVFP4 last. Leaves MXFP8 VRAM and Tier 1 RAM untouched.
+    /// Caller must follow with `restore_nvfp4_pool_after_resize`.
+    pub fn release_nvfp4_pool_for_resize(&mut self) -> Result<Vec<ExpertId>> {
+        self.wait_and_publish_all_pending()?;
+        self.backend.sync_stream(self.compute_stream)?;
+        self.backend.sync_stream(self.copy_stream)?;
+        let ranked = self.scheduler.cache.clear_nvfp4_vram_for_resize();
+        if self.vram_pool_nvfp4.id != 0 {
+            self.backend.free_device(self.vram_pool_nvfp4)?;
+            self.vram_pool_nvfp4 = DeviceBuf { id: 0, offset_bytes: 0, size_bytes: 0 };
+        }
+        Ok(ranked)
+    }
+
+    /// Reallocates the NVFP4 VRAM pool to `new_n4` resident slots (+ rescue ring) and refills it
+    /// with the highest-value NVFP4 experts from `ranked_nvfp4`, then queues async RAM warm-up for
+    /// experts just outside the new resident cutoff.
+    pub fn restore_nvfp4_pool_after_resize(&mut self, new_n4: usize, ranked_nvfp4: &[ExpertId]) -> Result<()> {
+        let new_n4 = new_n4.max(1);
+        let (ring4, _) = rescue_ring_slots();
+        let s4 = self.nvfp4_layout.aligned_slab_bytes;
+        let s8 = self.mxfp8_layout.aligned_slab_bytes;
+        let m8 = self.pool_slots.1;
+        self.vram_pool_nvfp4 = self.backend.alloc_device((new_n4 + ring4) * s4)?;
+        self.pool_slots.0 = new_n4;
+        self.scheduler
+            .cache
+            .reconfigure_nvfp4_capacity(new_n4 as u32, ring4 as u32, new_n4 * s4 + m8 * s8);
+
+        let prev_no_ram = self.scheduler.cache.no_ram_copy_on_direct;
+        self.scheduler.cache.no_ram_copy_on_direct = true;
+        let mut ops = Vec::with_capacity(new_n4);
+        let has_priors = self.scheduler.cache.has_priors();
+        let mut loaded = 0usize;
+        for &id in ranked_nvfp4 {
+            if loaded >= new_n4 {
+                break;
+            }
+            let pin = !has_priors && self.scheduler.model_cfg.is_loop_core_layer(id.layer.0 as usize);
+            if let Some(op) = self.scheduler.cache.promote_to_vram(id, pin, true) {
+                ops.push(op);
+                loaded += 1;
+            }
+        }
+        self.scheduler.cache.no_ram_copy_on_direct = prev_no_ram;
+        if !ops.is_empty() {
+            self.execute_transfers(&ops, true, false)?;
+        } else {
+            self.upload_table_on_compute()?;
+        }
+        // Keep experts displaced from VRAM warm in RAM in the background so rescues avoid disk reads.
+        let mut ram_ops = Vec::new();
+        for &id in ranked_nvfp4.iter().skip(new_n4).take(256) {
+            if !self.scheduler.cache.is_ram_ready(id) {
+                if let Some(op) = self.scheduler.cache.promote_to_ram_with_flag(id, true) {
+                    ram_ops.push(op);
+                }
+            }
+        }
+        if !ram_ops.is_empty() {
+            let _ = self.execute_transfers(&ram_ops, false, true);
+        }
+        Ok(())
+    }
+
     /// Back-compat alias (now stream-ordered on the compute stream).
     pub fn sync_full_slot_table_to_gpu(&mut self) -> Result<()> {
         self.upload_table_on_compute()
@@ -1165,6 +1253,8 @@ impl<B: ComputeBackend> Drop for TideExecutor<B> {
         if let Some(h) = self.mxfp8_host.take() {
             let _ = self.backend.free_pinned(h);
         }
-        let _ = self.backend.free_device(self.vram_pool_nvfp4);
+        if self.vram_pool_nvfp4.id != 0 {
+            let _ = self.backend.free_device(self.vram_pool_nvfp4);
+        }
     }
 }

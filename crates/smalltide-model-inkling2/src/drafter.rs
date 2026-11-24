@@ -196,7 +196,7 @@ impl<B: ComputeBackend> Drafter<B> {
                 let k_norm_ctx = vec(&mut f, "self_attn.k_norm_ctx.weight")?;
                 let local = l != 1;
                 let v_q4 = !local && global_v_q4;
-                let slots = if local { RING } else { global_slots.max(max_seq) };
+                let slots = if local { RING } else if global_slots > 0 { global_slots } else { max_seq };
                 let vc_bytes = slots * HK * if v_q4 { HD / 2 } else { HD };
                 let vs_bytes = slots * HK * if v_q4 { 16 } else { 4 };
                 let mut lane_ctx: Vec<[DeviceBuf; 4]> = Vec::new();
@@ -371,6 +371,55 @@ impl<B: ComputeBackend> Drafter<B> {
     /// Lanes that keep their own context.
     pub fn lanes(&self) -> usize {
         self.layers.iter().map(|ly| ly.lane_ctx.len()).max().unwrap_or(1).max(1)
+    }
+
+    /// Bytes per position in the drafter's global KV cache (for elastic KV sizing).
+    pub fn global_kv_bytes_per_pos(&self) -> usize {
+        self.layers
+            .iter()
+            .filter(|ly| !ly.local)
+            .map(|ly| HK * (HD + 4 + if ly.v_q4 { HD / 2 + 16 } else { HD + 4 }))
+            .sum()
+    }
+
+    /// Resizes the drafter's global-attention KV cache to `new_slots` positions, preserving
+    /// existing pages `0..min(old, new)` via D2D copy on `s`.
+    pub fn resize_global_slots(&mut self, new_slots: usize, s: Stream) -> Result<()> {
+        let b = &self.backend;
+        for ly in self.layers.iter_mut() {
+            if ly.local {
+                continue;
+            }
+            let kc_bytes = new_slots * HK * HD;
+            let ks_bytes = new_slots * HK * 4;
+            let vc_bytes = new_slots * HK * if ly.v_q4 { HD / 2 } else { HD };
+            let vs_bytes = new_slots * HK * if ly.v_q4 { 16 } else { 4 };
+            if ly.kc.size_bytes == kc_bytes {
+                continue;
+            }
+            let old = [ly.kc, ly.ks, ly.vc, ly.vs];
+            let old_bytes: usize = old.iter().map(|buf| buf.size_bytes).sum();
+            let new = [
+                b.alloc_device(kc_bytes)?,
+                b.alloc_device(ks_bytes)?,
+                b.alloc_device(vc_bytes)?,
+                b.alloc_device(vs_bytes)?,
+            ];
+            for (&o, &n) in old.iter().zip(new.iter()) {
+                let cp = o.size_bytes.min(n.size_bytes);
+                if cp > 0 {
+                    b.memcpy_d2d_async(n, 0, o, 0, cp, s)?;
+                }
+            }
+            b.sync_stream(s)?;
+            for &o in &old {
+                b.free_device(o)?;
+            }
+            let new_bytes: usize = new.iter().map(|buf| buf.size_bytes).sum();
+            self.vram_bytes = self.vram_bytes.saturating_sub(old_bytes) + new_bytes;
+            (ly.kc, ly.ks, ly.vc, ly.vs) = (new[0], new[1], new[2], new[3]);
+        }
+        Ok(())
     }
 
     /// Context K/V of `m` committed rows at positions `pos0..` from their taps

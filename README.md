@@ -201,7 +201,16 @@ Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K 
 4. Leave `SMALLTIDE_IDLE_HEARTBEAT_MS=1000` at its default. Radeon drivers 26.5.1 and later put a card with no display to sleep about 10 seconds after its last GPU work, and Windows first moves everything in the card's memory - the whole model - into system RAM, which exhausts a 32 GB machine within seconds ([ROCm/TheRock#7221](https://github.com/ROCm/TheRock/issues/7221)). The heartbeat is a few milliseconds of GPU work once a second from the moment the server starts, loading included, and keeps the card awake. AMD reports the driver bug fixed in Adrenalin 26.9.2; that was not verified here, and 26.10.44 (build 32.0.31044.16) still has it.
 5. Run one server at a time. A second one would load a second copy of the model next to the first; it now stops at once with `cannot listen on …`.
 
-With the monitor on the card none of this is needed, and closing VRAM-heavy apps before starting the server is what buys resident experts.
+**Keeping the monitor on the RX 9070 XT (avoiding glitches and interference)**
+
+1. Copy `.env.monitor.example` to `.env` (or launch with `$env:SMALLTIDE_ENV=".env.monitor.example"`). It uses elastic 128K KV starting at 32K (`SMALLTIDE_KV_INITIAL_TOKENS=32768`), `SMALLTIDE_PREFILL_CHUNK=256`, and `SMALLTIDE_ATTN_VTILES=local` to reclaim VRAM for resident experts while leaving headroom for the desktop. (Use `.env.example` when the monitor is on the motherboard.)
+2. **Move your browser / chat client to integrated graphics** if your CPU has an iGPU. Running Edge/Chromium on the 9070 XT alongside HIP compute can cause AMD D3D11/MPO speckled tile glitches inside browser windows and lowers decode tok/s because every streamed token repaints on the same GPU:
+   - Open **Windows Settings → System → Display → Graphics**.
+   - Select your browser or chat app. If it is not in the list, click **Add desktop app** (or **Browse**) and pick its `.exe` — for Microsoft Edge, `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`.
+   - Set **GPU preference** to **Power saving** (integrated graphics).
+   - Fully close the app (for Edge, close background `msedge.exe` processes in Task Manager or turn off *Startup boost*) and reopen it. Verify in `edge://gpu` that `GL_RENDERER` shows your integrated GPU instead of the RX 9070 XT.
+   - *(Without an iGPU, turn off **Use graphics acceleration when available** in browser settings, or switch `edge://flags/#use-angle` from `Default` to `OpenGL` / `D3D9`.)*
+3. Closing other VRAM-heavy apps before starting the server buys additional resident experts.
 
 ---
 

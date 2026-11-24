@@ -93,7 +93,16 @@ impl KvPool {
                 self.free.extend(taken.into_iter().rev());
                 self.lost[v] = true;
             }
-            let page = self.free.pop().expect("a free page");
+            // Prefer the lowest free page ID so short sequences stay packed in 0..initial_pages,
+            // allowing elastic KV to shrink back cleanly once long sequences finish.
+            let min_pos = self
+                .free
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &p)| p)
+                .map(|(i, _)| i)
+                .expect("a free page");
+            let page = self.free.swap_remove(min_pos);
             self.lanes[lane].pages.push(page);
         }
         self.upload(b, lane, had, stream)?;
@@ -132,5 +141,69 @@ impl KvPool {
             self.lost[l] = false;
         }
         v
+    }
+
+    /// True if the pool is larger than `target_pages` and no lane currently holds any page `>= target_pages`.
+    pub fn can_shrink_to(&self, target_pages: usize) -> bool {
+        if self.n_pages <= target_pages {
+            return false;
+        }
+        let limit = target_pages as u32;
+        self.lanes.iter().all(|l| l.pages.iter().all(|&p| p < limit))
+    }
+
+    /// Resizes the pool's physical page count to `new_n_pages` (capped at `max_pages`).
+    /// On shrink, caller must ensure `can_shrink_to(new_n_pages)` is true.
+    pub fn resize(&mut self, new_n_pages: usize) {
+        let new_n = new_n_pages.min(self.max_pages);
+        if new_n > self.n_pages {
+            for p in (self.n_pages as u32..new_n as u32).rev() {
+                self.free.push(p);
+            }
+            self.n_pages = new_n;
+        } else if new_n < self.n_pages {
+            debug_assert!(self.can_shrink_to(new_n));
+            let limit = new_n as u32;
+            self.free.retain(|&p| p < limit);
+            self.n_pages = new_n;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elastic_grow_and_shrink_packs_low_pages() {
+        let mut p = KvPool::new(4, 16 * PAGE_POS);
+        // Simulate 2 lanes without GPU buffers by manipulating lanes directly
+        p.lanes.push(LanePages {
+            pages: vec![0, 1, 2, 3],
+            table: DeviceBuf { id: 0, offset_bytes: 0, size_bytes: 0 },
+            staging: PinnedBuf { id: 0, size_bytes: 0 },
+        });
+        p.pinned.push(true);
+        p.lost.push(false);
+        p.free.clear();
+
+        // Grow from 4 -> 8 pages
+        p.resize(8);
+        assert_eq!(p.pages_total(), 8);
+        assert_eq!(p.pages_free(), 4);
+
+        // Allocate high pages 4, 5
+        p.lanes[0].pages.push(4);
+        p.lanes[0].pages.push(5);
+        p.free.retain(|&x| x != 4 && x != 5);
+        assert!(!p.can_shrink_to(4));
+
+        // Release back to 2 pages (0, 1) -> pages 2,3,4,5 freed
+        p.release(0, 2 * PAGE_POS);
+        assert!(p.can_shrink_to(4));
+        p.resize(4);
+        assert_eq!(p.pages_total(), 4);
+        assert_eq!(p.pages_free(), 2);
+        assert!(p.free.iter().all(|&x| x < 4));
     }
 }

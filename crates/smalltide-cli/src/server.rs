@@ -1345,6 +1345,12 @@ fn admit(
             return None;
         }
     };
+    let elastic_init = engine.elastic_kv_initial_positions();
+    if elastic_init > 0 && prompt_ids.len() + 2048 <= elastic_init {
+        if let Err(e) = engine.maybe_shrink_kv_pool() {
+            eprintln!("[kv-elastic] shrink warning: {e}");
+        }
+    }
     // Where the prompt first differs from what a lane last held: when that is well past the
     // reused prefix, the client rewrote earlier history and the tokens between were read again.
     let live_match = pc.longest_live_match(&prompt_ids);

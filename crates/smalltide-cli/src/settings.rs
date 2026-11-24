@@ -297,8 +297,13 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     // other lanes at lane_ctx held before), any lane up to max_ctx; pages carry one per lane of slack.
     let page = smalltide_model_inkling2::kv_pager::PAGE_POS;
     let kv_tokens = parse("SMALLTIDE_KV_TOKENS", s.max_ctx + extra_lanes * lane_ctx, "a token count");
-    let kv_pool_pages = (std::env::var("SMALLTIDE_KV_PAGED").map_or(true, |v| v.trim() != "0"))
-        .then(|| kv_tokens.div_ceil(page) + lanes.max(1));
+    let kv_paged = std::env::var("SMALLTIDE_KV_PAGED").map_or(true, |v| v.trim() != "0");
+    let kv_max_pages = kv_paged.then(|| kv_tokens.div_ceil(page) + lanes.max(1));
+    let kv_initial_tokens = parse("SMALLTIDE_KV_INITIAL_TOKENS", kv_tokens, "a token count");
+    let kv_pool_pages = kv_max_pages.map(|max_p| {
+        let init_p = (kv_initial_tokens.div_ceil(page) + lanes.max(1)).max(4);
+        init_p.min(max_p)
+    });
     let est_kv_bytes = match kv_pool_pages {
         Some(p) => 40 * (2 * 8 * (cfg.local_window_size + 128) * 132) * lanes.max(1) + p * page * global_per_pos + 64 * 1024 * 1024,
         None => est_kv_bytes
@@ -479,6 +484,18 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     } else {
         (nvfp4_slots, mxfp8_slots)
     };
+    if let (Some(init_p), Some(max_p)) = (kv_pool_pages, kv_max_pages) {
+        if max_p > init_p {
+            engine.configure_elastic_kv(init_p, max_p);
+            println!(
+                "[kv-elastic] enabled: starts at {} pages ({}K), grows on demand up to {} pages ({}K) by borrowing NVFP4 slots",
+                init_p,
+                (init_p * page) / 1024,
+                max_p,
+                (max_p * page) / 1024
+            );
+        }
+    }
     let _ = &resident_split;
     if let Some(p) = priors {
         engine.tide.scheduler.install_priors(PriorsStore {

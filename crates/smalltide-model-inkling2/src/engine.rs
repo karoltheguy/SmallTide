@@ -274,8 +274,10 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     /// Expert map: the decoded tokens' routing (host copies of what the engine already read back),
     /// the last single-token decode's (lane, pos, token) and the last batched round's rows.
     pub routes: smalltide_tide::expert_map::RouteLog,
-    /// Paged global KV (one fixed pool shared by the lanes); `None`: every lane owns its caches.
+    /// Paged global KV (one shared pool); `None`: every lane owns its caches.
     kv_pool: Option<(crate::kv_pager::KvPool, KvPoolBufs)>,
+    /// Elastic KV bounds `(init_pages, max_pages, max_nvfp4_slots)` when dynamic KV growth is enabled.
+    elastic_kv: Option<(usize, usize, usize)>,
     map_last_tok: Option<(usize, usize, u32)>,
     map_batch_rows: Vec<(usize, usize, u32)>,
     pub(crate) route_log_inflight: bool,
@@ -585,6 +587,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             verify_rescued: Vec::new(),
             routes: smalltide_tide::expert_map::RouteLog::default(),
             kv_pool,
+            elastic_kv: None,
             map_last_tok: None,
             map_batch_rows: Vec::new(),
             last_tap_rows: 0,
@@ -1108,7 +1111,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.consume_route_log()?;
         static BATCH_RESCUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let want = *BATCH_RESCUE.get_or_init(|| std::env::var("SMALLTIDE_BATCH_RESCUE").map(|v| v.trim() != "0").unwrap_or(true));
-        let rescue = want && self.begin_rows_rescue(m)?;
+        let rescue = want && self.begin_rows_rescue(m, false)?;
         if !rescue {
             self.run_deferred_tide_step()?;
             let published = self.tide.poll_pending()?;
@@ -2014,14 +2017,192 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
     }
 
+    /// Enables elastic KV: starts at `init_pages` and dynamically borrows tail NVFP4 expert slots
+    /// to grow up to `max_pages` when a sequence needs more context, shrinking back when idle.
+    pub fn configure_elastic_kv(&mut self, init_pages: usize, max_pages: usize) {
+        if self.kv_pool.is_none() || max_pages <= init_pages {
+            self.elastic_kv = None;
+            return;
+        }
+        let max_nvfp4 = self.tide.pool_slots().0;
+        self.elastic_kv = Some((init_pages, max_pages, max_nvfp4));
+    }
+
+    /// Initial (baseline) elastic KV capacity in token positions (`0` when elastic KV is off).
+    pub fn elastic_kv_initial_positions(&self) -> usize {
+        self.elastic_kv.map_or(0, |(init_p, _, _)| init_p * crate::kv_pager::PAGE_POS)
+    }
+
+    /// Bytes per KV page across all global layers of the main model plus the drafter (if loaded).
+    fn elastic_bytes_per_kv_page(&self) -> usize {
+        let main_per_pos: usize = self.global_kv_regions().iter().map(|r| r.1).sum();
+        let drafter_per_pos = self.drafter.as_ref().map_or(0, |d| d.global_kv_bytes_per_pos());
+        (main_per_pos + drafter_per_pos) * crate::kv_pager::PAGE_POS
+    }
+
+    /// Syncs all active and parked lanes' global layer KV buffer handles after `kv_pool` reallocation.
+    fn sync_kv_pool_handles(&mut self) {
+        let Some((_, ref bufs)) = self.kv_pool else { return };
+        let apply = |states: &mut [LogicalLayerState]| {
+            let mut gi = 0usize;
+            for st in states.iter_mut() {
+                if !st._is_local {
+                    let l = bufs.layers[gi];
+                    st.k_cache = l.0;
+                    st.k_scales = l.1;
+                    st.v_cache = l.2;
+                    st.v_scales = l.3;
+                    gi += 1;
+                }
+            }
+        };
+        apply(&mut self.layer_states);
+        for parked in self.lane_store.iter_mut().flatten() {
+            apply(&mut parked.layer_states);
+        }
+    }
+
+    /// Resizes the shared paged KV pool (and drafter global KV) to `new_pages`, trading VRAM with
+    /// the NVFP4 expert pool while preserving all live KV pages via GPU D2D copies.
+    fn resize_kv_pool(&mut self, new_pages: usize) -> Result<bool> {
+        let Some((_, max_pages, max_nvfp4_slots)) = self.elastic_kv else {
+            return Ok(false);
+        };
+        let old_pages = match self.kv_pool.as_ref() {
+            Some((pool, _)) => pool.pages_total(),
+            None => return Ok(false),
+        };
+        let new_pages = new_pages.min(max_pages);
+        if new_pages == old_pages {
+            return Ok(true);
+        }
+        if new_pages < old_pages {
+            let can = self.kv_pool.as_ref().is_some_and(|(p, _)| p.can_shrink_to(new_pages));
+            if !can {
+                return Ok(false);
+            }
+        }
+
+        let bytes_per_page = self.elastic_bytes_per_kv_page();
+        let nvfp4_slab = self.tide.nvfp4_layout.aligned_slab_bytes;
+        let (cur_n4, _cur_m8) = self.tide.pool_slots();
+        let new_n4 = if new_pages > old_pages {
+            let delta_bytes = (new_pages - old_pages) * bytes_per_page;
+            let shrink_slots = delta_bytes.div_ceil(nvfp4_slab);
+            if cur_n4.saturating_sub(shrink_slots) < 256 {
+                return Ok(false);
+            }
+            cur_n4 - shrink_slots
+        } else {
+            let delta_bytes = (old_pages - new_pages) * bytes_per_page;
+            let grow_slots = delta_bytes / nvfp4_slab;
+            (cur_n4 + grow_slots).min(max_nvfp4_slots)
+        };
+
+        let t0 = Instant::now();
+        // 1. Quiesce GPU and release NVFP4 pool first so grown KV buffers are allocated in fast
+        //    resident VRAM before reallocating NVFP4 last (Windows WDDM allocation-order invariant).
+        let ranked_nvfp4 = self.tide.release_nvfp4_pool_for_resize()?;
+
+        // 2. Reallocate KV pool + drafter global KV, preserving live pages [0..min(old, new)) via D2D.
+        let b = self.backend.clone();
+        let s = self.tide.compute_stream;
+        let new_bufs = alloc_kv_pool(&*b, &self.cfg, new_pages, self.global_v_q4)?;
+        let old_bufs = {
+            let (pool, bufs) = self.kv_pool.as_mut().unwrap();
+            for (old_l, new_l) in bufs.layers.iter().zip(new_bufs.layers.iter()) {
+                for (o, n) in [
+                    (old_l.0, new_l.0),
+                    (old_l.1, new_l.1),
+                    (old_l.2, new_l.2),
+                    (old_l.3, new_l.3),
+                ] {
+                    let cp = o.size_bytes.min(n.size_bytes);
+                    if cp > 0 {
+                        b.memcpy_d2d_async(n, 0, o, 0, cp, s)?;
+                    }
+                }
+            }
+            b.sync_stream(s)?;
+            pool.resize(new_pages);
+            std::mem::replace(bufs, new_bufs)
+        };
+        for l in &old_bufs.layers {
+            b.free_device(l.0)?;
+            b.free_device(l.1)?;
+            b.free_device(l.2)?;
+            b.free_device(l.3)?;
+        }
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.resize_global_slots(new_pages * crate::kv_pager::PAGE_POS, s)?;
+        }
+        self.sync_kv_pool_handles();
+
+        // 3. Reallocate NVFP4 pool at the new slot count and refill hottest experts.
+        self.tide.restore_nvfp4_pool_after_resize(new_n4, &ranked_nvfp4)?;
+
+        let pp = crate::kv_pager::PAGE_POS;
+        eprintln!(
+            "[kv-elastic] {} KV pool: {} -> {} pages ({}K -> {}K ctx), nvfp4 slots {} -> {} ({:.0} ms)",
+            if new_pages > old_pages { "grew" } else { "shrank" },
+            old_pages,
+            new_pages,
+            (old_pages * pp) / 1024,
+            (new_pages * pp) / 1024,
+            cur_n4,
+            new_n4,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(true)
+    }
+
+    /// Shrinks the elastic KV pool back to its initial size if all currently allocated pages across
+    /// all lanes fit within `init_pages`, returning borrowed VRAM slots to the NVFP4 expert pool.
+    pub fn maybe_shrink_kv_pool(&mut self) -> Result<bool> {
+        let Some((init_pages, _, _)) = self.elastic_kv else {
+            return Ok(false);
+        };
+        let can = self.kv_pool.as_ref().is_some_and(|(p, _)| p.can_shrink_to(init_pages));
+        if !can {
+            return Ok(false);
+        }
+        self.resize_kv_pool(init_pages)
+    }
+
     /// Like `kv_ensure`, but returns false instead of failing (the server stops that request).
     pub fn kv_reserve(&mut self, lane: usize, end: usize) -> Result<bool> {
         let (b, s) = (self.backend.clone(), self.tide.compute_stream);
-        let Some((pool, _)) = self.kv_pool.as_mut() else { return Ok(true) };
+        if self.kv_pool.is_none() {
+            return Ok(true);
+        }
         if end > self.lane_max_seq[lane] {
             return Ok(false);
         }
-        pool.ensure(&*b, lane, end, s)
+        let ok = {
+            let (pool, _) = self.kv_pool.as_mut().unwrap();
+            pool.ensure(&*b, lane, end, s)?
+        };
+        if ok {
+            return Ok(true);
+        }
+        // Try growing elastic KV if enabled and below max_pages.
+        if let Some((_, max_pages, _)) = self.elastic_kv {
+            let (cur_pages, still_need) = {
+                let (pool, _) = self.kv_pool.as_ref().unwrap();
+                let need_total = end.div_ceil(crate::kv_pager::PAGE_POS);
+                let have = pool.lane_pages(lane).len();
+                (pool.pages_total(), need_total.saturating_sub(have))
+            };
+            if cur_pages < max_pages && still_need > 0 {
+                // Grow in 8-page (16K-token) steps so long prompts trigger at most one resize.
+                let target = (cur_pages + still_need).next_multiple_of(8).min(max_pages);
+                if self.resize_kv_pool(target)? {
+                    let (pool, _) = self.kv_pool.as_mut().unwrap();
+                    return pool.ensure(&*b, lane, end, s);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Returns `lane`'s global KV pages past position `keep` to the pool.
@@ -2183,7 +2364,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// or a batched round's rows, one a lane - and says whether they are on (threshold rescue with
     /// GPU-side waits, no dump). The rows forward then queues a check at every layer that is not
     /// fully resident (`queue_verify_rescue_check`) and services them (`service_verify_rescue_checks`).
-    pub(crate) fn begin_rows_rescue(&mut self, m: usize) -> Result<bool> {
+    pub(crate) fn begin_rows_rescue(&mut self, m: usize, speculative: bool) -> Result<bool> {
         let on = self.dump.is_none()
             && matches!(self.tide.scheduler.tide_cfg.rescue_policy, smalltide_core::RescuePolicy::Threshold(_))
             && std::env::var_os("SMALLTIDE_VERIFY_NO_RESCUE").is_none()
@@ -2197,7 +2378,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let pub2 = self.tide.wait_and_publish_all_pending()?;
             self.tide.scheduler.telemetry.stage1_async_published += pub2 as u64;
         }
-        self.tide.scheduler.begin_verify_step(m);
+        self.tide.scheduler.begin_verify_step_kind(m, speculative);
         self.wait_ticket = self.wait_ticket.wrapping_add(1).max(1024);
         if let Some((_, phost)) = self.rescue_patches {
             let n_log = self.layer_planned.len();
@@ -2232,7 +2413,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         self.ensure_rows_buffers()?;
         self.consume_route_log()?;
-        let use_verify_rescue = self.begin_rows_rescue(m)?;
+        let use_verify_rescue = self.begin_rows_rescue(m, true)?;
         if !use_verify_rescue {
             self.run_deferred_tide_step()?;
             let published = self.tide.poll_pending()?;

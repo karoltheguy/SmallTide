@@ -221,6 +221,10 @@ pub struct TideScheduler {
     last_periodic_rebalance_tok: u64,
     /// Per-block (Prelude / Loop Core / Coda) rescue gate & budget tuning telemetry.
     rescue_tracker: RescueTracker,
+    /// True during speculative draft-verify passes (row 0 is committed; later rows have lower survival).
+    speculative_verify: bool,
+    /// When true (default), discounts speculative tail rows in `plan_verify_layer_dispatch`.
+    pub spec_row_decay: bool,
 }
 
 impl TideScheduler {
@@ -259,6 +263,10 @@ impl TideScheduler {
             event_share: 0.0,
             last_periodic_rebalance_tok: 0,
             rescue_tracker: RescueTracker::default(),
+            speculative_verify: false,
+            spec_row_decay: std::env::var("SMALLTIDE_SPEC_ROW_DECAY")
+                .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 
@@ -617,14 +625,21 @@ impl TideScheduler {
         self.begin_verify_step(1);
     }
 
-    /// Step boundary for single-token decode (`verify_rows == 1`) or speculative verify (`m > 1`).
+    /// Step boundary for single-token decode (`verify_rows == 1`) or multi-row passes (`m > 1`).
     pub fn begin_verify_step(&mut self, verify_rows: usize) {
+        self.begin_verify_step_kind(verify_rows, false);
+    }
+
+    /// Step boundary with explicit `speculative` flag (`true` for draft-verify where row 0 is
+    /// guaranteed committed and tail rows are speculative; `false` for multi-lane independent rows).
+    pub fn begin_verify_step_kind(&mut self, verify_rows: usize, speculative: bool) {
         self.steer_auto_gates();
         let budgets = self.effective_zone_budgets(verify_rows);
         self.rescue_tracker.start_step(verify_rows, budgets);
         self.rescues_this_token = 0;
         self.rescues_by_zone = [0; 3];
         self.step_rescued.clear();
+        self.speculative_verify = speculative && verify_rows > 1;
     }
 
     /// True if `id` was copied in by an inline rescue in the current step: the step ran it, so the
@@ -1262,17 +1277,27 @@ impl TideScheduler {
                 self.rescue_tracker.cur.zones[zone].budget = zone_cap.min(u16::MAX as usize) as u16;
             }
             if self.rescues_by_zone[zone] < zone_cap {
-                // Aggregate (max_single_row_share, sum_share_across_rows) per unique missing expert.
+                // Aggregate (effective_max_share, weighted_sum_share) per unique missing expert.
+                // In speculative draft-verify passes, row 0 is always committed while tail rows are
+                // progressively more likely to be rejected, so discount tail rows by survival weight
+                // to avoid stalling the GPU for minor misses on discarded draft tokens.
+                const SPEC_ROW_SURVIVAL: [f32; 8] = [1.00, 0.85, 0.65, 0.45, 0.35, 0.30, 0.25, 0.25];
+                let decay = self.speculative_verify && self.spec_row_decay;
                 let mut miss_stats: Vec<(ExpertId, f32, f32)> = Vec::new();
-                for (r_ids, r_ws) in rows_ids.iter().zip(rows_ws.iter()) {
+                for (row_idx, (r_ids, r_ws)) in rows_ids.iter().zip(rows_ws.iter()).enumerate() {
                     let tot: f32 = r_ws.iter().sum();
                     let inv = if tot > 1e-8 { 1.0 / tot } else { 1.0 };
+                    let row_w = if decay {
+                        SPEC_ROW_SURVIVAL[row_idx.min(SPEC_ROW_SURVIVAL.len() - 1)]
+                    } else {
+                        1.0
+                    };
                     for (&e, &w) in r_ids.iter().zip(r_ws.iter()) {
                         let id = ExpertId { layer, expert: e };
                         if !self.cache.entry(id).vram_slot.is_missing() {
                             continue;
                         }
-                        let nw = w * inv;
+                        let nw = w * inv * row_w;
                         if let Some(st) = miss_stats.iter_mut().find(|s| s.0 == id) {
                             st.1 = st.1.max(nw);
                             st.2 += nw;
@@ -1281,7 +1306,7 @@ impl TideScheduler {
                         }
                     }
                 }
-                miss_stats.retain(|s| s.1 >= tau);
+                miss_stats.retain(|s| s.1 >= tau || (decay && s.2 >= tau * 1.25));
                 miss_stats.sort_by(|a, b| b.2.total_cmp(&a.2));
                 // 1/layer in Loop Core (36 passes); scale Prelude & Coda up to 3/layer when budget > 12.
                 // With the auto gate the block's budget is the limit: the gate is what keeps the

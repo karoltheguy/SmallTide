@@ -370,6 +370,55 @@ impl TideCache {
         self.scratch_occupants_mxfp8 = vec![None; self.scratch_ring_mxfp8 as usize];
     }
 
+    /// Clears all NVFP4 VRAM residency (both resident slots and scratch ring) without touching
+    /// MXFP8 VRAM or Tier 1 RAM copies. Returns every NVFP4 expert sorted by `value(id)` descending
+    /// so the caller can refill a resized NVFP4 pool with the hottest experts.
+    pub fn clear_nvfp4_vram_for_resize(&mut self) -> Vec<ExpertId> {
+        let mut ranked: Vec<(ExpertId, f64)> = Vec::new();
+        for i in 0..self.entries.len() {
+            let id = self.expert_from_flat(i);
+            if self.expert_class(id) != ExpertClass::Nvfp4 {
+                continue;
+            }
+            ranked.push((id, self.value(id)));
+            let e = &mut self.entries[i];
+            if !e.vram_slot.is_missing() {
+                if !e.is_scratch_slot {
+                    let bytes = self.model_cfg.expert_bytes(id.layer.0 as usize);
+                    self.vram_used_bytes = self.vram_used_bytes.saturating_sub(bytes);
+                }
+                e.vram_slot = SlotIndex::MISSING;
+                e.vram_pinned = false;
+                e.vram_pending = false;
+                e.is_scratch_slot = false;
+                self.gpu_slot_table[i] = SlotIndex::MISSING.0;
+                self.dirty_gpu_indices.insert(i);
+            }
+        }
+        self.used_vram_slots_nvfp4 = 0;
+        self.next_vram_slot_nvfp4 = 0;
+        self.free_vram_slots_nvfp4.clear();
+        self.scratch_cursor_nvfp4 = 0;
+        self.scratch_occupants_nvfp4.fill(None);
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        ranked.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Updates NVFP4 pool capacity and scratch ring without disturbing MXFP8 residency or ring.
+    pub fn reconfigure_nvfp4_capacity(
+        &mut self,
+        nvfp4_resident_capacity: u32,
+        nvfp4_ring: u32,
+        unified_vram_budget_bytes: usize,
+    ) {
+        self.unified_vram_budget_bytes = unified_vram_budget_bytes;
+        self.scratch_base_nvfp4 = nvfp4_resident_capacity;
+        self.max_vram_slots_nvfp4 = Some(nvfp4_resident_capacity as usize);
+        self.scratch_ring_nvfp4 = nvfp4_ring.max(1);
+        self.scratch_cursor_nvfp4 = 0;
+        self.scratch_occupants_nvfp4 = vec![None; self.scratch_ring_nvfp4 as usize];
+    }
+
     pub fn has_free_vram_room_for(&self, id: ExpertId) -> bool {
         let need = self.expert_bytes(id);
         if self.vram_used_bytes + need > self.vram_expert_budget_bytes() {
@@ -475,6 +524,10 @@ impl TideCache {
         self.entries[idx].vram_slot = scratch_slot;
         self.entries[idx].is_scratch_slot = true;
         self.entries[idx].vram_pending = true;
+        // Protect this newly staged rescue so later rescues in the same layer cannot wrap and overwrite it.
+        if !self.protected.contains(&idx) {
+            self.protected.push(idx);
+        }
 
         let src_ram = if self.is_ram_ready(id) {
             Some(self.entries[idx].ram_slot)

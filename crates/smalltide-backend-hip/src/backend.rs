@@ -2451,19 +2451,21 @@ impl ComputeBackend for HipBackend {
 
     fn dspark_ctx_store_fp8(&self, kc: DeviceBuf, ks: DeviceBuf, vc: DeviceBuf, vs: DeviceBuf,
         k: DeviceBuf, v: DeviceBuf, pos0: usize, rows: usize, ring: usize, nkv: usize,
-        v_q4: bool, stream: Stream) -> Result<()> {
+        v_q4: bool, page_table: Option<DeviceBuf>, stream: Stream) -> Result<()> {
         let (mut a, mut b, mut c, mut d, mut kk, mut vv) = (self.dev_ptr(kc)?, self.dev_ptr(ks)?,
             self.dev_ptr(vc)?, self.dev_ptr(vs)?, self.dev_ptr(k)?, self.dev_ptr(v)?);
         let (mut p0, mut rg, mut nk, mut vq4) = (pos0 as u32, ring as u32, nkv as u32, v_q4 as u32);
-        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut kk), p(&mut vv), p(&mut p0), p(&mut rg), p(&mut nk), p(&mut vq4)];
+        let mut pt = self.opt_dev_ptr(page_table)?;
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut d), p(&mut kk), p(&mut vv), p(&mut p0), p(&mut rg), p(&mut nk), p(&mut vq4), p(&mut pt)];
         self.launch(self.kernels.dspark_ctx_store_fp8, (rows as u32, nk, 1), 128, &mut args, stream, "launch(dspark_ctx_store_fp8)")
     }
 
     fn dspark_attn_fp8(&self, out: DeviceBuf, part_o: DeviceBuf, part_m: DeviceBuf, part_l: DeviceBuf,
         q: DeviceBuf, kb: DeviceBuf, vb: DeviceBuf, kc: DeviceBuf, ks: DeviceBuf,
         vc: DeviceBuf, vs: DeviceBuf, rows: usize, pp: usize, lo: usize, ring: usize,
-        nh: usize, nkv: usize, nblk: usize, scale: f32, v_q4: bool, stream: Stream) -> Result<()> {
+        nh: usize, nkv: usize, nblk: usize, scale: f32, v_q4: bool, page_table: Option<DeviceBuf>, stream: Stream) -> Result<()> {
         let nctx = pp.saturating_sub(lo);
+        let mut pt = self.opt_dev_ptr(page_table)?;
         let num_splits = nctx.div_ceil(128).clamp(1, 16) as u32;
         let (mut o, mut po, mut pm, mut pl) = (self.dev_ptr(out)?, self.dev_ptr(part_o)?, self.dev_ptr(part_m)?, self.dev_ptr(part_l)?);
         let (mut qq, mut a, mut b, mut c, mut cs, mut d, mut ds) = (self.dev_ptr(q)?, self.dev_ptr(kb)?, self.dev_ptr(vb)?,
@@ -2472,7 +2474,7 @@ impl ComputeBackend for HipBackend {
             (pp as u32, lo as u32, ring as u32, nh as u32, nkv as u32, nblk as u32, num_splits, scale, v_q4 as u32);
         let mut args = [p(&mut o), p(&mut po), p(&mut pm), p(&mut pl), p(&mut qq), p(&mut a), p(&mut b),
             p(&mut c), p(&mut cs), p(&mut d), p(&mut ds), p(&mut pv), p(&mut lv), p(&mut rg),
-            p(&mut n1), p(&mut n2), p(&mut nb), p(&mut ns), p(&mut sc), p(&mut vq4)];
+            p(&mut n1), p(&mut n2), p(&mut nb), p(&mut ns), p(&mut sc), p(&mut vq4), p(&mut pt)];
         self.launch(self.kernels.dspark_attn_fp8_split, (n2, ns, 1), 256, &mut args, stream, "launch(dspark_attn_fp8_split)")?;
         if num_splits > 1 {
             let (mut o2, mut po2, mut pm2, mut pl2, mut n1b, mut ns2) = (o, po, pm, pl, nh as u32, num_splits);

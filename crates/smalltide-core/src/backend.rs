@@ -837,11 +837,12 @@ pub trait ComputeBackend: Send + Sync {
         self.attn_prefill_fp8(out, q, k_cache, k_scales, v_cache, v_scales, rel_table, sinks, params, stream)
     }
 
-    /// FP8/K8V4 context K/V store of `rows` rows at positions `pos0..` (`ring` = 0: linear).
+    /// FP8/K8V4 context K/V store of `rows` rows at positions `pos0..` (`ring` = 0: linear;
+    /// `page_table`: the sequence's pages when the cache is the shared paged KV pool).
     #[allow(clippy::too_many_arguments)]
     fn dspark_ctx_store_fp8(&self, _kc: DeviceBuf, _ks: DeviceBuf, _vc: DeviceBuf, _vs: DeviceBuf,
         _k: DeviceBuf, _v: DeviceBuf, _pos0: usize, _rows: usize, _ring: usize, _nkv: usize,
-        _v_q4: bool, _stream: Stream) -> Result<()> {
+        _v_q4: bool, _page_table: Option<DeviceBuf>, _stream: Stream) -> Result<()> {
         Err(crate::SmallTideError::Unsupported("dspark_ctx_store_fp8".into()))
     }
 
@@ -850,7 +851,7 @@ pub trait ComputeBackend: Send + Sync {
     fn dspark_attn_fp8(&self, _out: DeviceBuf, _part_o: DeviceBuf, _part_m: DeviceBuf, _part_l: DeviceBuf,
         _q: DeviceBuf, _kb: DeviceBuf, _vb: DeviceBuf, _kc: DeviceBuf, _ks: DeviceBuf,
         _vc: DeviceBuf, _vs: DeviceBuf, _rows: usize, _p: usize, _lo: usize, _ring: usize,
-        _nh: usize, _nkv: usize, _nblk: usize, _scale: f32, _v_q4: bool, _stream: Stream) -> Result<()> {
+        _nh: usize, _nkv: usize, _nblk: usize, _scale: f32, _v_q4: bool, _page_table: Option<DeviceBuf>, _stream: Stream) -> Result<()> {
         Err(crate::SmallTideError::Unsupported("dspark_attn_fp8".into()))
     }
 

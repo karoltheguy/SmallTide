@@ -128,7 +128,8 @@ pub struct TideCache {
     pub no_ram_copy_on_direct: bool,
     used_vram_slots_nvfp4: usize,
     used_vram_slots_mxfp8: usize,
-    scratch_ring_size: u32,
+    scratch_ring_nvfp4: u32,
+    scratch_ring_mxfp8: u32,
     scratch_cursor_nvfp4: u32,
     scratch_cursor_mxfp8: u32,
     scratch_occupants_nvfp4: Vec<Option<ExpertId>>,
@@ -189,7 +190,8 @@ impl TideCache {
             no_ram_copy_on_direct: false,
             used_vram_slots_nvfp4: 0,
             used_vram_slots_mxfp8: 0,
-            scratch_ring_size: 8,
+            scratch_ring_nvfp4: 8,
+            scratch_ring_mxfp8: 8,
             scratch_cursor_nvfp4: 0,
             scratch_cursor_mxfp8: 0,
             scratch_occupants_nvfp4: vec![None; 8],
@@ -341,15 +343,28 @@ impl TideCache {
         mxfp8_resident_capacity: u32,
         ring_size: u32,
     ) {
+        self.configure_scratch_rings(nvfp4_resident_capacity, mxfp8_resident_capacity, ring_size, ring_size)
+    }
+
+    /// `configure_scratch_ring` with a ring size per pool. A rescued expert stays in its ring
+    /// (and counts as on the card) until that many later rescues of its class have come in.
+    pub fn configure_scratch_rings(
+        &mut self,
+        nvfp4_resident_capacity: u32,
+        mxfp8_resident_capacity: u32,
+        nvfp4_ring: u32,
+        mxfp8_ring: u32,
+    ) {
         self.scratch_base_nvfp4 = nvfp4_resident_capacity;
         self.scratch_base_mxfp8 = mxfp8_resident_capacity;
         self.max_vram_slots_nvfp4 = Some(nvfp4_resident_capacity as usize);
         self.max_vram_slots_mxfp8 = Some(mxfp8_resident_capacity as usize);
-        self.scratch_ring_size = ring_size.max(1);
+        self.scratch_ring_nvfp4 = nvfp4_ring.max(1);
+        self.scratch_ring_mxfp8 = mxfp8_ring.max(1);
         self.scratch_cursor_nvfp4 = 0;
         self.scratch_cursor_mxfp8 = 0;
-        self.scratch_occupants_nvfp4 = vec![None; self.scratch_ring_size as usize];
-        self.scratch_occupants_mxfp8 = vec![None; self.scratch_ring_size as usize];
+        self.scratch_occupants_nvfp4 = vec![None; self.scratch_ring_nvfp4 as usize];
+        self.scratch_occupants_mxfp8 = vec![None; self.scratch_ring_mxfp8 as usize];
     }
 
     pub fn has_free_vram_room_for(&self, id: ExpertId) -> bool {
@@ -404,7 +419,10 @@ impl TideCache {
     /// any resident VRAM expert (skipping any ring slot occupied by a `protected` expert).
     pub fn stage_scratch_rescue(&mut self, id: ExpertId) -> TransferOp {
         let cls = self.expert_class(id);
-        let ring_size = self.scratch_ring_size as usize;
+        let ring_size = match cls {
+            ExpertClass::Nvfp4 => self.scratch_ring_nvfp4,
+            ExpertClass::Mxfp8 => self.scratch_ring_mxfp8,
+        } as usize;
         let (base, prev_occupant, ring_idx) = match cls {
             ExpertClass::Nvfp4 => {
                 let mut r = (self.scratch_cursor_nvfp4 as usize) % ring_size;
@@ -966,8 +984,8 @@ impl TideCache {
     /// First Scratch Rescue slot index and ring size of a class.
     pub fn scratch_ring(&self, cls: ExpertClass) -> (u32, u32) {
         match cls {
-            ExpertClass::Nvfp4 => (self.scratch_base_nvfp4, self.scratch_ring_size),
-            ExpertClass::Mxfp8 => (self.scratch_base_mxfp8, self.scratch_ring_size),
+            ExpertClass::Nvfp4 => (self.scratch_base_nvfp4, self.scratch_ring_nvfp4),
+            ExpertClass::Mxfp8 => (self.scratch_base_mxfp8, self.scratch_ring_mxfp8),
         }
     }
 

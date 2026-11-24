@@ -254,7 +254,8 @@ pub fn parse_json(s: &str) -> Result<OJson, String> {
 
 /// Lenient JSON parser used only as a fallback for model-emitted tool calls after strict
 /// `parse_json` fails. Tolerates non-standard string escapes (`\'`, `\s`, `\U`, non-hex `\u`),
-/// trailing commas, and unescaped inner quotes (e.g. HTML attributes inside large payloads).
+/// trailing commas, unescaped inner quotes (e.g. HTML attributes inside large payloads), and a
+/// string whose closing quote was escaped (at the end of the call or before the next member).
 pub fn parse_json_lenient(s: &str) -> Result<OJson, String> {
     parse_json_with(s, true)
 }
@@ -288,6 +289,36 @@ impl Parser<'_> {
         let rest = &self.b[self.i.min(self.b.len())..];
         rest.iter().any(|c| matches!(c, b'}' | b']'))
             && rest.iter().all(|c| matches!(c, b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r'))
+    }
+    /// True when the input goes on with `,"name":` - the next member of an object - with the
+    /// name's quotes unescaped. Inside a valid string that cannot happen (its first bare quote
+    /// would end the string, and a name's character cannot follow a string's end), so an escaped
+    /// quote right before it is the string's own closing quote, escaped by mistake.
+    fn next_member_follows(&self) -> bool {
+        let b = self.b;
+        let skip_ws = |mut k: usize| {
+            while k < b.len() && matches!(b[k], b' ' | b'\t' | b'\n' | b'\r') {
+                k += 1;
+            }
+            k
+        };
+        let mut k = skip_ws(self.i);
+        if b.get(k) != Some(&b',') {
+            return false;
+        }
+        k = skip_ws(k + 1);
+        if b.get(k) != Some(&b'"') {
+            return false;
+        }
+        k += 1;
+        let st = k;
+        while k < b.len() && k - st <= 64 && (b[k].is_ascii_alphanumeric() || matches!(b[k], b'_' | b'-' | b'.')) {
+            k += 1;
+        }
+        if k == st || b.get(k) != Some(&b'"') {
+            return false;
+        }
+        b.get(skip_ws(k + 1)) == Some(&b':')
     }
     fn err<T>(&self, m: &str) -> Result<T, String> {
         Err(format!("invalid JSON at byte {}: {m}", self.i))
@@ -464,6 +495,9 @@ impl Parser<'_> {
                         // input is the string's closing quote, escaped by mistake (otherwise the
                         // string, and the whole call, would never terminate).
                         b'"' if self.lenient && self.only_closers_follow() => return Ok(out),
+                        // Lenient: the same mistake in the middle of an object, e.g.
+                        // `"new_text":"...;\","old_text":"..."`.
+                        b'"' if self.lenient && self.next_member_follows() => return Ok(out),
                         b'"' => out.push('"'),
                         b'\\' => out.push('\\'),
                         b'/' => out.push('/'),
@@ -1107,6 +1141,26 @@ mod tests {
                 AnswerEvent::ToolCall { name: "get_weather".into(), arguments: r#"{"city":"Brasília"}"#.into() },
             ]
         );
+    }
+
+    #[test]
+    fn lenient_json_closes_a_string_whose_quote_was_escaped_before_the_next_member() {
+        // A captured failure: the closing quote of `new_text` came out as `\"`.
+        let raw = r#"{"name":"edit_artifact","args":{"edits":[{"new_text":"scene.add(new THREE.AmbientLight(0x8a7ab8,0.0));\","old_text":"scene.add(new THREE.AmbientLight(0x8a7ab8,0.38));"}],"id":"mwu7aimkn18q"}}"#;
+        assert!(parse_json(raw).is_err());
+        let v = parse_json_lenient(raw).expect("recovered");
+        let edit = match v.get("args").and_then(|a| a.get("edits")) {
+            Some(OJson::Arr(e)) => e[0].clone(),
+            _ => panic!("no edits list"),
+        };
+        assert_eq!(edit.get("new_text").and_then(OJson::as_str), Some("scene.add(new THREE.AmbientLight(0x8a7ab8,0.0));"));
+        assert_eq!(edit.get("old_text").and_then(OJson::as_str), Some("scene.add(new THREE.AmbientLight(0x8a7ab8,0.38));"));
+        assert_eq!(v.get("args").and_then(|a| a.get("id")).and_then(OJson::as_str), Some("mwu7aimkn18q"));
+        // JSON quoted inside a string keeps its escaped quotes (all of them are escaped there),
+        // also when the lenient parser runs because of a defect elsewhere (the trailing comma).
+        let v = parse_json_lenient(r#"{"a":"{\"x\":\"1\",\"y\":2}","b":"say \"hi\", then go","c":1,}"#).unwrap();
+        assert_eq!(v.get("a").and_then(OJson::as_str), Some(r#"{"x":"1","y":2}"#));
+        assert_eq!(v.get("b").and_then(OJson::as_str), Some(r#"say "hi", then go"#));
     }
 
     #[test]

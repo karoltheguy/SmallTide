@@ -1237,7 +1237,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         } else {
             (self.tide.vram_pool_nvfp4, self.tide.nvfp4_layout.aligned_slab_bytes, ExpertClass::Nvfp4)
         };
-        let ring = self.tide.scheduler.cache.scratch_ring(cls).1 as usize;
+        // Prefill stages a wave's missing experts in the first slots of the rescue ring, 8 at a
+        // time whatever the ring's size (`SMALLTIDE_RESCUE_RING_*` is for decode).
+        let ring = (self.tide.scheduler.cache.scratch_ring(cls).1 as usize).min(smalltide_tide::runtime::DEFAULT_SCRATCH_RING_SLOTS);
 
         let (out, mid, tmp, x) = {
             let pf = self.pf.as_ref().unwrap();

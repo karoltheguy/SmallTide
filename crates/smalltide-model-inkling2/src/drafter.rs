@@ -53,10 +53,14 @@ struct DrafterLayer {
     k_norm: DeviceBuf,
     k_norm_ctx: DeviceBuf,
     /// Context K / V in FP8 E4M3FN `[slots][HK * HD]` + per-head-pos f32 scales `[slots][HK]`.
+    /// A local layer's are the current lane's ring (see `lane_ctx`); the global layer's hold
+    /// every lane's context, a lane's positions mapped through its page table when paged.
     kc: DeviceBuf,
     ks: DeviceBuf,
     vc: DeviceBuf,
     vs: DeviceBuf,
+    /// Local layers: each lane's ring (kc, ks, vc, vs). Empty for the global layer.
+    lane_ctx: Vec<[DeviceBuf; 4]>,
 }
 
 struct Scratch {
@@ -118,6 +122,10 @@ pub struct Drafter<B: ComputeBackend> {
     chunk: usize,
     sc: Scratch,
     pub vram_bytes: usize,
+    /// The lane whose context `ingest` writes and `draft` reads, and its page table into the
+    /// shared KV pool (`None`: the global layer's cache is one sequence's, position = slot).
+    lane: usize,
+    page_table: Option<DeviceBuf>,
 }
 
 fn bf16r(x: f32) -> f32 {
@@ -147,7 +155,12 @@ impl<B: ComputeBackend> Drafter<B> {
     /// Loads `mtp.safetensors` (dense projections quantized to FP8 per row), keeps `w1` in
     /// host-mapped pinned memory, splits `rnn_proj` into dynamic/static blocks, uses FP8 context
     /// KV, and folds `U @ hidden_out` into padded FP8 E4M3FN.
-    pub fn load(backend: Arc<B>, path: &Path, dense: &Inkling2DenseGpu<B>, vocab: usize, max_seq: usize, chunk: usize, global_v_q4: bool) -> Result<Self> {
+    /// `lanes`: sequences that each keep their own context (local rings a lane, about 4 MiB).
+    /// `global_slots`: slots of the global layer's cache - the positions of the shared KV pool
+    /// when the lanes page into it (pass each lane's table with `set_lane`), else `max_seq`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(backend: Arc<B>, path: &Path, dense: &Inkling2DenseGpu<B>, vocab: usize, max_seq: usize, chunk: usize, global_v_q4: bool,
+                lanes: usize, global_slots: usize) -> Result<Self> {
         let hdr = inspect_safetensors_header(path)?;
         let base = 8u64 + hdr.header_len;
         let mut f = File::open(path)?;
@@ -183,17 +196,26 @@ impl<B: ComputeBackend> Drafter<B> {
                 let k_norm_ctx = vec(&mut f, "self_attn.k_norm_ctx.weight")?;
                 let local = l != 1;
                 let v_q4 = !local && global_v_q4;
-                let slots = if local { RING } else { max_seq };
-                let kc = backend.alloc_device(slots * HK * HD)?;
-                let ks = backend.alloc_device(slots * HK * 4)?;
+                let slots = if local { RING } else { global_slots.max(max_seq) };
                 let vc_bytes = slots * HK * if v_q4 { HD / 2 } else { HD };
                 let vs_bytes = slots * HK * if v_q4 { 16 } else { 4 };
-                let vc = backend.alloc_device(vc_bytes)?;
-                let vs = backend.alloc_device(vs_bytes)?;
-                bytes += slots * HK * (HD + 4) + vc_bytes + vs_bytes;
+                let mut lane_ctx: Vec<[DeviceBuf; 4]> = Vec::new();
+                for _ in 0..if local { lanes.max(1) } else { 1 } {
+                    lane_ctx.push([
+                        backend.alloc_device(slots * HK * HD)?,
+                        backend.alloc_device(slots * HK * 4)?,
+                        backend.alloc_device(vc_bytes)?,
+                        backend.alloc_device(vs_bytes)?,
+                    ]);
+                    bytes += slots * HK * (HD + 4) + vc_bytes + vs_bytes;
+                }
+                let [kc, ks, vc, vs] = lane_ctx[0];
+                if !local {
+                    lane_ctx.clear();
+                }
                 layers.push(DrafterLayer {
                     local, v_q4, in_ln, post_ln, dflare, q, k, v, k_ctx, v_ctx, o, gate, up: upm, down,
-                    q_norm, k_norm, k_norm_ctx, kc, ks, vc, vs,
+                    q_norm, k_norm, k_norm_ctx, kc, ks, vc, vs, lane_ctx,
                 });
             }
             let rdv = |f: &mut File, name: &str| read_f32_vec(f, &hdr, base, name);
@@ -324,12 +346,31 @@ impl<B: ComputeBackend> Drafter<B> {
                 chunk,
                 sc,
                 vram_bytes: bytes,
+                lane: 0,
+                page_table: None,
             })
         })();
         let _ = backend.sync_stream(stream);
         let _ = backend.free_pinned(staging);
         let _ = backend.destroy_stream(stream);
         res
+    }
+
+    /// Makes `lane` the sequence `ingest` writes and `draft` reads: its local rings and, when the
+    /// global layer's cache is the shared KV pool, its page table (`None`: position = slot).
+    pub fn set_lane(&mut self, lane: usize, page_table: Option<DeviceBuf>) {
+        self.page_table = page_table;
+        self.lane = lane;
+        for ly in self.layers.iter_mut() {
+            if let Some(&[kc, ks, vc, vs]) = ly.lane_ctx.get(lane) {
+                (ly.kc, ly.ks, ly.vc, ly.vs) = (kc, ks, vc, vs);
+            }
+        }
+    }
+
+    /// Lanes that keep their own context.
+    pub fn lanes(&self) -> usize {
+        self.layers.iter().map(|ly| ly.lane_ctx.len()).max().unwrap_or(1).max(1)
     }
 
     /// Context K/V of `m` committed rows at positions `pos0..` from their taps
@@ -357,7 +398,8 @@ impl<B: ComputeBackend> Drafter<B> {
                 b.gemm_fp8_rows(sc.ctx_v, sc.ctx_c, ly.v_ctx.data, ly.v_ctx.row_scales, m, kvd, D, s)?;
             }
             b.dspark_head_norm_rope(sc.ctx_k, ly.k_norm_ctx, HK, m, pos0, THETA, EPS, s)?;
-            b.dspark_ctx_store_fp8(ly.kc, ly.ks, ly.vc, ly.vs, sc.ctx_k, sc.ctx_v, pos0, m, if ly.local { RING } else { 0 }, HK, ly.v_q4, s)?;
+            let pages = if ly.local { None } else { self.page_table };
+            b.dspark_ctx_store_fp8(ly.kc, ly.ks, ly.vc, ly.vs, sc.ctx_k, sc.ctx_v, pos0, m, if ly.local { RING } else { 0 }, HK, ly.v_q4, pages, s)?;
         }
         Ok(())
     }
@@ -400,7 +442,7 @@ impl<B: ComputeBackend> Drafter<B> {
             b.dspark_attn_fp8(
                 sc.att, sc.part_o, sc.part_m, sc.part_l,
                 sc.q, sc.kb, sc.vb, ly.kc, ly.ks, ly.vc, ly.vs,
-                BLOCK, p, lo, ring, HQ, HK, BLOCK, scale, ly.v_q4, s,
+                BLOCK, p, lo, ring, HQ, HK, BLOCK, scale, ly.v_q4, if ly.local { None } else { self.page_table }, s,
             )?;
             b.gemv_multi_rows(&[seg(&ly.o, sc.att, sc.tmp)], BLOCK, s)?;
             b.add_rmsnorm_rows(sc.res, sc.xn, sc.tmp, ly.post_ln, BLOCK, D, EPS, s)?;
@@ -476,8 +518,18 @@ impl<B: ComputeBackend> Drop for Drafter<B> {
                 let _ = b.free_device(m.data);
                 let _ = b.free_device(m.row_scales);
             }
-            for buf in [ly.in_ln, ly.post_ln, ly.dflare, ly.q_norm, ly.k_norm, ly.k_norm_ctx, ly.kc, ly.ks, ly.vc, ly.vs] {
+            for buf in [ly.in_ln, ly.post_ln, ly.dflare, ly.q_norm, ly.k_norm, ly.k_norm_ctx] {
                 let _ = b.free_device(buf);
+            }
+            if ly.lane_ctx.is_empty() {
+                for buf in [ly.kc, ly.ks, ly.vc, ly.vs] {
+                    let _ = b.free_device(buf);
+                }
+            }
+            for bufs in &ly.lane_ctx {
+                for &buf in bufs {
+                    let _ = b.free_device(buf);
+                }
             }
         }
         for m in [&self.rnn_w_h, &self.rnn_w_frnn] {

@@ -192,6 +192,9 @@ pub struct RescueSnapshot {
 pub struct ExpertMap {
     /// the model's layer index of each row: the layers with routed experts, in order
     pub layers: Vec<usize>,
+    /// the physical layer each row shows: a looped layer has one row per pass, all showing the
+    /// same experts. Empty: every row is its own layer.
+    pub physical: Vec<usize>,
     pub experts: usize,
     /// [row * experts + expert]
     pub state: Vec<u8>,
@@ -216,11 +219,25 @@ pub struct ExpertMap {
 }
 
 impl ExpertMap {
-    /// Experts in each state, by the constants above.
+    /// The rows that show a physical layer for the first time (all of them without `physical`).
+    fn first_rows(&self) -> Vec<usize> {
+        let rows = self.state.len() / self.experts.max(1);
+        (0..rows).filter(|&r| self.physical.get(r).map_or(true, |p| !self.physical[..r].contains(p))).collect()
+    }
+
+    /// Physical layers shown: a looped layer counts once however many rows it has.
+    pub fn physical_layers(&self) -> usize {
+        self.first_rows().len()
+    }
+
+    /// Experts in each state, by the constants above; an expert of a looped layer counts once.
     pub fn counts(&self) -> [usize; 4] {
         let mut n = [0; 4];
-        for &s in &self.state {
-            n[(s as usize).min(3)] += 1;
+        let e = self.experts.max(1);
+        for r in self.first_rows() {
+            for &s in &self.state[r * e..(r + 1) * e] {
+                n[(s as usize).min(3)] += 1;
+            }
         }
         n
     }
@@ -245,15 +262,29 @@ impl ExpertMap {
 }
 
 #[cfg(test)]
+impl ExpertMap {
+    fn clone_shape(&self) -> ExpertMap {
+        ExpertMap { layers: self.layers.clone(), physical: self.physical.clone(), experts: self.experts, state: self.state.clone(),
+                    demand: None, slots: self.slots, spare: self.spare, world: self.world, busy: self.busy,
+                    counters: vec![], events: vec![], routes: vec![], rescue: None }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn rows_and_counts() {
-        let m = ExpertMap { layers: vec![3, 5], experts: 4, state: vec![0, 1, 1, 3, 2, 0, 0, 1],
+        let m = ExpertMap { layers: vec![3, 5], physical: vec![], experts: 4, state: vec![0, 1, 1, 3, 2, 0, 0, 1],
                             demand: Some(vec![0.0, 1.0, 4.0, 1e-9, 0.0, 0.0, 0.0, 0.0]), slots: 8, spare: 2, world: 2, busy: false,
                             counters: vec![], events: vec![], routes: vec![], rescue: None };
         assert_eq!(m.counts(), [3, 3, 1, 1]);
+        assert_eq!(m.physical_layers(), 2);
+        // A looped layer drawn twice (rows 0 and 2) counts once.
+        let looped = ExpertMap { layers: vec![0, 1, 2], physical: vec![0, 1, 0], state: vec![0, 1, 1, 3, 2, 0, 0, 1, 0, 1, 1, 3], ..m.clone_shape() };
+        assert_eq!(looped.counts(), [3, 3, 1, 1]);
+        assert_eq!(looped.physical_layers(), 2);
         assert_eq!(m.state_rows(), ["0113", "2001"]);
         // 1/4 of the top is half the scale; a trace of mass is never shown as none; an unused row is all 0
         assert_eq!(m.demand_rows().unwrap(), ["0iz1", "0000"]);

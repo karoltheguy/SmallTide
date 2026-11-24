@@ -194,6 +194,8 @@ fn main() {
         max_seq,
         chunk,
         v_q4,
+        1,
+        max_seq,
     )
     .expect("Drafter::load");
     println!(

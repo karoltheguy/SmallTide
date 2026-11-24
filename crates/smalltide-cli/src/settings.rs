@@ -280,19 +280,6 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     spawn_gpu_heartbeat(backend.clone());
     let dense_gpu = Inkling2DenseGpu::upload(backend.clone(), dense_host).expect("upload dense GPU");
     smalltide_model_inkling2::engine::set_prefill_chunk(parse("SMALLTIDE_PREFILL_CHUNK", 1024usize, "a token count (64 to 1024)"));
-    // The drafter goes before the VRAM measurement so the pool budget accounts for it.
-    let drafter = if s.spec {
-        let path = dir.join("mtp.safetensors");
-        let t = Instant::now();
-        let d = smalltide_model_inkling2::drafter::Drafter::load(backend.clone(), &path, &dense_gpu, cfg.unpadded_vocab_size, s.max_ctx,
-            smalltide_model_inkling2::engine::prefill_chunk(), s.kv_v_q4).expect("load drafter (mtp.safetensors)");
-        println!("[spec] DSpark drafter loaded ({:.0} MiB VRAM, kv={}, {:.1}s)", d.vram_bytes as f64 / (1u64 << 20) as f64,
-            if s.kv_v_q4 { "k8v4" } else { "fp8" }, t.elapsed().as_secs_f64());
-        Some(d)
-    } else {
-        None
-    };
-    let info_after_dense = backend.device_info().expect("device_info");
 
     // Auto-size expert pools from free device memory after dense + KV + headroom.
     let nvfp4_slab = ExpertSlabLayout::for_inkling2(&cfg, DType::NVFP4).aligned_slab_bytes;
@@ -317,8 +304,31 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
         None => est_kv_bytes
             + extra_lanes * (40 * (2 * 8 * (cfg.local_window_size + 128) * 132) + lane_ctx * global_per_pos),
     };
+    // The drafter goes before the VRAM measurement so the pool budget accounts for it.
+    let drafter = if s.spec {
+        let path = dir.join("mtp.safetensors");
+        let t = Instant::now();
+        let d = smalltide_model_inkling2::drafter::Drafter::load(backend.clone(), &path, &dense_gpu, cfg.unpadded_vocab_size, s.max_ctx,
+            smalltide_model_inkling2::engine::prefill_chunk(), s.kv_v_q4,
+            // Every lane keeps its own drafter context: local rings a lane, and the global layer
+            // in the same pages of the shared KV pool as the lane's global KV.
+            lanes.max(1), kv_pool_pages.map_or(s.max_ctx, |p| p * page)).expect("load drafter (mtp.safetensors)");
+        println!("[spec] DSpark drafter loaded ({:.0} MiB VRAM, kv={}, {:.1}s)", d.vram_bytes as f64 / (1u64 << 20) as f64,
+            if s.kv_v_q4 { "k8v4" } else { "fp8" }, t.elapsed().as_secs_f64());
+        Some(d)
+    } else {
+        None
+    };
+    let info_after_dense = backend.device_info().expect("device_info");
     let headroom_bytes = 900 * 1024 * 1024usize;
-    let scratch_ring_bytes = 8 * (nvfp4_slab + mxfp8_slab);
+    let (ring4, ring8) = smalltide_tide::runtime::rescue_ring_slots();
+    let scratch_ring_bytes = ring4 * nvfp4_slab + ring8 * mxfp8_slab;
+    if (ring4, ring8) != (8, 8) {
+        println!(
+            "[pools] rescue rings: {ring4} NVFP4 + {ring8} MXFP8 slots ({:.0} MiB that would otherwise hold resident experts)",
+            (scratch_ring_bytes - 8 * (nvfp4_slab + mxfp8_slab)) as f64 / (1u64 << 20) as f64
+        );
+    }
     let mut avail = info_after_dense
         .free_vram_bytes
         .saturating_sub(est_kv_bytes + headroom_bytes + scratch_ring_bytes);
@@ -445,6 +455,9 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     if resident_fit && s.nvfp4_slots.is_none() && s.mxfp8_slots.is_none() {
         if let Some((usage, resident)) = backend.resident_vram_info() {
             let tail = std::env::var("SMALLTIDE_RESIDENT_TAIL_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(384) << 20;
+            // The rings are part of the pool allocations made below, so their bytes come out of
+            // what is left for resident slots. (Crediting the placeholder pools' rings back here
+            // was tried and put the process over the budget by exactly the rings' size.)
             let left = (resident as usize).saturating_sub(usage as usize + scratch_ring_bytes + tail);
             let planned = nvfp4_slots * nvfp4_slab + mxfp8_slots * mxfp8_slab;
             if planned > left {

@@ -174,6 +174,22 @@ impl<S> PrefixCache<S> {
         }
     }
 
+    /// Restore plan for the longest snapshot that `new` starts with and `keep` accepts (e.g. only
+    /// snapshots that also hold the drafter's state), if there is one.
+    pub fn plan_restore_where(&self, lane: usize, new: &[u32], keep: impl Fn(&S) -> bool) -> Option<PrefixPlan> {
+        let limit = new.len().checked_sub(1)?;
+        let cached = &self.live[lane];
+        self.snaps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.tokens.is_empty() && s.tokens.len() <= limit && new.starts_with(&s.tokens) && keep(&s.payload))
+            .max_by_key(|(_, s)| s.tokens.len())
+            .map(|(i, s)| {
+                let pos = s.tokens.len();
+                PrefixPlan::Restore { snap_idx: i, pos, global: !(cached.len() >= pos && cached[..pos] == s.tokens[..]) }
+            })
+    }
+
     /// Marks every snapshot that `prompt` starts with as used now: a shared system prompt stays
     /// fresh while conversations keep extending it in their lanes (no restore needed there).
     pub fn touch_prefixes(&mut self, prompt: &[u32]) {

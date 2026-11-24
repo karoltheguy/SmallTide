@@ -270,6 +270,12 @@ impl TideScheduler {
         self.priors_store = Some(store);
     }
 
+    /// End of a request whose routing must not teach the priors (`"learn_routing": false`): its
+    /// demand is dropped.
+    pub fn discard_request_demand(&mut self) {
+        let _ = self.cache.take_demand();
+    }
+
     /// End of a request: folds its routing demand into the priors as one vote, refreshes the live
     /// prior rates and persists. Returns a short log line.
     pub fn finish_request(&mut self) -> Option<String> {

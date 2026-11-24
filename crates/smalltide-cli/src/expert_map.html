@@ -231,7 +231,7 @@ const css = name => getComputedStyle(document.documentElement).getPropertyValue(
 const fmt = n => Number(n).toLocaleString("en-US");
 const STATE_TEXT = ["not loaded", "resident", "in the hot-read ring", "being read from disk"];
 // Polls: five a second, each asking only for the routes and events it has not seen; the usage rows every 2 s.
-const POLL_MS = 200, DEMAND_EVERY = 10, LOG_MAX = 400;
+const POLL_MS = 200, DEMAND_EVERY = 10, LOG_MAX = 400, EVENT_LINES_PER_POLL = 8;
 // Engine event kinds (event_kinds)
 const EV = { HOT: 1, RESCUE: 2, ADAPT: 3, PRELOAD: 4, PREDICT: 5, DROPPED: 6 };
 // Motion: a token's route grows through the layers over GROW_MS, a little behind real time (its own spacing
@@ -545,6 +545,9 @@ function drawFibres(x, X, Y, keep) {
 function addEvents(d, now) {
   const E = A.E, wall = Date.now(), first = firstPoll, batch = {};
   let n = 0;
+  // A busy engine sends hundreds of rescues and reads a second: the log shows the first few of a poll
+  // and counts the rest (a line an event cost more than the drawing).
+  let logged = 0, moreRescued = 0, moreRead = 0, lastT = 0;
   for (const [seq, age, row, ex, kind, share, vrow, vex] of d.events || []) {
     if (seq <= lastEventSeq || row < 0) continue;
     lastEventSeq = Math.max(lastEventSeq, seq);
@@ -560,7 +563,8 @@ function addEvents(d, now) {
     // an adaptation's plan lands in one pass: spread it so it reads as a wave
     const t0 = now + Math.max(0, REPLAY_MS - age) + (isLoad ? (n++ % 120) * 7 : 0);
     if (isLoad) { const b = batch[kind] = batch[kind] || { n: 0, rows: new Set(), t }; b.n++; b.rows.add(row); }
-    else logEvent(kind, row, ex, sh, vrow, vex, t);
+    else if (logged < EVENT_LINES_PER_POLL) { logEvent(kind, row, ex, sh, vrow, vex, t); logged++; }
+    else { if (rescue) moreRescued++; else moreRead++; lastT = t; }
     if (kind !== EV.DROPPED) { lit.set(i, { t0: t0 + (motion ? 300 : 0), kind }); A.start[i] = t0 + 300; }
     if (motion && pings.length < 500) pings.push({ i, t0: t0 + 300, kind });
     if (vi >= 0) {
@@ -569,6 +573,12 @@ function addEvents(d, now) {
       lit.delete(vi);
     }
     if (rescue || ((kind === EV.HOT || kind === EV.PREDICT) && sh >= 0.25)) addNote(i, kind, sh, t0);
+  }
+  if (moreRescued + moreRead) {
+    const parts = [];
+    if (moreRescued) parts.push(fmt(moreRescued) + " more rescued");
+    if (moreRead) parts.push(fmt(moreRead) + " more read");
+    logLine([["d", "… and " + parts.join(", ")]], lastT);
   }
   for (const kind in batch) {
     const b = batch[kind], pre = +kind === EV.PRELOAD;
@@ -1576,7 +1586,9 @@ async function poll() {
     if (polls % 5 === 1) table();
     for (const k of SIG_KEYS) if (SIG[k].nEl) SIG[k].nEl.textContent = SIG[k].n();
     for (const b of document.querySelectorAll("[data-view=demand],[data-order=demand]")) b.disabled = !demandRows;
-    $("what").textContent = d.model + ", " + (d.sparks > 1 ? "on " + d.sparks + " GPUs" : "on one GPU") + " — " + d.layers.length + " layers of " + d.experts_per_layer + " experts";
+    $("what").textContent = d.model + ", " + (d.sparks > 1 ? "on " + d.sparks + " GPUs" : "on one GPU") + " — " + (d.physical_layers && d.physical_layers < d.layers.length
+      ? d.physical_layers + " layers of " + d.experts_per_layer + " experts, drawn as " + d.layers.length + " rows (a looped layer once per pass)"
+      : d.layers.length + " layers of " + d.experts_per_layer + " experts");
     $("locktext").textContent = d.tokens_shown ? "token text shown" : "token text needs the key";
     $("tokkey").hidden = !!d.tokens_shown;
     $("rate").textContent = "five times a second (" + (bytes / 1024).toFixed(0) + " KB each)";

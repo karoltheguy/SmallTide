@@ -2578,16 +2578,17 @@ extern "C" __global__ void smalltide_dspark_rnn_step(
 }
 
 // Context K/V store (FP8 E4M3FN + per-head-pos f32 scales): rows of k / v [rows][nkv*128].
+// `page_table` (nullable): the sequence's pages in the shared KV pool (see kv_phys).
 //   Grid: (rows, nkv, 1), Block: (128, 1, 1)
 extern "C" __global__ void smalltide_dspark_ctx_store_fp8(
     uint8_t* __restrict__ kc, float* __restrict__ ks, uint8_t* __restrict__ vc, float* __restrict__ vs,
     const float* __restrict__ k, const float* __restrict__ v, uint32_t pos0, uint32_t ring, uint32_t nkv,
-    uint32_t v_q4
+    uint32_t v_q4, const uint32_t* __restrict__ page_table
 ) {
     __shared__ float sk[4], sv[4];
     uint32_t r = blockIdx.x, kvh = blockIdx.y, d = threadIdx.x;
     uint32_t pos = pos0 + r;
-    uint32_t slot = (ring != 0u) ? (pos % ring) : pos;
+    uint32_t slot = kv_phys(page_table, (ring != 0u) ? (pos % ring) : pos);
     size_t src_off = (static_cast<size_t>(r) * nkv + kvh) * 128u + d;
     float kv = k[src_off], vv = v[src_off];
     float mk = fabsf(kv), mv = fabsf(vv);
@@ -2622,7 +2623,7 @@ extern "C" __global__ void smalltide_dspark_attn_fp8_split(
     const uint8_t* __restrict__ kc, const float* __restrict__ ks,
     const uint8_t* __restrict__ vc, const float* __restrict__ vs,
     uint32_t P, uint32_t lo, uint32_t ring, uint32_t nh, uint32_t nkv, uint32_t nblk,
-    uint32_t num_splits, float scale, uint32_t v_q4
+    uint32_t num_splits, float scale, uint32_t v_q4, const uint32_t* __restrict__ page_table
 ) {
     uint32_t kvh = blockIdx.x, sp = blockIdx.y;
     uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
@@ -2656,7 +2657,7 @@ extern "C" __global__ void smalltide_dspark_attn_fp8_split(
         uint32_t tlen = min(16u, c_end - j0);
         if (lt < tlen) {
             uint32_t pos = lo + j0 + lt;
-            uint32_t slot = (ring != 0u) ? (pos % ring) : pos;
+            uint32_t slot = kv_phys(page_table, (ring != 0u) ? (pos % ring) : pos);
             size_t head_idx = static_cast<size_t>(slot) * nkv + kvh;
             uint2 kw = reinterpret_cast<const uint2*>(kc + head_idx * 128u)[lw];
             s_k8[lt][lw * 2u + 0u] = kw.x; s_k8[lt][lw * 2u + 1u] = kw.y;

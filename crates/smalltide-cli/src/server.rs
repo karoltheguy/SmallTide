@@ -142,6 +142,7 @@ enum EngineCommand {
         sampling: SamplingParams,
         stop_strings: Vec<String>,
         cache_prompt: bool,
+        learn_routing: bool,
         /// Chat only: the prompt's images, in the order of their placeholders.
         images: Vec<crate::image::Prepared>,
         event_tx: Sender<StreamEvent>,
@@ -184,6 +185,9 @@ struct ChatCompletionReq {
     repetition_penalty: Option<f32>,
     /// llama.cpp-style: `false` bypasses the prompt prefix cache for this request.
     cache_prompt: Option<bool>,
+    /// `false`: this request's routing is not added to the routing history that places experts
+    /// (for test and benchmark prompts, which would otherwise pull the placement towards themselves).
+    learn_routing: Option<bool>,
     #[serde(default)]
     stream: Option<bool>,
     #[serde(default)]
@@ -206,6 +210,9 @@ struct CompletionReq {
     repetition_penalty: Option<f32>,
     /// llama.cpp-style: `false` bypasses the prompt prefix cache for this request.
     cache_prompt: Option<bool>,
+    /// `false`: this request's routing is not added to the routing history that places experts
+    /// (for test and benchmark prompts, which would otherwise pull the placement towards themselves).
+    learn_routing: Option<bool>,
     #[serde(default)]
     stream: Option<bool>,
     #[serde(default)]
@@ -439,6 +446,14 @@ pub fn run_serve(args: &[String]) {
 /// One generation in flight on an engine lane.
 struct ActiveReq {
     lane: usize,
+    /// Fold this request's routing into the routing history when it ends.
+    learn_routing: bool,
+    /// Where the decode time went (for the `[req]` line): draft-verify steps with their draft and
+    /// verify times, single-token steps (no draft: the drafter was not in step with the lane, or
+    /// another lane was decoding too), and the rescue timers at the request's start.
+    t_steps: (u32, f64, f64),
+    t_single: (u32, f64),
+    t_rescue0: (u64, f64, f64),
     /// `prompt[..len - 1]`: key of this prompt's end snapshot (conversation memory).
     prompt_key: Vec<u32>,
     is_chat: bool,
@@ -608,6 +623,7 @@ fn finish_req(
     req: ActiveReq,
 ) -> f64 {
     let lane = req.lane;
+    let req_learn = req.learn_routing;
     engine.set_lane_pinned(lane, false);
     let demand = engine.tide.scheduler.cache.take_lane_demand(lane);
     if demand.iter().any(|&d| d > 0.0) {
@@ -638,8 +654,40 @@ fn finish_req(
         dd as f64 / ntok,
         req.log_tail
     );
+    {
+        let (n, d_ms, v_ms) = req.t_steps;
+        let (n1, ms1) = req.t_single;
+        let (rb, rf, rw) = engine.tide.rescue_stats;
+        let (b, f, w) = (rb - req.t_rescue0.0, rf - req.t_rescue0.1, rw - req.t_rescue0.2);
+        let mut parts: Vec<String> = Vec::new();
+        if n > 0 {
+            let toks = (req.generated.len() as f64 - n1 as f64).max(0.0);
+            parts.push(format!(
+                "{n} draft-verify steps of {:.2} tokens: {:.1} ms draft + {:.1} ms verify each",
+                toks / n as f64,
+                d_ms / n as f64,
+                v_ms / n as f64
+            ));
+        }
+        if n1 > 0 {
+            parts.push(format!("{n1} single-token steps: {:.1} ms each", ms1 / n1 as f64));
+        }
+        if b > 0 {
+            parts.push(format!(
+                "{b} rescue batches: {:.2} ms staging + {:.2} ms waiting for the copy each ({:.0}% of the decode time)",
+                f / b as f64,
+                w / b as f64,
+                100.0 * (f + w) / (d_ms + v_ms + ms1).max(1e-9)
+            ));
+        }
+        if !parts.is_empty() {
+            eprintln!("[req] lane {lane}: decode time: {}", parts.join(" | "));
+        }
+    }
     let tps = req.finish(hit);
-    if let Some(line) = engine.tide.scheduler.finish_request() {
+    if !req_learn {
+        engine.tide.scheduler.discard_request_demand();
+    } else if let Some(line) = engine.tide.scheduler.finish_request() {
         println!("{line}");
     }
     tps
@@ -696,7 +744,20 @@ fn engine_worker_loop(
         .and_then(|v| v.trim().parse::<usize>().ok())
         .map(|w| w.clamp(2, 8));
     // Tracks which `(lane, committed_pos)` currently matches the single DSpark drafter's KV cache.
-    let mut drafter_state: Option<(usize, usize)> = None;
+    // Per lane: the position up to which the drafter holds that lane's sequence (`None`: it does
+    // not, the lane decodes a token at a time until it is brought back in step). With the paged
+    // KV pool every lane has its own drafter context; without it there is one, and giving it to
+    // a lane takes it from the others.
+    let mut drafter_pos: Vec<Option<usize>> = vec![None; n_lanes];
+    let drafter_per_lane = engine.drafter_per_lane();
+    let set_drafter = |v: &mut Vec<Option<usize>>, lane: usize, pos: Option<usize>| {
+        if !drafter_per_lane {
+            v.iter_mut().for_each(|x| *x = None);
+        }
+        v[lane] = pos;
+    };
+    // Most prompt tokens read again to bring the drafter back in step with a conversation (0: never).
+    let spec_resync_tokens: usize = std::env::var("SMALLTIDE_SPEC_RESYNC_TOKENS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16_384);
     let mut spec_pred_ema = 3.0f64;
     let mut spec_obs_ema = 2.0f64;
     let mut spec_draft_ema = 3.0f64;
@@ -862,6 +923,7 @@ fn engine_worker_loop(
                     sampling,
                     stop_strings,
                     cache_prompt,
+                    learn_routing,
                     images,
                     event_tx,
                 }) = queue.pop_front()
@@ -909,15 +971,40 @@ fn engine_worker_loop(
                             sampling,
                             stop_strings,
                             cache_prompt,
+                            learn_routing,
                             images,
                             event_tx,
                         });
                     } else {
-                        let (lane, plan) = if cache_prompt {
+                        let (lane, mut plan) = if cache_prompt {
                             pc.best_lane(&fits, &prompt_ids).unwrap()
                         } else {
                             (fits[0], PrefixPlan::Reset)
                         };
+                        // The drafter holds one conversation's state. If another request ran in
+                        // between (or two decoded at once), it is out of step with this lane, the
+                        // whole request would decode a token at a time, and so would every later
+                        // turn (their snapshots carry no drafter state either). So resume from the
+                        // longest snapshot that does hold the drafter's state, or from the start,
+                        // when that costs at most SMALLTIDE_SPEC_RESYNC_TOKENS more prompt tokens.
+                        if cache_prompt && engine.drafter.is_some() && spec_resync_tokens > 0 {
+                            let in_step = match &plan {
+                                PrefixPlan::Reset => true,
+                                PrefixPlan::Extend { from } => drafter_pos[lane].is_some_and(|dp| *from == dp || (dp <= 1024 && *from <= dp)),
+                                PrefixPlan::Restore { snap_idx, .. } => pc.snapshot(*snap_idx).drafter_valid,
+                            };
+                            if !in_step {
+                                let alt = pc.plan_restore_where(lane, &prompt_ids, |sn| sn.drafter_valid).unwrap_or(PrefixPlan::Reset);
+                                let have = PrefixCache::<SeqSnapshot>::plan_reuse(&plan);
+                                let extra = have.saturating_sub(PrefixCache::<SeqSnapshot>::plan_reuse(&alt));
+                                if extra <= spec_resync_tokens {
+                                    eprintln!("[spec] lane {lane}: the drafter is out of step with this conversation; reading {extra} more prompt tokens again to bring it back");
+                                    plan = alt;
+                                } else {
+                                    eprintln!("[spec] lane {lane}: the drafter is out of step with this conversation and bringing it back would mean reading {extra} prompt tokens again (limit {spec_resync_tokens}): this request decodes a token at a time");
+                                }
+                            }
+                        }
                         // Prompt-aware loading: the conversation's remembered routing (the
                         // snapshot it restores, or this lane's live conversation it extends).
                         let memory: Option<Vec<f32>> = match &plan {
@@ -934,20 +1021,18 @@ fn engine_worker_loop(
                         let drafter_coherent_in = engine.drafter.is_some()
                             && match &plan {
                                 PrefixPlan::Reset => true,
-                                PrefixPlan::Extend { from } => drafter_state.is_some_and(|(dl, dp)| {
-                                    dl == lane && (*from == dp || (dp <= 1024 && *from <= dp))
-                                }),
+                                PrefixPlan::Extend { from } => drafter_pos[lane].is_some_and(|dp| *from == dp || (dp <= 1024 && *from <= dp)),
                                 PrefixPlan::Restore { snap_idx, .. } => pc.snapshot(*snap_idx).drafter_valid,
                             };
                         let _ = event_tx.send(StreamEvent::Admitted);
                         if let Some(req) = admit(
                             &mut engine, &tok, &mut pc, lane, plan, prompt_ids, is_chat, forced_tool,
-                            single_tool_call, max_tokens, sampling, stop_strings, cache_prompt,
+                            single_tool_call, max_tokens, sampling, stop_strings, cache_prompt, learn_routing,
                             drafter_coherent_in, event_tx, &mut last_prefill_tok_s,
                             vision.as_ref(), &images, &image_starts,
                         ) {
                             if engine.drafter.is_some() {
-                                drafter_state = drafter_coherent_in.then_some((lane, req.pos));
+                                set_drafter(&mut drafter_pos, lane, drafter_coherent_in.then_some(req.pos));
                             }
                             let mut req = req;
                             if req.accept(&tok, engine.lane_max_seq(lane)) {
@@ -956,7 +1041,7 @@ fn engine_worker_loop(
                                 last_decode_tok_s = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
                             }
                         } else {
-                            drafter_state = None;
+                            drafter_pos[lane] = None;
                             engine.set_lane_pinned(lane, false);
                         }
                         for l in engine.take_lost_lanes() {
@@ -993,7 +1078,10 @@ fn engine_worker_loop(
         }
         let act: Vec<usize> = (0..n_lanes).filter(|&l| active[l].is_some()).collect();
         if act.len() >= 2 && batch_decode {
-            drafter_state = None;
+            // A batched round feeds no drafter: these lanes' contexts fall behind.
+            for &l in &act {
+                drafter_pos[l] = None;
+            }
             let rows: Vec<(usize, u32, usize)> = act
                 .iter()
                 .map(|&l| {
@@ -1038,7 +1126,7 @@ fn engine_worker_loop(
         if act.len() == 1 && engine.drafter.is_some() {
             let l = act[0];
             let can_spec = active[l].as_ref().is_some_and(|req| {
-                drafter_state == Some((l, req.pos))
+                drafter_pos[l] == Some(req.pos)
                     && req.pos + 2 <= engine.lane_max_seq(l)
             });
             if can_spec {
@@ -1062,7 +1150,7 @@ fn engine_worker_loop(
                         Err(e) => {
                             let _ = req.event_tx.send(StreamEvent::Error(engine_error("draft error", &e.to_string())));
                             pc.invalidate(l);
-                            drafter_state = None;
+                            drafter_pos[l] = None;
                             done = true;
                         }
                         Ok(draft_pairs) => {
@@ -1106,20 +1194,21 @@ fn engine_worker_loop(
                                 Err((what, e)) => {
                                     let _ = req.event_tx.send(StreamEvent::Error(engine_error(what, &e)));
                                     pc.invalidate(l);
-                                    drafter_state = None;
+                                    drafter_pos[l] = None;
                                     done = true;
                                 }
                                 Ok((c, next_tok)) => {
                                     if let Err(e) = engine.verify_rewind(spec_width, c + 1) {
                                         let _ = req.event_tx.send(StreamEvent::Error(engine_error("verify rewind error", &e.to_string())));
                                         pc.invalidate(l);
-                                        drafter_state = None;
+                                        drafter_pos[l] = None;
                                         done = true;
                                     } else {
                                         if let Err(e) = engine.post_batch_tide_step() {
                                             let _ = engine_error("post verify tide step", &e.to_string());
                                         }
                                         let dt_v = tv.elapsed().as_secs_f64() * 1000.0;
+                                        req.t_steps = (req.t_steps.0 + 1, req.t_steps.1 + dt_d, req.t_steps.2 + dt_v);
                                         spec_vbase_ema = 0.85 * spec_vbase_ema + 0.15 * (dt_v - 2.3 * n as f64).clamp(10.0, 30.0);
                                         let eval_n = (c + 1).min(n);
                                         let pred_sum: f64 = (0..eval_n)
@@ -1130,7 +1219,7 @@ fn engine_worker_loop(
                                         pc.live[l].extend_from_slice(&block[..=c]);
                                         req.pos += c + 1;
                                         req.tap_row = c;
-                                        drafter_state = Some((l, req.pos));
+                                        drafter_pos[l] = Some(req.pos);
                                         let lane_max = engine.lane_max_seq(l);
                                         for &t in &block[1..=c] {
                                             req.next_tok = t;
@@ -1161,9 +1250,10 @@ fn engine_worker_loop(
 
         for l in 0..n_lanes {
             let Some(req) = active[l].as_mut() else { continue };
-            drafter_state = None;
+            drafter_pos[l] = None;
             engine.select_lane(l);
             let mut done = false;
+            let t_one = Instant::now();
             if let Err(e) = engine.forward_token(req.next_tok, req.pos, false, true) {
                 let _ = req.event_tx.send(StreamEvent::Error(engine_error("decode error", &e.to_string())));
                 pc.invalidate(l);
@@ -1172,7 +1262,9 @@ fn engine_worker_loop(
                 let _ = engine.post_decode_tide_step();
                 pc.live[l].push(req.next_tok);
                 req.pos += 1;
-                match engine.sample_next_token(&req.sampling, &req.generated) {
+                let sampled = engine.sample_next_token(&req.sampling, &req.generated);
+                req.t_single = (req.t_single.0 + 1, req.t_single.1 + t_one.elapsed().as_secs_f64() * 1000.0);
+                match sampled {
                     Ok(t) => {
                         req.next_tok = t;
                         if !req.accept(&tok, engine.lane_max_seq(l)) {
@@ -1210,6 +1302,7 @@ fn admit(
     sampling: SamplingParams,
     stop_strings: Vec<String>,
     cache_prompt: bool,
+    learn_routing: bool,
     drafter_coherent: bool,
     event_tx: Sender<StreamEvent>,
     last_prefill_tok_s: &mut f64,
@@ -1382,6 +1475,10 @@ fn admit(
     Some(ActiveReq {
         lane,
         prompt_key: prompt_ids[..end.saturating_sub(1)].to_vec(),
+        learn_routing,
+        t_steps: (0, 0.0, 0.0),
+        t_single: (0, 0.0),
+        t_rescue0: engine.tide.rescue_stats,
         is_chat,
         single_tool_call,
         max_tokens,
@@ -1672,6 +1769,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     sampling,
                     stop_strings,
                     cache_prompt: req.cache_prompt.unwrap_or(true),
+                    learn_routing: req.learn_routing.unwrap_or(true),
                     images,
                     event_tx: ev_tx,
                 })
@@ -1957,6 +2055,7 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                     sampling,
                     stop_strings,
                     cache_prompt: req.cache_prompt.unwrap_or(true),
+                    learn_routing: req.learn_routing.unwrap_or(true),
                     images: Vec::new(),
                     event_tx: ev_tx,
                 })

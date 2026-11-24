@@ -721,10 +721,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 self.backend.memcpy_d2h_async(sn.host, off, b, 0, b.size_bytes, s)?;
                 off += b.size_bytes;
             }
+            // The drafter's global layer lives in the lane's pages too: the same runs.
             for (buf, per_pos) in d.global_kv_regions() {
-                let len = pos * per_pos;
-                if len > 0 {
-                    self.backend.memcpy_d2h_async(sn.host, off, buf.slice(0, len), 0, len, s)?;
+                for &(first, n) in &runs {
+                    let len = n * per_pos;
+                    self.backend.memcpy_d2h_async(sn.host, off, buf.slice(first * per_pos, len), 0, len, s)?;
                     off += len;
                 }
             }
@@ -766,10 +767,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     self.backend.memcpy_h2d_async(b, 0, snap.host, off, b.size_bytes, s)?;
                     off += b.size_bytes;
                 }
+                let runs = self.kv_runs(snap.pos);
                 for (buf, per_pos) in d.global_kv_regions() {
-                    let len = snap.pos * per_pos;
-                    if len > 0 {
-                        self.backend.memcpy_h2d_async(buf.slice(0, len), 0, snap.host, off, len, s)?;
+                    for &(first, n) in &runs {
+                        let len = n * per_pos;
+                        self.backend.memcpy_h2d_async(buf.slice(first * per_pos, len), 0, snap.host, off, len, s)?;
                         off += len;
                     }
                 }
@@ -1047,6 +1049,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.global_max_seq = self.lane_max_seq[i];
         self.active_lane = i;
         self.tide.scheduler.cache.set_current_lane(i);
+        self.sync_drafter_lane();
     }
 
     /// The single-row logits buffer (`[unpadded_vocab]` f32).
@@ -1413,13 +1416,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                         dirty_len = dirty.len();
                         first_dirty = dirty.first().copied();
                         let (n4, m8) = self.tide.pool_slots();
-                        let scratch_n = smalltide_tide::runtime::DEFAULT_SCRATCH_RING_SLOTS;
+                        let (ring4, ring8) = smalltide_tide::runtime::rescue_ring_slots();
                         let n_exp = self.cfg.n_routed_experts;
                         let mut bounds_err: Option<smalltide_core::SmallTideError> = None;
                         for &(idx, val) in &dirty {
                             if val != u32::MAX {
                                 let pl = idx / n_exp;
-                                let max_s = if self.cfg.is_mxfp8_layer(pl) { m8 + scratch_n } else { n4 + scratch_n };
+                                let max_s = if self.cfg.is_mxfp8_layer(pl) { m8 + ring8 } else { n4 + ring4 };
                                 if (val as usize) >= max_s {
                                     bounds_err = Some(smalltide_core::SmallTideError::Backend {
                                         backend: "engine",
@@ -1742,13 +1745,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                     Ok(dirty) => {
                         self.verify_rescued.extend_from_slice(&rescued);
                         let (n4, m8) = self.tide.pool_slots();
-                        let scratch_n = smalltide_tide::runtime::DEFAULT_SCRATCH_RING_SLOTS;
+                        let (ring4, ring8) = smalltide_tide::runtime::rescue_ring_slots();
                         let n_exp = self.cfg.n_routed_experts;
                         let mut bounds_err: Option<smalltide_core::SmallTideError> = None;
                         for &(idx, val) in &dirty {
                             if val != u32::MAX {
                                 let pl = idx / n_exp;
-                                let max_s = if self.cfg.is_mxfp8_layer(pl) { m8 + scratch_n } else { n4 + scratch_n };
+                                let max_s = if self.cfg.is_mxfp8_layer(pl) { m8 + ring8 } else { n4 + ring4 };
                                 if (val as usize) >= max_s {
                                     bounds_err = Some(smalltide_core::SmallTideError::Backend {
                                         backend: "engine",
@@ -1939,6 +1942,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let e = self.cfg.n_routed_experts;
         let n_log = self.layer_planned.len();
         let layers: Vec<usize> = (0..n_log).collect();
+        let physical: Vec<usize> = (0..n_log)
+            .map(|il| crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16)).0 .0 as usize)
+            .collect();
         let mut state = Vec::with_capacity(n_log * e);
         let mut demand = Vec::with_capacity(n_log * e);
         for il in 0..n_log {
@@ -1971,11 +1977,15 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let routes = self.routes.recent(6.0, 400).into_iter().filter(|r| r.seq > since).collect();
         ExpertMap {
             layers,
+            physical,
             experts: e,
             state,
             demand: Some(demand),
             slots: n4 + m8,
-            spare: smalltide_tide::runtime::DEFAULT_SCRATCH_RING_SLOTS * 2,
+            spare: {
+                let (r4, r8) = smalltide_tide::runtime::rescue_ring_slots();
+                r4 + r8
+            },
             world: 1,
             busy,
             counters,
@@ -2109,7 +2119,29 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     pub fn attach_drafter(&mut self, d: crate::drafter::Drafter<B>) -> Result<()> {
         self.drafter = Some(d);
         self.capture_taps = true;
+        self.sync_drafter_lane();
         self.enable_speculative_buffers()
+    }
+
+    /// Points the drafter at the active lane's context: its local rings and, with the paged KV
+    /// pool, its page table (the drafter's global layer lives in the same pages as the lane's
+    /// global KV, so every lane keeps its own drafter context at no extra pool memory).
+    fn sync_drafter_lane(&mut self) {
+        let table = if self.kv_pool.is_some() {
+            self.layer_states.iter().find(|st| !st._is_local).and_then(|st| st.page_table)
+        } else {
+            None
+        };
+        let lane = self.active_lane;
+        if let Some(d) = self.drafter.as_mut() {
+            d.set_lane(lane, table);
+        }
+    }
+
+    /// True when every lane keeps its own drafter context (the paged pool, a ring per lane):
+    /// a request on one lane then leaves the others' drafter state alone.
+    pub fn drafter_per_lane(&self) -> bool {
+        self.kv_pool.is_some() && self.drafter.as_ref().is_some_and(|d| d.lanes() >= self.lane_store.len())
     }
 
     /// Context K/V of the drafter for the `m` rows just run at `pos0..` (no-op without drafter).

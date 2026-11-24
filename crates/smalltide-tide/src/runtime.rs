@@ -30,6 +30,21 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 pub const DEFAULT_SCRATCH_RING_SLOTS: usize = 8;
+
+/// Slots of the rescue ring of each pool, `(nvfp4, mxfp8)`: `SMALLTIDE_RESCUE_RING_NVFP4` and
+/// `SMALLTIDE_RESCUE_RING_MXFP8`, 8 to 1024, default 8. An inline rescue copies its expert into
+/// the next ring slot; the expert then counts as on the card until the ring has gone round, so a
+/// larger ring saves the repeated rescues of the same experts at the cost of resident slots (a
+/// ring slot is as large as a pool slot). Never below 8: a layer rescues up to 8 experts in a step.
+pub fn rescue_ring_slots() -> (usize, usize) {
+    static RING: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *RING.get_or_init(|| {
+        let get = |k: &str| {
+            std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_SCRATCH_RING_SLOTS).clamp(DEFAULT_SCRATCH_RING_SLOTS, 1024)
+        };
+        (get("SMALLTIDE_RESCUE_RING_NVFP4"), get("SMALLTIDE_RESCUE_RING_MXFP8"))
+    })
+}
 const TABLE_UPLOAD_RING: usize = 8;
 
 struct TableUploadBuf {
@@ -147,7 +162,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
 
         let resident_nvfp4 = nvfp4_vram_slots.max(1);
         let resident_mxfp8 = mxfp8_vram_slots.max(1);
-        let scratch = DEFAULT_SCRATCH_RING_SLOTS;
+        let (ring4, ring8) = rescue_ring_slots();
 
         // Resident budget excludes the tail Scratch Rescue Ring slots
         let unified_resident_vram_bytes = resident_nvfp4 * nvfp4_layout.aligned_slab_bytes
@@ -157,8 +172,8 @@ impl<B: ComputeBackend> TideExecutor<B> {
         // hot buffers (activations, KV, scratch) exist. On Windows the driver backs whatever does
         // not fit the resident local budget with system memory, in allocation order, so the
         // large expert pools must come last (and fill hottest experts first).
-        let vram_pool_nvfp4 = backend.alloc_device((1 + scratch) * nvfp4_layout.aligned_slab_bytes)?;
-        let vram_pool_mxfp8 = backend.alloc_device((1 + scratch) * mxfp8_layout.aligned_slab_bytes)?;
+        let vram_pool_nvfp4 = backend.alloc_device((1 + ring4) * nvfp4_layout.aligned_slab_bytes)?;
+        let vram_pool_mxfp8 = backend.alloc_device((1 + ring8) * mxfp8_layout.aligned_slab_bytes)?;
 
         let total_experts = model_cfg.num_physical_layers * model_cfg.n_routed_experts;
         let gpu_slot_table = backend.alloc_device(total_experts * 4)?;
@@ -191,11 +206,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
 
         let mut scheduler =
             TideScheduler::new(model_cfg, tide_cfg, unified_resident_vram_bytes, ram_budget_bytes);
-        scheduler.cache.configure_scratch_ring(
-            resident_nvfp4 as u32,
-            resident_mxfp8 as u32,
-            scratch as u32,
-        );
+        scheduler.cache.configure_scratch_rings(resident_nvfp4 as u32, resident_mxfp8 as u32, ring4 as u32, ring8 as u32);
 
         let mut exec = Self {
             backend,
@@ -250,14 +261,14 @@ impl<B: ComputeBackend> TideExecutor<B> {
         if self.pools_allocated {
             return Ok(());
         }
-        let scratch = DEFAULT_SCRATCH_RING_SLOTS;
+        let (ring4, ring8) = rescue_ring_slots();
         self.backend.sync_stream(self.compute_stream)?;
         self.backend.free_device(self.vram_pool_nvfp4)?;
         self.backend.free_device(self.vram_pool_mxfp8)?;
         // MXFP8 first: it is the smaller pool and (with priors) its experts carry the most
         // routing mass per byte. Windows places the first-allocated memory in VRAM; whatever
         // follows past the resident cap lands in system memory (see `fit_pools_to_resident`).
-        let mx_bytes = (self.pool_slots.1 + scratch) * self.mxfp8_layout.aligned_slab_bytes;
+        let mx_bytes = (self.pool_slots.1 + ring8) * self.mxfp8_layout.aligned_slab_bytes;
         if self.mxfp8_host_mapped {
             let (view, host) = self.backend.alloc_host_mapped(mx_bytes)?;
             self.vram_pool_mxfp8 = view;
@@ -267,7 +278,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
         }
         self.vram_pool_nvfp4 = self
             .backend
-            .alloc_device((self.pool_slots.0 + scratch) * self.nvfp4_layout.aligned_slab_bytes)?;
+            .alloc_device((self.pool_slots.0 + ring4) * self.nvfp4_layout.aligned_slab_bytes)?;
         self.pools_allocated = true;
         Ok(())
     }
@@ -282,18 +293,18 @@ impl<B: ComputeBackend> TideExecutor<B> {
             });
         }
         let (n4, m8) = (nvfp4_slots.max(1), mxfp8_slots.max(1));
-        let scratch = DEFAULT_SCRATCH_RING_SLOTS;
+        let (ring4, ring8) = rescue_ring_slots();
         // Free the current pools first so the new ones can take their place.
         self.backend.sync_stream(self.compute_stream)?;
         self.backend.free_device(self.vram_pool_nvfp4)?;
         self.backend.free_device(self.vram_pool_mxfp8)?;
-        self.vram_pool_nvfp4 = self.backend.alloc_device((1 + scratch) * self.nvfp4_layout.aligned_slab_bytes)?;
-        self.vram_pool_mxfp8 = self.backend.alloc_device((1 + scratch) * self.mxfp8_layout.aligned_slab_bytes)?;
+        self.vram_pool_nvfp4 = self.backend.alloc_device((1 + ring4) * self.nvfp4_layout.aligned_slab_bytes)?;
+        self.vram_pool_mxfp8 = self.backend.alloc_device((1 + ring8) * self.mxfp8_layout.aligned_slab_bytes)?;
         self.pool_slots = (n4, m8);
         self.scheduler.cache.set_unified_vram_budget(
             n4 * self.nvfp4_layout.aligned_slab_bytes + m8 * self.mxfp8_layout.aligned_slab_bytes,
         );
-        self.scheduler.cache.configure_scratch_ring(n4 as u32, m8 as u32, scratch as u32);
+        self.scheduler.cache.configure_scratch_rings(n4 as u32, m8 as u32, ring4 as u32, ring8 as u32);
         self.pools_allocated = false;
         self.allocate_pools()
     }
@@ -337,7 +348,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
     /// left unused; the scratch ring follows the usable slots and so stays fast too.
     /// Returns `(nvfp4_slots, mxfp8_slots, log line)`. Only valid before the first transfer.
     pub fn fit_pools_to_resident(&mut self) -> Result<(usize, usize, String)> {
-        let scratch = DEFAULT_SCRATCH_RING_SLOTS;
+        let (ring4, ring8) = rescue_ring_slots();
         let win = 256usize << 20;
         let (n4, m8) = self.pool_slots;
         let s4 = self.nvfp4_layout.aligned_slab_bytes;
@@ -347,14 +358,14 @@ impl<B: ComputeBackend> TideExecutor<B> {
             m8
         } else {
             let (fast, _best, worst) = self.fast_prefix_bytes(self.vram_pool_mxfp8, win.min(self.vram_pool_mxfp8.size_bytes & !0xFFFF))?;
-            let fit = (fast / s8).saturating_sub(scratch).min(m8);
+            let fit = (fast / s8).saturating_sub(ring8).min(m8);
             if fit < m8 {
                 notes.push(format!("mxfp8 fast {:.2} GiB (then {worst:.0} GB/s)", fast as f64 / (1u64 << 30) as f64));
             }
             fit
         };
         let (fast4, best4, worst4) = self.fast_prefix_bytes(self.vram_pool_nvfp4, win)?;
-        let n4_fit = (fast4 / s4).saturating_sub(scratch).min(n4);
+        let n4_fit = (fast4 / s4).saturating_sub(ring4).min(n4);
         if n4_fit < n4 {
             notes.push(format!("nvfp4 fast {:.2} GiB (then {worst4:.0} GB/s)", fast4 as f64 / (1u64 << 30) as f64));
         }
@@ -362,7 +373,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
         if (n4_fit, m8_fit) != (n4, m8) {
             self.pool_slots = (n4_fit, m8_fit);
             self.scheduler.cache.set_unified_vram_budget(n4_fit * s4 + m8_fit * s8);
-            self.scheduler.cache.configure_scratch_ring(n4_fit as u32, m8_fit as u32, scratch as u32);
+            self.scheduler.cache.configure_scratch_rings(n4_fit as u32, m8_fit as u32, ring4 as u32, ring8 as u32);
         }
         let line = if notes.is_empty() {
             format!("[pools] residency check: both pools fully at VRAM speed (~{best4:.0} GB/s copy)")

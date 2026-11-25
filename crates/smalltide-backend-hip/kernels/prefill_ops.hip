@@ -1192,6 +1192,7 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
     __shared__ _Float16 s_v[AW_WARPS][16][128];
     __shared__ float s_m[AW_WARPS][16], s_l[AW_WARPS][16];
     __shared__ float s_o[AW_WARPS][16][128 + 4];
+    __shared__ uint32_t s_t[16], s_qh[16];
 
     // Query vectors of this block: positions, rows and their key ranges.
     auto qinfo = [&](uint32_t m, uint32_t& t, uint32_t& qh, uint32_t& p, uint32_t& lo) {
@@ -1201,9 +1202,16 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
         p = pos0 + t;
         lo = (window != 0u && p + 1u > window) ? (p + 1u - window) : 0u;
     };
-    uint32_t t_first, qh_x, p_first, lo_first, t_last, p_last, lo_last;
-    qinfo(0u, t_first, qh_x, p_first, lo_first);
-    qinfo(15u, t_last, qh_x, p_last, lo_last);
+    if (threadIdx.x < 16u) {
+        uint32_t t_, qh_, p_, lo_;
+        qinfo(threadIdx.x, t_, qh_, p_, lo_);
+        s_t[threadIdx.x] = t_;
+        s_qh[threadIdx.x] = qh_;
+    }
+    __syncthreads();
+    uint32_t p_first = pos0 + s_t[0];
+    uint32_t lo_first = (window != 0u && p_first + 1u > window) ? (p_first + 1u - window) : 0u;
+    uint32_t p_last = pos0 + s_t[15];
     // Key tiles are aligned to absolute multiples of 16 and owned by warp (tile index % 4), so a
     // query's result does not depend on which other queries share its block (prefill segmentation
     // invariance: prefix-cache restores must reproduce a cold prefill bit for bit).
@@ -1213,8 +1221,7 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
     uint32_t tile0 = key_lo / 16u;
 
     // A fragment of Q (row m = l % 16, dims half*8 + 16c .. +8), pre-scaled to the log2 domain.
-    uint32_t tA, qhA, pA, loA;
-    qinfo(nl, tA, qhA, pA, loA);
+    uint32_t tA = s_t[nl], qhA = s_qh[nl];
     bool validA = q_base + nl < nq;
     const float* qrow = q + (static_cast<size_t>(tA) * n_q_heads + qhA) * 128u;
     float qs = inv_sqrt_d * LOG2E;
@@ -1226,10 +1233,6 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
         qa[c][0] = (_Float16)(u.x * qs); qa[c][1] = (_Float16)(u.y * qs); qa[c][2] = (_Float16)(u.z * qs); qa[c][3] = (_Float16)(u.w * qs);
         qa[c][4] = (_Float16)(v.x * qs); qa[c][5] = (_Float16)(v.y * qs); qa[c][6] = (_Float16)(v.z * qs); qa[c][7] = (_Float16)(v.w * qs);
     }
-    // Rows this lane holds in the C layout: m = half * 8 + i.
-    uint32_t tC[8], qhC[8], pC[8], loC[8];
-    #pragma unroll
-    for (uint32_t i = 0u; i < 8u; ++i) qinfo(half_ * 8u + i, tC[i], qhC[i], pC[i], loC[i]);
 
     // Position-major cache ([slot][n_kv_heads][128], scales [slot][n_kv_heads]).
     const uint8_t* kb = k_cache + static_cast<size_t>(kvh) * 128u;
@@ -1270,16 +1273,19 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
         }
         float kscale = kin ? ksb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f;
         float vscale = (v_q4 != 0u) ? 1.0f : (kin ? vsb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f);
-        // Logits, masks, relative bias; online softmax (row max over the 16 key lanes).
-        float pr[8];
+        // Logits, masks, relative bias; online softmax (row max over the 16 key lanes) -> P in LDS.
         #pragma unroll
         for (uint32_t i = 0u; i < 8u; ++i) {
-            bool ok = kin && kp <= pC[i] && kp >= loC[i] && (q_base + half_ * 8u + i) < nq;
+            uint32_t mi = half_ * 8u + i;
+            uint32_t ti = s_t[mi], qhi = s_qh[mi];
+            uint32_t pi = pos0 + ti;
+            uint32_t loi = (window != 0u && pi + 1u > window) ? (pi + 1u - window) : 0u;
+            bool ok = kin && kp <= pi && kp >= loi && (q_base + mi) < nq;
             float sc = -1e30f;
             if (ok) {
-                uint32_t dist = pC[i] - kp;
+                uint32_t dist = pi - kp;
                 float rb = (rel_table != nullptr && dist < rel_extent)
-                    ? rel_table[(static_cast<size_t>(tC[i]) * n_q_heads + qhC[i]) * rel_extent + dist] * LOG2E : 0.0f;
+                    ? rel_table[(static_cast<size_t>(ti) * n_q_heads + qhi) * rel_extent + dist] * LOG2E : 0.0f;
                 sc = sacc[i] * kscale + rb;
             }
             float mx = sc;
@@ -1294,11 +1300,8 @@ extern "C" __global__ void smalltide_attn_prefill_wmma(
             m_run[i] = mn;
             #pragma unroll
             for (uint32_t c = 0u; c < 8u; ++c) o[c][i] *= al;
-            pr[i] = pv * vscale;
+            s_p[warp][mi][nl] = (_Float16)(pv * vscale);
         }
-        // P (C layout: lane = key column) -> LDS -> A layout (lane = query row).
-        #pragma unroll
-        for (uint32_t i = 0u; i < 8u; ++i) s_p[warp][half_ * 8u + i][nl] = (_Float16)pr[i];
         // V tile [16 keys][128] FP8 -> f16 (raw; the V scale is in P).
         #pragma unroll
         for (uint32_t r = 0u; r < 16u; ++r) {
@@ -1431,6 +1434,7 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_vt(
     __shared__ _Float16 s_p[AW_WARPS][16][16];
     __shared__ float s_m[AW_WARPS][16], s_l[AW_WARPS][16];
     __shared__ float s_o[AW_WARPS][16][128 + 4];
+    __shared__ uint32_t s_t[16], s_qh[16];
 
     // Query vectors of this block: positions, rows and their key ranges.
     auto qinfo = [&](uint32_t m, uint32_t& t, uint32_t& qh, uint32_t& p, uint32_t& lo) {
@@ -1440,9 +1444,16 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_vt(
         p = pos0 + t;
         lo = (window != 0u && p + 1u > window) ? (p + 1u - window) : 0u;
     };
-    uint32_t t_first, qh_x, p_first, lo_first, t_last, p_last, lo_last;
-    qinfo(0u, t_first, qh_x, p_first, lo_first);
-    qinfo(15u, t_last, qh_x, p_last, lo_last);
+    if (threadIdx.x < 16u) {
+        uint32_t t_, qh_, p_, lo_;
+        qinfo(threadIdx.x, t_, qh_, p_, lo_);
+        s_t[threadIdx.x] = t_;
+        s_qh[threadIdx.x] = qh_;
+    }
+    __syncthreads();
+    uint32_t p_first = pos0 + s_t[0];
+    uint32_t lo_first = (window != 0u && p_first + 1u > window) ? (p_first + 1u - window) : 0u;
+    uint32_t p_last = pos0 + s_t[15];
     // Key tiles are aligned to absolute multiples of 16 and owned by warp (tile index % 4), so a
     // query's result does not depend on which other queries share its block (prefill segmentation
     // invariance: prefix-cache restores must reproduce a cold prefill bit for bit).
@@ -1452,8 +1463,7 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_vt(
     uint32_t tile0 = key_lo / 16u;
 
     // A fragment of Q (row m = l % 16, dims half*8 + 16c .. +8), pre-scaled to the log2 domain.
-    uint32_t tA, qhA, pA, loA;
-    qinfo(nl, tA, qhA, pA, loA);
+    uint32_t tA = s_t[nl], qhA = s_qh[nl];
     bool validA = q_base + nl < nq;
     const float* qrow = q + (static_cast<size_t>(tA) * n_q_heads + qhA) * 128u;
     float qs = inv_sqrt_d * LOG2E;
@@ -1465,14 +1475,9 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_vt(
         qa[c][0] = (_Float16)(u.x * qs); qa[c][1] = (_Float16)(u.y * qs); qa[c][2] = (_Float16)(u.z * qs); qa[c][3] = (_Float16)(u.w * qs);
         qa[c][4] = (_Float16)(v.x * qs); qa[c][5] = (_Float16)(v.y * qs); qa[c][6] = (_Float16)(v.z * qs); qa[c][7] = (_Float16)(v.w * qs);
     }
-    // Rows this lane holds in the C layout: m = half * 8 + i.
-    uint32_t tC[8], qhC[8], pC[8], loC[8];
-    #pragma unroll
-    for (uint32_t i = 0u; i < 8u; ++i) qinfo(half_ * 8u + i, tC[i], qhC[i], pC[i], loC[i]);
 
     // Position-major cache ([slot][n_kv_heads][128], scales [slot][n_kv_heads]).
     const uint8_t* kb = k_cache + static_cast<size_t>(kvh) * 128u;
-    const uint8_t* vb = v_cache + static_cast<size_t>(kvh) * 128u;
     const float* ksb = k_scales + kvh;
     const float* vsb = v_scales + kvh;
     const size_t kv_stride = static_cast<size_t>(n_kv_heads) * 128u;
@@ -1509,16 +1514,19 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_vt(
         }
         float kscale = kin ? ksb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f;
         float vscale = (v_q4 != 0u) ? 1.0f : (kin ? vsb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f);
-        // Logits, masks, relative bias; online softmax (row max over the 16 key lanes).
-        float pr[8];
+        // Logits, masks, relative bias; online softmax (row max over the 16 key lanes) -> P in LDS.
         #pragma unroll
         for (uint32_t i = 0u; i < 8u; ++i) {
-            bool ok = kin && kp <= pC[i] && kp >= loC[i] && (q_base + half_ * 8u + i) < nq;
+            uint32_t mi = half_ * 8u + i;
+            uint32_t ti = s_t[mi], qhi = s_qh[mi];
+            uint32_t pi = pos0 + ti;
+            uint32_t loi = (window != 0u && pi + 1u > window) ? (pi + 1u - window) : 0u;
+            bool ok = kin && kp <= pi && kp >= loi && (q_base + mi) < nq;
             float sc = -1e30f;
             if (ok) {
-                uint32_t dist = pC[i] - kp;
+                uint32_t dist = pi - kp;
                 float rb = (rel_table != nullptr && dist < rel_extent)
-                    ? rel_table[(static_cast<size_t>(tC[i]) * n_q_heads + qhC[i]) * rel_extent + dist] * LOG2E : 0.0f;
+                    ? rel_table[(static_cast<size_t>(ti) * n_q_heads + qhi) * rel_extent + dist] * LOG2E : 0.0f;
                 sc = sacc[i] * kscale + rb;
             }
             float mx = sc;
@@ -1533,11 +1541,8 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_vt(
             m_run[i] = mn;
             #pragma unroll
             for (uint32_t c = 0u; c < 8u; ++c) o[c][i] *= al;
-            pr[i] = pv * vscale;
+            s_p[warp][mi][nl] = (_Float16)(pv * vscale);
         }
-        // P (C layout: lane = key column) -> LDS -> A layout (lane = query row).
-        #pragma unroll
-        for (uint32_t i = 0u; i < 8u; ++i) s_p[warp][half_ * 8u + i][nl] = (_Float16)pr[i];
         // The V tile comes pre-decoded (smalltide_kv_v_tiles_f16): [tile][head][dim][16 keys] f16,
         // so this lane's 8 keys of one dim are a single 16-byte load - no decode, no LDS staging.
         const uint4* vtile = vt16 + (static_cast<size_t>(ring0 >> 4) * n_kv_heads + kvh) * 256u;
@@ -1614,6 +1619,7 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_split(
     __shared__ _Float16 s_v[AW_WARPS][16][128];
     __shared__ float s_m[AW_WARPS][16], s_l[AW_WARPS][16];
     __shared__ float s_o[AW_WARPS][16][128 + 4];
+    __shared__ uint32_t s_t[16], s_qh[16];
 
     auto qinfo = [&](uint32_t m, uint32_t& t, uint32_t& qh, uint32_t& p, uint32_t& lo) {
         uint32_t qi = min(q_base + m, nq - 1u);
@@ -1622,9 +1628,16 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_split(
         p = pos0 + t;
         lo = (window != 0u && p + 1u > window) ? (p + 1u - window) : 0u;
     };
-    uint32_t t_first, qh_x, p_first, lo_first, t_last, p_last, lo_last;
-    qinfo(0u, t_first, qh_x, p_first, lo_first);
-    qinfo(15u, t_last, qh_x, p_last, lo_last);
+    if (threadIdx.x < 16u) {
+        uint32_t t_, qh_, p_, lo_;
+        qinfo(threadIdx.x, t_, qh_, p_, lo_);
+        s_t[threadIdx.x] = t_;
+        s_qh[threadIdx.x] = qh_;
+    }
+    __syncthreads();
+    uint32_t p_first = pos0 + s_t[0];
+    uint32_t lo_first = (window != 0u && p_first + 1u > window) ? (p_first + 1u - window) : 0u;
+    uint32_t p_last = pos0 + s_t[15];
     uint32_t key_lo = lo_first & ~15u;
     uint32_t key_hi = p_last;
     uint32_t n_tiles = (key_hi - key_lo) / 16u + 1u;
@@ -1632,8 +1645,7 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_split(
     uint32_t t_begin = sp * tiles_per_sp;
     uint32_t t_end = min(n_tiles, t_begin + tiles_per_sp);
 
-    uint32_t tA, qhA, pA, loA;
-    qinfo(nl, tA, qhA, pA, loA);
+    uint32_t tA = s_t[nl], qhA = s_qh[nl];
     bool validA = q_base + nl < nq;
     const float* qrow = q + (static_cast<size_t>(tA) * n_q_heads + qhA) * 128u;
     float qs = inv_sqrt_d * LOG2E;
@@ -1645,9 +1657,6 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_split(
         qa[c][0] = (_Float16)(u.x * qs); qa[c][1] = (_Float16)(u.y * qs); qa[c][2] = (_Float16)(u.z * qs); qa[c][3] = (_Float16)(u.w * qs);
         qa[c][4] = (_Float16)(v.x * qs); qa[c][5] = (_Float16)(v.y * qs); qa[c][6] = (_Float16)(v.z * qs); qa[c][7] = (_Float16)(v.w * qs);
     }
-    uint32_t tC[8], qhC[8], pC[8], loC[8];
-    #pragma unroll
-    for (uint32_t i = 0u; i < 8u; ++i) qinfo(half_ * 8u + i, tC[i], qhC[i], pC[i], loC[i]);
 
     const uint8_t* kb = k_cache + static_cast<size_t>(kvh) * 128u;
     const uint8_t* vb = v_cache + static_cast<size_t>(kvh) * 128u;
@@ -1684,15 +1693,18 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_split(
         }
         float kscale = kin ? ksb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f;
         float vscale = (v_q4 != 0u) ? 1.0f : (kin ? vsb[static_cast<size_t>(slot) * n_kv_heads] : 0.0f);
-        float pr[8];
         #pragma unroll
         for (uint32_t i = 0u; i < 8u; ++i) {
-            bool ok = kin && kp <= pC[i] && kp >= loC[i] && (q_base + half_ * 8u + i) < nq;
+            uint32_t mi = half_ * 8u + i;
+            uint32_t ti = s_t[mi], qhi = s_qh[mi];
+            uint32_t pi = pos0 + ti;
+            uint32_t loi = (window != 0u && pi + 1u > window) ? (pi + 1u - window) : 0u;
+            bool ok = kin && kp <= pi && kp >= loi && (q_base + mi) < nq;
             float sc = -1e30f;
             if (ok) {
-                uint32_t dist = pC[i] - kp;
+                uint32_t dist = pi - kp;
                 float rb = (rel_table != nullptr && dist < rel_extent)
-                    ? rel_table[(static_cast<size_t>(tC[i]) * n_q_heads + qhC[i]) * rel_extent + dist] * LOG2E : 0.0f;
+                    ? rel_table[(static_cast<size_t>(ti) * n_q_heads + qhi) * rel_extent + dist] * LOG2E : 0.0f;
                 sc = sacc[i] * kscale + rb;
             }
             float mx = sc;
@@ -1707,10 +1719,8 @@ extern "C" __global__ void smalltide_attn_prefill_wmma_split(
             m_run[i] = mn;
             #pragma unroll
             for (uint32_t c = 0u; c < 8u; ++c) o[c][i] *= al;
-            pr[i] = pv * vscale;
+            s_p[warp][mi][nl] = (_Float16)(pv * vscale);
         }
-        #pragma unroll
-        for (uint32_t i = 0u; i < 8u; ++i) s_p[warp][half_ * 8u + i][nl] = (_Float16)pr[i];
         #pragma unroll
         for (uint32_t r = 0u; r < 16u; ++r) {
             uint32_t kr = k0 + r;
@@ -1908,22 +1918,27 @@ extern "C" __global__ void smalltide_gemm_fp8_rows_wmma_x16(
         b_ok[j] = n < n_rows;
         wr[j] = w_fp8 + static_cast<size_t>(b_ok[j] ? n : 0u) * k_cols;
     }
-    st_float8 c[ST_GEMM_RG][4] = {};
-    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    st_float8 c[ST_GEMM_RG][4];
+    #pragma unroll
+    for (uint32_t g = 0u; g < ST_GEMM_RG; ++g) {
+        #pragma unroll
+        for (uint32_t j = 0u; j < 4u; ++j) c[g][j] = (st_float8){};
+    }
     uint32_t hoff = (l >> 4) * 16u;
     for (uint32_t k = 0u; k < k_cols; k += 32u) {
         uint32_t base = k + hoff;
         st_half8 b0[4], b1[4];
         #pragma unroll
         for (uint32_t j = 0u; j < 4u; ++j) {
-            uint4 wv = b_ok[j] ? *reinterpret_cast<const uint4*>(wr[j] + base) : zero;
+            uint4 wv = b_ok[j] ? *reinterpret_cast<const uint4*>(wr[j] + base) : make_uint4(0u, 0u, 0u, 0u);
             b0[j] = fp8x8_to_half8(make_uint2(wv.x, wv.y));
             b1[j] = fp8x8_to_half8(make_uint2(wv.z, wv.w));
         }
         #pragma unroll
         for (uint32_t g = 0u; g < ST_GEMM_RG; ++g) {
             const uint4* xp = reinterpret_cast<const uint4*>(xr[g] + base);
-            st_half8 a0 = as_half8(a_ok[g] ? xp[0] : zero), a1 = as_half8(a_ok[g] ? xp[1] : zero);
+            st_half8 a0 = as_half8(a_ok[g] ? xp[0] : make_uint4(0u, 0u, 0u, 0u));
+            st_half8 a1 = as_half8(a_ok[g] ? xp[1] : make_uint4(0u, 0u, 0u, 0u));
             #pragma unroll
             for (uint32_t j = 0u; j < 4u; ++j) {
                 c[g][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0[j], c[g][j]);

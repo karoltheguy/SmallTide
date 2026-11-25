@@ -1,6 +1,6 @@
 //! GPU-resident dense weights for Inkling-2-Mini (`--fp8-dense`), backend-agnostic over `ComputeBackend`.
 
-use smalltide_core::{ComputeBackend, DeviceBuf, PinnedBuf, QueueKind, Result, Stream};
+use smalltide_core::{backend::GemvSegment, ComputeBackend, DeviceBuf, PinnedBuf, QueueKind, Result, Stream};
 use smalltide_io::dense_loader::{DenseLayerHost, Fp8MatrixHost, Inkling2DenseHost, LoopControllerHost};
 use std::sync::Arc;
 
@@ -9,6 +9,49 @@ pub struct Fp8MatrixGpu {
     pub k_cols: usize,
     pub data: DeviceBuf,
     pub row_scales: DeviceBuf,
+    pub is_bf16: bool,
+}
+
+impl Fp8MatrixGpu {
+    #[inline]
+    pub fn seg(&self, x: DeviceBuf, y: DeviceBuf) -> GemvSegment {
+        GemvSegment {
+            w: self.data,
+            row_scales: (!self.is_bf16).then_some(self.row_scales),
+            x,
+            y,
+            n_rows: self.n_rows,
+            k_cols: self.k_cols,
+            is_bf16: self.is_bf16,
+        }
+    }
+
+    #[inline]
+    pub fn gemv<B: ComputeBackend>(&self, b: &B, out: DeviceBuf, x: DeviceBuf, n_rows: usize, s: Stream) -> Result<()> {
+        if self.is_bf16 {
+            b.gemv_bf16(out, x, self.data, n_rows, self.k_cols, s)
+        } else {
+            b.gemv_fp8(out, x, self.data, self.row_scales, n_rows, self.k_cols, s)
+        }
+    }
+
+    #[inline]
+    pub fn gemm_rows<B: ComputeBackend>(&self, b: &B, y: DeviceBuf, x: DeviceBuf, rows: usize, n_rows: usize, s: Stream) -> Result<()> {
+        if self.is_bf16 {
+            b.gemm_bf16_rows(y, x, self.data, rows, n_rows, self.k_cols, s)
+        } else {
+            b.gemm_fp8_rows(y, x, self.data, self.row_scales, rows, n_rows, self.k_cols, s)
+        }
+    }
+
+    #[inline]
+    pub fn gemm_rows_decode<B: ComputeBackend>(&self, b: &B, y: DeviceBuf, x: DeviceBuf, rows: usize, n_rows: usize, s: Stream) -> Result<()> {
+        if self.is_bf16 {
+            b.gemm_bf16_rows(y, x, self.data, rows, n_rows, self.k_cols, s)
+        } else {
+            b.gemm_fp8_rows_decode(y, x, self.data, self.row_scales, rows, n_rows, self.k_cols, s)
+        }
+    }
 }
 
 pub struct LoopControllerGpu {
@@ -107,6 +150,7 @@ impl<'a, B: ComputeBackend> Uploader<'a, B> {
             k_cols: m.k_cols,
             data: self.upload_bytes(&m.data)?,
             row_scales: self.upload_f32(&m.row_scales)?,
+            is_bf16: m.is_bf16,
         })
     }
 

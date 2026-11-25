@@ -294,9 +294,28 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
         std::process::exit(1);
     }
 
+    let dense_bf16 = match std::env::var("SMALLTIDE_DENSE_FMT")
+        .unwrap_or_else(|_| "fp8".into())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fp8" | "" => false,
+        "bf16" => true,
+        other => {
+            eprintln!("error: SMALLTIDE_DENSE_FMT={other:?} is invalid (expected fp8 or bf16)");
+            std::process::exit(2);
+        }
+    };
     let tok = BpeTokenizer::from_file(&tok_path).expect("load tokenizer.json");
-    let dense_host = Inkling2DenseHost::load_from_safetensors(&cfg, &dense_path)
+    let dense_host = Inkling2DenseHost::load_from_safetensors_with_bf16(&cfg, &dense_path, dense_bf16)
         .expect("load dense weights");
+    if dense_bf16 {
+        println!(
+            "[dense] native BF16 dense weights ({:.2} GiB VRAM; set SMALLTIDE_DENSE_FMT=fp8 for compact ~1.10 GiB)",
+            dense_host.total_vram_bytes() as f64 / (1u64 << 30) as f64
+        );
+    }
     let pack = StidePackReader::open(&pack_path).expect("open experts.stide");
     let backend = Arc::new(HipBackend::new_auto().expect("init HipBackend"));
     spawn_gpu_heartbeat(backend.clone());

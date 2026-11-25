@@ -187,7 +187,7 @@ impl HipBackend {
                     y: self.dev_ptr(sg.y)?,
                     n_rows: sg.n_rows as u32,
                     k_cols: sg.k_cols as u32,
-                    is_f32: sg.row_scales.is_none() as u32,
+                    is_f32: if sg.is_bf16 { 2 } else { sg.row_scales.is_none() as u32 },
                     row_start: a.total_rows,
                 };
                 a.total_rows += sg.n_rows as u32;
@@ -200,10 +200,14 @@ impl HipBackend {
                 Some(r) => {
                     let mut rr = r;
                     let mut args = [p(&mut a), p(&mut rr)];
-                    let can_wmma = r >= 4
-                        && chunk.iter().all(|sg| sg.row_scales.is_some() && sg.n_rows % 16 == 0 && sg.k_cols % 32 == 0)
-                        && std::env::var_os("SMALLTIDE_NO_WMMA_MULTI").is_none();
-                    if can_wmma {
+                    let no_wmma = std::env::var_os("SMALLTIDE_NO_WMMA_MULTI").is_some();
+                    let can_wmma_fp8 = r >= 4
+                        && !no_wmma
+                        && chunk.iter().all(|sg| !sg.is_bf16 && sg.row_scales.is_some() && sg.n_rows % 16 == 0 && sg.k_cols % 32 == 0);
+                    let can_wmma_bf16 = r >= 4
+                        && !no_wmma
+                        && chunk.iter().all(|sg| sg.is_bf16 && sg.n_rows % 16 == 0 && sg.k_cols % 32 == 0);
+                    if can_wmma_fp8 {
                         let kfn = if r <= 16 {
                             self.kernels.gemv_multi_wmma
                         } else if r <= 32 {
@@ -212,6 +216,15 @@ impl HipBackend {
                             self.kernels.gemv_multi_wmma_m64
                         };
                         self.launch(kfn, (a.total_rows.div_ceil(32), 1, 1), 64, &mut args, stream, "launch(gemv_multi_wmma)")?;
+                    } else if can_wmma_bf16 {
+                        let kfn = if r <= 16 {
+                            self.kernels.gemv_multi_wmma_bf16
+                        } else if r <= 32 {
+                            self.kernels.gemv_multi_wmma_bf16_m32
+                        } else {
+                            self.kernels.gemv_multi_wmma_bf16_m64
+                        };
+                        self.launch(kfn, (a.total_rows.div_ceil(32), 1, 1), 64, &mut args, stream, "launch(gemv_multi_wmma_bf16)")?;
                     } else {
                         self.launch(self.kernels.gemv_multi_rows, (a.total_rows.div_ceil(4), 1, 1), 128, &mut args, stream, "launch(gemv_multi_rows)")?;
                     }
@@ -2111,6 +2124,49 @@ impl ComputeBackend for HipBackend {
         self.launch(self.kernels.gemv_fp8_rows, (n.div_ceil(4), 1, 1), 128, &mut args, stream, "launch(gemv_fp8_rows)")
     }
 
+    fn gemv_bf16(&self, out: DeviceBuf, x: DeviceBuf, w_bf16: DeviceBuf,
+        n_rows: usize, k_cols: usize, stream: Stream) -> Result<()> {
+        let (mut a, mut b, mut c) = (self.dev_ptr(out)?, self.dev_ptr(x)?, self.dev_ptr(w_bf16)?);
+        let (mut n, mut k) = (n_rows as u32, k_cols as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut n), p(&mut k)];
+        self.launch(self.kernels.gemv_bf16_f32, (n.div_ceil(4), 1, 1), 128, &mut args, stream, "launch(gemv_bf16_f32)")
+    }
+
+    fn gemm_bf16_rows(&self, y: DeviceBuf, x: DeviceBuf, w_bf16: DeviceBuf,
+        rows: usize, n_rows: usize, k_cols: usize, stream: Stream) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let (mut a, mut b, mut c) = (self.dev_ptr(y)?, self.dev_ptr(x)?, self.dev_ptr(w_bf16)?);
+        let (mut m, mut n, mut k) = (rows as u32, n_rows as u32, k_cols as u32);
+        let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut m), p(&mut n), p(&mut k)];
+        let wmma_ok = k_cols % 32 == 0 && std::env::var_os("SMALLTIDE_GEMM_SCALAR").is_none();
+        if wmma_ok && rows >= 4 {
+            if rows <= 16 {
+                return self.launch(self.kernels.gemm_bf16_rows_wmma_small, (n.div_ceil(256), 1, 1), 256, &mut args, stream, "launch(gemm_bf16_rows_wmma_small)");
+            }
+            if rows <= 32 {
+                return self.launch(self.kernels.gemm_bf16_rows_wmma_m32, (n.div_ceil(32), 1, 1), 64, &mut args, stream, "launch(gemm_bf16_rows_wmma_m32)");
+            }
+            if rows <= 64 {
+                return self.launch(self.kernels.gemm_bf16_rows_wmma_m64, (n.div_ceil(32), 1, 1), 64, &mut args, stream, "launch(gemm_bf16_rows_wmma_m64)");
+            }
+            return self.launch(self.kernels.vit_gemm_bf16, (n.div_ceil(64), m.div_ceil(128), 1), 256, &mut args, stream, "launch(vit_gemm_bf16)");
+        }
+        let mut off = 0usize;
+        while off < rows {
+            let take = (rows - off).min(8);
+            let ys = y.slice(off * n_rows * 4, take * n_rows * 4);
+            let xs = x.slice(off * k_cols * 4, take * k_cols * 4);
+            let (mut a, mut b, mut c) = (self.dev_ptr(ys)?, self.dev_ptr(xs)?, self.dev_ptr(w_bf16)?);
+            let (mut m, mut n, mut k) = (take as u32, n_rows as u32, k_cols as u32);
+            let mut args = [p(&mut a), p(&mut b), p(&mut c), p(&mut m), p(&mut n), p(&mut k)];
+            self.launch(self.kernels.gemv_bf16_rows, (n.div_ceil(4), 1, 1), 128, &mut args, stream, "launch(gemv_bf16_rows)")?;
+            off += take;
+        }
+        Ok(())
+    }
+
     fn gemm_f32_rows(&self, y: DeviceBuf, x: DeviceBuf, w: DeviceBuf, rows: usize, n_rows: usize,
         k_cols: usize, stream: Stream) -> Result<()> {
         let (mut a, mut b, mut c) = (self.dev_ptr(y)?, self.dev_ptr(x)?, self.dev_ptr(w)?);
@@ -3044,9 +3100,11 @@ impl ComputeBackend for HipBackend {
         if rows == 0 {
             return Err(SmallTideError::Backend { backend: "hip", message: format!("gemv_multi_rows: {rows} rows") });
         }
+        let no_wmma = std::env::var_os("SMALLTIDE_NO_WMMA_MULTI").is_some();
         let all_wmma = rows >= 4
-            && segs.iter().all(|sg| sg.row_scales.is_some() && sg.n_rows % 16 == 0 && sg.k_cols % 32 == 0)
-            && std::env::var_os("SMALLTIDE_NO_WMMA_MULTI").is_none();
+            && !no_wmma
+            && (segs.iter().all(|sg| !sg.is_bf16 && sg.row_scales.is_some() && sg.n_rows % 16 == 0 && sg.k_cols % 32 == 0)
+                || segs.iter().all(|sg| sg.is_bf16 && sg.n_rows % 16 == 0 && sg.k_cols % 32 == 0));
         let tile = if all_wmma { 64 } else { 8 };
         if rows <= tile {
             return self.gemv_multi_impl(segs, Some(rows as u32), stream);
@@ -3063,6 +3121,7 @@ impl ComputeBackend for HipBackend {
                     y: sg.y.slice(off * sg.n_rows * 4, take * sg.n_rows * 4),
                     n_rows: sg.n_rows,
                     k_cols: sg.k_cols,
+                    is_bf16: sg.is_bf16,
                 })
                 .collect();
             self.gemv_multi_impl(&sliced, Some(take as u32), stream)?;

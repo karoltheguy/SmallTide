@@ -136,7 +136,8 @@ pub struct GroupedMoeParams {
 }
 
 /// One output segment of `ComputeBackend::gemv_multi`: `y = W . x` with FP8 E4M3 row-scaled
-/// weights (`row_scales` = Some) or F32 weights (`row_scales` = None).
+/// weights (`row_scales = Some`, `is_bf16 = false`), native BF16 weights (`is_bf16 = true`),
+/// or F32 weights (`row_scales = None`, `is_bf16 = false`).
 #[derive(Debug, Clone, Copy)]
 pub struct GemvSegment {
     pub w: DeviceBuf,
@@ -145,6 +146,7 @@ pub struct GemvSegment {
     pub y: DeviceBuf,
     pub n_rows: usize,
     pub k_cols: usize,
+    pub is_bf16: bool,
 }
 
 /// Inputs/outputs of the fused decode attention prep (see `ComputeBackend::attn_prep_decode`).
@@ -683,6 +685,18 @@ pub trait ComputeBackend: Send + Sync {
 
     fn gemm_fp8_rows(&self, y: DeviceBuf, x: DeviceBuf, w_fp8: DeviceBuf, row_scales: DeviceBuf,
         rows: usize, n_rows: usize, k_cols: usize, stream: Stream) -> Result<()>;
+
+    /// `out[n] = W_bf16[n, :] . x` (single-row decode / unembed with native BF16 weights).
+    fn gemv_bf16(&self, _out: DeviceBuf, _x: DeviceBuf, _w_bf16: DeviceBuf,
+        _n_rows: usize, _k_cols: usize, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("gemv_bf16".into()))
+    }
+
+    /// `y[m, n] = W_bf16[n, :] . x[m, :]` (decode, verify, or prefill with native BF16 weights).
+    fn gemm_bf16_rows(&self, _y: DeviceBuf, _x: DeviceBuf, _w_bf16: DeviceBuf,
+        _rows: usize, _n_rows: usize, _k_cols: usize, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("gemm_bf16_rows".into()))
+    }
 
     /// `y[m, n] = W_f32[n, :] . x[m, :]`.
     #[allow(clippy::too_many_arguments)]

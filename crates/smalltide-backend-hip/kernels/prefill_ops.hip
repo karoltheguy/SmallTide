@@ -1896,6 +1896,169 @@ extern "C" __global__ void smalltide_gemv_fp8_rows(
 }
 
 // ---------------------------------------------------------------------------
+// Native BF16 multi-row kernels:
+//   - smalltide_gemv_bf16_rows             : 1..=8 rows bandwidth-bound BF16 GEMV
+//   - smalltide_gemm_bf16_rows_wmma_small  : <= 16 rows, 2 N-tiles/warp native BF16 WMMA
+//   - smalltide_gemm_bf16_rows_wmma_m32/64 : 17..=64 rows, 2 warps/block full-occupancy BF16 WMMA
+//   (> 64 rows uses smalltide_vit_gemm_bf16 in vision_ops.hip)
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_gemv_bf16_rows(
+    float* __restrict__ y, const float* __restrict__ x, const uint16_t* __restrict__ w_bf16,
+    uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) {
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t row = blockIdx.x * 4u + warp;
+    if (row >= n_rows) return;
+    const uint4* wv = reinterpret_cast<const uint4*>(w_bf16 + static_cast<size_t>(row) * k_cols);
+    uint32_t k8 = k_cols >> 3;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    auto dot8 = [&](uint4 w8, uint32_t c) {
+        float4 d0 = decode_bf16x4(make_uint2(w8.x, w8.y));
+        float4 d1 = decode_bf16x4(make_uint2(w8.z, w8.w));
+        #pragma unroll
+        for (uint32_t m = 0u; m < 8u; ++m) {
+            if (m < m_rows) {
+                const float4* xv = reinterpret_cast<const float4*>(x + static_cast<size_t>(m) * k_cols) + (c << 1);
+                float4 x0 = xv[0], x1 = xv[1];
+                float a = acc[m];
+                a = fmaf(d0.x, x0.x, a); a = fmaf(d0.y, x0.y, a); a = fmaf(d0.z, x0.z, a); a = fmaf(d0.w, x0.w, a);
+                a = fmaf(d1.x, x1.x, a); a = fmaf(d1.y, x1.y, a); a = fmaf(d1.z, x1.z, a); a = fmaf(d1.w, x1.w, a);
+                acc[m] = a;
+            }
+        }
+    };
+    uint32_t c = lane;
+    for (; c + 32u < k8; c += 64u) {
+        uint4 wa = wv[c];
+        uint4 wb = wv[c + 32u];
+        dot8(wa, c);
+        dot8(wb, c + 32u);
+    }
+    if (c < k8) dot8(wv[c], c);
+    #pragma unroll
+    for (uint32_t m = 0u; m < 8u; ++m) {
+        if (m < m_rows) {
+            float sum = wave32_sum(acc[m]);
+            if (lane == 0u) y[static_cast<size_t>(m) * n_rows + row] = sum;
+        }
+    }
+}
+
+extern "C" __global__ void smalltide_gemm_bf16_rows_wmma_small(
+    float* __restrict__ y, const float* __restrict__ x, const uint16_t* __restrict__ w_bf16,
+    uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) {
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t n0 = (blockIdx.x * 8u + warp) * 32u;
+    if (n0 >= n_rows) return;
+    uint32_t am = l & 15u;
+    bool a_ok = am < m_rows;
+    const float* xr = x + static_cast<size_t>(a_ok ? am : 0u) * k_cols;
+    uint32_t n_a = n0 + (l & 15u);
+    uint32_t n_b = n0 + 16u + (l & 15u);
+    bool b_ok0 = n_a < n_rows;
+    bool b_ok1 = n_b < n_rows;
+    const uint16_t* wr0 = w_bf16 + static_cast<size_t>(b_ok0 ? n_a : 0u) * k_cols;
+    const uint16_t* wr1 = w_bf16 + static_cast<size_t>(b_ok1 ? n_b : 0u) * k_cols;
+    st_float8 c0 = {}, c1 = {};
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    uint32_t hoff = (l >> 4) * 16u;
+    for (uint32_t k = 0u; k < k_cols; k += 32u) {
+        uint32_t base = k + hoff;
+        const float4* xp = reinterpret_cast<const float4*>(xr + base);
+        float4 x0 = a_ok ? xp[0] : make_float4(0, 0, 0, 0), x1 = a_ok ? xp[1] : make_float4(0, 0, 0, 0);
+        float4 x2 = a_ok ? xp[2] : make_float4(0, 0, 0, 0), x3 = a_ok ? xp[3] : make_float4(0, 0, 0, 0);
+        st_bf16_8 a0, a1;
+        a0[0] = f32_to_bf16_rne(x0.x); a0[1] = f32_to_bf16_rne(x0.y); a0[2] = f32_to_bf16_rne(x0.z); a0[3] = f32_to_bf16_rne(x0.w);
+        a0[4] = f32_to_bf16_rne(x1.x); a0[5] = f32_to_bf16_rne(x1.y); a0[6] = f32_to_bf16_rne(x1.z); a0[7] = f32_to_bf16_rne(x1.w);
+        a1[0] = f32_to_bf16_rne(x2.x); a1[1] = f32_to_bf16_rne(x2.y); a1[2] = f32_to_bf16_rne(x2.z); a1[3] = f32_to_bf16_rne(x2.w);
+        a1[4] = f32_to_bf16_rne(x3.x); a1[5] = f32_to_bf16_rne(x3.y); a1[6] = f32_to_bf16_rne(x3.z); a1[7] = f32_to_bf16_rne(x3.w);
+        const uint4* wp0 = reinterpret_cast<const uint4*>(wr0 + base);
+        const uint4* wp1 = reinterpret_cast<const uint4*>(wr1 + base);
+        c0 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0, as_bf16_8(b_ok0 ? wp0[0] : zero), c0);
+        c1 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0, as_bf16_8(b_ok1 ? wp1[0] : zero), c1);
+        c0 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1, as_bf16_8(b_ok0 ? wp0[1] : zero), c0);
+        c1 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1, as_bf16_8(b_ok1 ? wp1[1] : zero), c1);
+    }
+    if (b_ok0) {
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            uint32_t mm = (l >> 4) * 8u + i;
+            if (mm < m_rows) y[static_cast<size_t>(mm) * n_rows + n_a] = c0[i];
+        }
+    }
+    if (b_ok1) {
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            uint32_t mm = (l >> 4) * 8u + i;
+            if (mm < m_rows) y[static_cast<size_t>(mm) * n_rows + n_b] = c1[i];
+        }
+    }
+}
+
+template <uint32_t RG>
+__device__ __forceinline__ void gemm_bf16_rows_wmma_mid(
+    float* __restrict__ y, const float* __restrict__ x, const uint16_t* __restrict__ w_bf16,
+    uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) {
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t n0 = (blockIdx.x * 2u + warp) * 16u;
+    if (n0 >= n_rows) return;
+    uint32_t n = n0 + (l & 15u);
+    bool b_ok = n < n_rows;
+    const uint16_t* wr = w_bf16 + static_cast<size_t>(b_ok ? n : 0u) * k_cols;
+    const float* xr[RG];
+    bool a_ok[RG];
+    #pragma unroll
+    for (uint32_t g = 0u; g < RG; ++g) {
+        uint32_t am = 16u * g + (l & 15u);
+        a_ok[g] = am < m_rows;
+        xr[g] = x + static_cast<size_t>(a_ok[g] ? am : 0u) * k_cols;
+    }
+    st_float8 c[RG] = {};
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    uint32_t hoff = (l >> 4) * 16u;
+    for (uint32_t k = 0u; k < k_cols; k += 32u) {
+        uint32_t base = k + hoff;
+        const uint4* wp = reinterpret_cast<const uint4*>(wr + base);
+        st_bf16_8 b0 = as_bf16_8(b_ok ? wp[0] : zero);
+        st_bf16_8 b1 = as_bf16_8(b_ok ? wp[1] : zero);
+        #pragma unroll
+        for (uint32_t g = 0u; g < RG; ++g) {
+            const float4* xp = reinterpret_cast<const float4*>(xr[g] + base);
+            float4 x0 = a_ok[g] ? xp[0] : make_float4(0, 0, 0, 0), x1 = a_ok[g] ? xp[1] : make_float4(0, 0, 0, 0);
+            float4 x2 = a_ok[g] ? xp[2] : make_float4(0, 0, 0, 0), x3 = a_ok[g] ? xp[3] : make_float4(0, 0, 0, 0);
+            st_bf16_8 a0, a1;
+            a0[0] = f32_to_bf16_rne(x0.x); a0[1] = f32_to_bf16_rne(x0.y); a0[2] = f32_to_bf16_rne(x0.z); a0[3] = f32_to_bf16_rne(x0.w);
+            a0[4] = f32_to_bf16_rne(x1.x); a0[5] = f32_to_bf16_rne(x1.y); a0[6] = f32_to_bf16_rne(x1.z); a0[7] = f32_to_bf16_rne(x1.w);
+            a1[0] = f32_to_bf16_rne(x2.x); a1[1] = f32_to_bf16_rne(x2.y); a1[2] = f32_to_bf16_rne(x2.z); a1[3] = f32_to_bf16_rne(x2.w);
+            a1[4] = f32_to_bf16_rne(x3.x); a1[5] = f32_to_bf16_rne(x3.y); a1[6] = f32_to_bf16_rne(x3.z); a1[7] = f32_to_bf16_rne(x3.w);
+            c[g] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0, b0, c[g]);
+            c[g] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1, b1, c[g]);
+        }
+    }
+    if (!b_ok) return;
+    #pragma unroll
+    for (uint32_t g = 0u; g < RG; ++g) {
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            uint32_t mm = 16u * g + (l >> 4) * 8u + i;
+            if (mm < m_rows) y[static_cast<size_t>(mm) * n_rows + n] = c[g][i];
+        }
+    }
+}
+
+extern "C" __global__ void smalltide_gemm_bf16_rows_wmma_m32(
+    float* __restrict__ y, const float* __restrict__ x, const uint16_t* __restrict__ w_bf16,
+    uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) { gemm_bf16_rows_wmma_mid<2u>(y, x, w_bf16, m_rows, n_rows, k_cols); }
+
+extern "C" __global__ void smalltide_gemm_bf16_rows_wmma_m64(
+    float* __restrict__ y, const float* __restrict__ x, const uint16_t* __restrict__ w_bf16,
+    uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) { gemm_bf16_rows_wmma_mid<4u>(y, x, w_bf16, m_rows, n_rows, k_cols); }
+
+// ---------------------------------------------------------------------------
 // Speculative-verify rewind: every short-conv state takes the 3 history rows that follow the
 // first `keep` inputs (state after `keep` of the verified rows).
 //   entries: [n][4] u64 = (hist ptr, state ptr, dim, unused).  Grid: (n, ceil(maxdim / 256)), Block: 256

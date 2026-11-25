@@ -11,7 +11,6 @@
 //! Reference: `tools/inkling2_draft_ref.py`.
 
 use crate::weights::{Fp8MatrixGpu, Inkling2DenseGpu, Uploader};
-use smalltide_core::backend::GemvSegment;
 use smalltide_core::{ComputeBackend, DeviceBuf, PinnedBuf, QueueKind, Result, SmallTideError, Stream};
 use smalltide_io::dense_loader::{read_f32_vec, read_fp8_matrix, read_raw_bytes, Fp8MatrixHost};
 use smalltide_io::quant::{bf16_to_f32, f32_to_fp8_e4m3fn, FP8_E4M3FN_MAX};
@@ -148,7 +147,7 @@ pub(crate) fn quantize_f32_rows_to_fp8(src: &[f32], n_rows: usize, k_cols: usize
             *d = f32_to_fp8_e4m3fn(v * inv);
         }
     }
-    Fp8MatrixHost { n_rows, k_cols, data, row_scales }
+    Fp8MatrixHost { n_rows, k_cols, data, row_scales, is_bf16: false }
 }
 
 impl<B: ComputeBackend> DSparkDrafter<B> {
@@ -280,7 +279,7 @@ impl<B: ComputeBackend> DSparkDrafter<B> {
             let xd = up.upload_f32(&x)?;
             let y = backend.alloc_device((R + 1) * vocab * 4)?;
             let u = &dense.unembed_fp8;
-            backend.gemm_fp8_rows(y, xd, u.data, u.row_scales, R + 1, vocab, D, stream)?;
+            u.gemm_rows(backend.as_ref(), y, xd, R + 1, vocab, stream)?;
             let fold_fp8 = backend.alloc_device(R * vocab_pad)?;
             let fold_scales = backend.alloc_device(R * 4)?;
             backend.dspark_quant_fold_fp8(fold_fp8, fold_scales, y, R, vocab, vocab_pad, stream)?;
@@ -443,10 +442,7 @@ impl<B: ComputeBackend> DSparkDrafter<B> {
         for (l, ly) in self.layers.iter().enumerate() {
             b.dspark_mix_rms(sc.ctx_c, taps_shifted, tap_stride, self.alpha[l], ly.dflare, m, D, EPS, s)?;
             if m <= 8 {
-                let segs = [
-                    GemvSegment { w: ly.k_ctx.data, row_scales: Some(ly.k_ctx.row_scales), x: sc.ctx_c, y: sc.ctx_k, n_rows: kvd, k_cols: D },
-                    GemvSegment { w: ly.v_ctx.data, row_scales: Some(ly.v_ctx.row_scales), x: sc.ctx_c, y: sc.ctx_v, n_rows: kvd, k_cols: D },
-                ];
+                let segs = [ly.k_ctx.seg(sc.ctx_c, sc.ctx_k), ly.v_ctx.seg(sc.ctx_c, sc.ctx_v)];
                 b.gemv_multi_rows(&segs, m, s)?;
             } else {
                 b.gemm_fp8_rows(sc.ctx_k, sc.ctx_c, ly.k_ctx.data, ly.k_ctx.row_scales, m, kvd, D, s)?;
@@ -488,7 +484,7 @@ impl<B: ComputeBackend> DSparkDrafter<B> {
         b.memcpy_h2d_async(sc.anchor_in, 0, sc.pinned, 0, D * 4, s)?;
         b.dspark_embed_prep(sc.res, sc.xn, sc.anchor_in, dense.embed_norm, self.mask_embed_gpu, self.layers[0].in_ln, D, EPS, s)?;
 
-        let seg = |m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment { w: m.data, row_scales: Some(m.row_scales), x, y, n_rows: m.n_rows, k_cols: m.k_cols };
+        let seg = |m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| m.seg(x, y);
         let scale = 1.0 / (HD as f32).sqrt();
         for (l, ly) in self.layers.iter().enumerate() {
             b.gemv_multi_rows(&[seg(&ly.q, sc.xn, sc.q), seg(&ly.k, sc.xn, sc.kb), seg(&ly.v, sc.xn, sc.vb)], BLOCK, s)?;
@@ -511,7 +507,7 @@ impl<B: ComputeBackend> DSparkDrafter<B> {
         // Markov head: base logits of block rows 1..=n, plus precomputed loop-invariant RNN projections.
         let hb = sc.xn.slice(D * 4, (BLOCK - 1) * D * 4);
         let u = &dense.unembed_fp8;
-        b.gemm_fp8_rows_decode(sc.base, hb, u.data, u.row_scales, n, self.vocab, D, s)?;
+        u.gemm_rows_decode(b, sc.base, hb, n, self.vocab, s)?;
         let toff = tap_row * D * 4;
         b.dspark_mix_rms(sc.frnn, taps.slice(toff, taps.size_bytes - toff), tap_stride, self.alpha[3], self.mk_norm, 1, D, EPS, s)?;
         b.gemv_fp8(sc.frnn_proj, sc.frnn, self.rnn_w_frnn.data, self.rnn_w_frnn.row_scales, 3 * R, D, s)?;

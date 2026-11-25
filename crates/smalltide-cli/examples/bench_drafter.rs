@@ -142,7 +142,7 @@ fn main() {
             }
         }
         (
-            Fp8MatrixGpu { n_rows: lm.n_rows, k_cols: lm.k_cols, data, row_scales },
+            Fp8MatrixGpu { n_rows: lm.n_rows, k_cols: lm.k_cols, data, row_scales, is_bf16: false },
             embed_norm,
             emb,
         )
@@ -169,7 +169,7 @@ fn main() {
                 emb[o..o + 2].copy_from_slice(&bf.to_le_bytes());
             }
         }
-        (Fp8MatrixGpu { n_rows: vocab, k_cols: d, data, row_scales }, embed_norm, emb)
+        (Fp8MatrixGpu { n_rows: vocab, k_cols: d, data, row_scales, is_bf16: false }, embed_norm, emb)
     };
 
     let dummy = backend.alloc_device(4).expect("dummy");

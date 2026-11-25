@@ -13,13 +13,15 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// A row-major `[n_rows, k_cols]` matrix quantized on load to FP8 E4M3FN + per-row F32 scales.
+/// A row-major `[n_rows, k_cols]` dense matrix: either FP8 E4M3FN + per-row F32 scales
+/// (`is_bf16 = false`) or exact native BF16 (`is_bf16 = true`, `row_scales` empty).
 #[derive(Debug, Clone)]
 pub struct Fp8MatrixHost {
     pub n_rows: usize,
     pub k_cols: usize,
     pub data: Vec<u8>,
     pub row_scales: Vec<f32>,
+    pub is_bf16: bool,
 }
 
 impl Fp8MatrixHost {
@@ -151,6 +153,17 @@ impl Inkling2DenseHost {
 
     /// Loads all Inkling-2-Mini dense text tensors from `safetensors_path`, casting BF16 linears -> FP8.
     pub fn load_from_safetensors(cfg: &Inkling2Config, safetensors_path: &Path) -> Result<Self> {
+        Self::load_from_safetensors_with_bf16(cfg, safetensors_path, false)
+    }
+
+    /// Loads all Inkling-2-Mini dense text tensors from `safetensors_path`.
+    /// When `dense_bf16` is true, linear projections and `unembed` stay in native BF16 (~2.20 GiB)
+    /// instead of quantizing to per-row FP8 E4M3FN (~1.10 GiB).
+    pub fn load_from_safetensors_with_bf16(
+        cfg: &Inkling2Config,
+        safetensors_path: &Path,
+        dense_bf16: bool,
+    ) -> Result<Self> {
         let hdr = inspect_safetensors_header(safetensors_path)?;
         let data_base = 8u64 + hdr.header_len;
         let mut file = File::open(safetensors_path)?;
@@ -173,20 +186,20 @@ impl Inkling2DenseHost {
             "model.llm.middle_cycle_cross_pass_kv_queries",
         )?;
         let unembed_fp8 =
-            read_fp8_matrix(&mut file, &hdr, data_base, "model.llm.unembed.weight")?;
+            read_dense_matrix(&mut file, &hdr, data_base, "model.llm.unembed.weight", dense_bf16)?;
 
         let mut layers = Vec::with_capacity(cfg.num_physical_layers);
         for l in 0..cfg.num_physical_layers {
             let p = format!("model.llm.layers.{l}");
             let is_local = cfg.is_local_layer(l);
 
-            let wq = read_fp8_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wq_du.weight"))?;
-            let wk = read_fp8_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wk_dv.weight"))?;
-            let wv = read_fp8_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wv_dv.weight"))?;
-            let wo = read_fp8_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wo_ud.weight"))?;
+            let wq = read_dense_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wq_du.weight"), dense_bf16)?;
+            let wk = read_dense_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wk_dv.weight"), dense_bf16)?;
+            let wv = read_dense_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wv_dv.weight"), dense_bf16)?;
+            let wo = read_dense_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wo_ud.weight"), dense_bf16)?;
             let gate_attn =
-                read_fp8_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.gate_attn.weight"))?;
-            let wr = read_fp8_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wr_du.weight"))?;
+                read_dense_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.gate_attn.weight"), dense_bf16)?;
+            let wr = read_dense_matrix(&mut file, &hdr, data_base, &format!("{p}.attn.wr_du.weight"), dense_bf16)?;
             let attn_sink = read_f32_vec(
                 &mut file,
                 &hdr,
@@ -302,23 +315,26 @@ impl Inkling2DenseHost {
             let (controllers, loop_msg_queries) = if cfg.is_loop_core_layer(l) {
                 let mut load_ctrl = |name: &str| -> Result<LoopControllerHost> {
                     Ok(LoopControllerHost {
-                        down: read_fp8_matrix(
+                        down: read_dense_matrix(
                             &mut file,
                             &hdr,
                             data_base,
                             &format!("{p}.controllers.{name}.down_weight"),
+                            dense_bf16,
                         )?,
-                        forget: read_fp8_matrix(
+                        forget: read_dense_matrix(
                             &mut file,
                             &hdr,
                             data_base,
                             &format!("{p}.controllers.{name}.forget_weight"),
+                            dense_bf16,
                         )?,
-                        gain: read_fp8_matrix(
+                        gain: read_dense_matrix(
                             &mut file,
                             &hdr,
                             data_base,
                             &format!("{p}.controllers.{name}.gain_weight"),
+                            dense_bf16,
                         )?,
                     })
                 };
@@ -438,6 +454,16 @@ pub fn read_fp8_matrix(
     data_base: u64,
     name: &str,
 ) -> Result<Fp8MatrixHost> {
+    read_dense_matrix(file, hdr, data_base, name, false)
+}
+
+pub fn read_dense_matrix(
+    file: &mut File,
+    hdr: &SafetensorsHeader,
+    data_base: u64,
+    name: &str,
+    keep_bf16: bool,
+) -> Result<Fp8MatrixHost> {
     let entry = hdr
         .tensors
         .get(name)
@@ -452,13 +478,24 @@ pub fn read_fp8_matrix(
     let raw = read_raw_bytes(file, hdr, data_base, name)?;
     match entry.dtype.as_str() {
         "BF16" => {
-            let (data, row_scales) = quantize_bf16_bytes_to_fp8_rows(&raw, n_rows, k_cols);
-            Ok(Fp8MatrixHost {
-                n_rows,
-                k_cols,
-                data,
-                row_scales,
-            })
+            if keep_bf16 {
+                Ok(Fp8MatrixHost {
+                    n_rows,
+                    k_cols,
+                    data: raw,
+                    row_scales: Vec::new(),
+                    is_bf16: true,
+                })
+            } else {
+                let (data, row_scales) = quantize_bf16_bytes_to_fp8_rows(&raw, n_rows, k_cols);
+                Ok(Fp8MatrixHost {
+                    n_rows,
+                    k_cols,
+                    data,
+                    row_scales,
+                    is_bf16: false,
+                })
+            }
         }
         other => Err(SmallTideError::InvalidModel(format!(
             "expected BF16 for dense matrix '{name}', got '{other}'"

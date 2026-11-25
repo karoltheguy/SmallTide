@@ -3645,13 +3645,12 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
     #[inline]
     pub(crate) fn fp8_mm(&self, out: DeviceBuf, x: DeviceBuf, m: &Fp8MatrixGpu, s: Stream) -> Result<()> {
-        self.backend
-            .gemv_fp8(out, x, m.data, m.row_scales, m.n_rows, m.k_cols, s)
+        m.gemv(self.backend.as_ref(), out, x, m.n_rows, s)
     }
 
     /// Exact rank-64 cross-pass controller (`inkling2.cpp:241-249`).
     fn seg(&self, m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf) -> GemvSegment {
-        GemvSegment { w: m.data, row_scales: Some(m.row_scales), x, y, n_rows: m.n_rows, k_cols: m.k_cols }
+        m.seg(x, y)
     }
 
     /// Rank-64 cross-pass controllers (`inkling2.cpp:241-249`) for up to 4 inputs at once:
@@ -3837,13 +3836,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.seg(&layer.wv, nv, self.scratch.v_raw),
             self.seg(&layer.wr, nq, self.scratch.r),
             self.seg(&layer.gate_attn, nq, self.scratch.gate_out),
-            GemvSegment { w: layer.attn_sink, row_scales: None, x: nq, y: self.scratch.sinks, n_rows: nh, k_cols: h },
+            GemvSegment { w: layer.attn_sink, row_scales: None, x: nq, y: self.scratch.sinks, n_rows: nh, k_cols: h, is_bf16: false },
         ];
         if let Some(w) = layer.k_sconv_dyn_proj {
-            segs.push(GemvSegment { w, row_scales: None, x: nk, y: self.scratch.k_dyn, n_rows: taps, k_cols: h });
+            segs.push(GemvSegment { w, row_scales: None, x: nk, y: self.scratch.k_dyn, n_rows: taps, k_cols: h, is_bf16: false });
         }
         if let Some(w) = layer.v_sconv_dyn_proj {
-            segs.push(GemvSegment { w, row_scales: None, x: nv, y: self.scratch.v_dyn, n_rows: taps, k_cols: h });
+            segs.push(GemvSegment { w, row_scales: None, x: nv, y: self.scratch.v_dyn, n_rows: taps, k_cols: h, is_bf16: false });
         }
         self.backend.gemv_multi(&segs, s)?;
         let dt_ap = self.prof_end(t_ap, s);
@@ -4551,13 +4550,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.write_dump_final(pos, self.scratch.moe_norm)?;
         }
         // Compute only the unpadded 200,058 vocab rows (skipping 966 padded rows!)
-        self.backend.gemv_fp8(
+        self.dense.unembed_fp8.gemv(
+            self.backend.as_ref(),
             self.scratch.logits,
             self.scratch.moe_norm,
-            self.dense.unembed_fp8.data,
-            self.dense.unembed_fp8.row_scales,
             self.cfg.unpadded_vocab_size,
-            h,
             s,
         )?;
         if self.cfg.final_logit_softcapping > 0.0 {

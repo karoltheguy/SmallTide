@@ -45,6 +45,31 @@ __device__ __forceinline__ float4 decode_fp8x4(uint32_t w) {
     return make_float4(lo[0], lo[1], hi[0], hi[1]);
 }
 
+typedef short st_bf16_8 __attribute__((ext_vector_type(8)));
+
+/// 4 BF16 values packed in uint2 (8 bytes) -> 4 floats.
+__device__ __forceinline__ float4 decode_bf16x4(uint2 w) {
+    return make_float4(
+        __uint_as_float((w.x & 0xFFFFu) << 16),
+        __uint_as_float(w.x & 0xFFFF0000u),
+        __uint_as_float((w.y & 0xFFFFu) << 16),
+        __uint_as_float(w.y & 0xFFFF0000u)
+    );
+}
+
+/// Round F32 -> BF16 bits (round-to-nearest-even) for native gfx12 BF16 WMMA.
+__device__ __forceinline__ short f32_to_bf16_rne(float f) {
+    uint32_t b = __float_as_uint(f);
+    b += 0x7FFFu + ((b >> 16) & 1u);
+    return static_cast<short>(b >> 16);
+}
+
+__device__ __forceinline__ st_bf16_8 as_bf16_8(uint4 v) {
+    st_bf16_8 r;
+    __builtin_memcpy(&r, &v, sizeof(r));
+    return r;
+}
+
 /// Packed asymmetric 4-bit KV value scale for one 32-element group: (min, (max-min)/15) as f16x2.
 struct KvV4Scale {
     _Float16 lo;
@@ -227,6 +252,51 @@ extern "C" __global__ void smalltide_gemv_fp8_e4m3_f32(
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Native BF16 GEMV (Batch = 1 decode / unembed):
+//    y[n] = sum_k bf16(W[n, k]) * x[k]
+//    Grid: (ceil(N / 4), 1, 1), Block: (128, 1, 1) -> 4 warps, 1 warp per output row.
+//    K must be a multiple of 8 (all Inkling-2-Mini dense dims are multiples of 64).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void smalltide_gemv_bf16_f32(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint16_t* __restrict__ w_bf16,
+    uint32_t n_rows,
+    uint32_t k_cols
+) {
+    uint32_t warp_in_block = threadIdx.x >> 5;
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t row = blockIdx.x * 4u + warp_in_block;
+    if (row >= n_rows) return;
+
+    const uint4* w_vec = reinterpret_cast<const uint4*>(w_bf16 + static_cast<size_t>(row) * k_cols);
+    const float4* x_vec = reinterpret_cast<const float4*>(x);
+    uint32_t k_chunks8 = k_cols >> 3; // 16 bytes = 8 BF16 elements per uint4
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    auto dot8 = [&](uint4 w8, uint32_t c) {
+        uint32_t base4 = c << 1;
+        float4 x0 = x_vec[base4 + 0], x1 = x_vec[base4 + 1];
+        float4 d0 = decode_bf16x4(make_uint2(w8.x, w8.y));
+        float4 d1 = decode_bf16x4(make_uint2(w8.z, w8.w));
+        a0 = fmaf(d0.x, x0.x, a0); a1 = fmaf(d0.y, x0.y, a1);
+        a2 = fmaf(d0.z, x0.z, a2); a3 = fmaf(d0.w, x0.w, a3);
+        a0 = fmaf(d1.x, x1.x, a0); a1 = fmaf(d1.y, x1.y, a1);
+        a2 = fmaf(d1.z, x1.z, a2); a3 = fmaf(d1.w, x1.w, a3);
+    };
+    uint32_t c = lane;
+    for (; c + 32u < k_chunks8; c += 64u) {
+        uint4 wa = w_vec[c];
+        uint4 wb = w_vec[c + 32u];
+        dot8(wa, c);
+        dot8(wb, c + 32u);
+    }
+    if (c < k_chunks8) dot8(w_vec[c], c);
+    float sum = wave32_sum((a0 + a1) + (a2 + a3));
+    if (lane == 0u) y[row] = sum;
+}
+
+// ---------------------------------------------------------------------------
 // 4. NVFP4 (ModelOpt) GEMV (Batch = 1 decode):
 //    Block size = 16 elements = 8 packed bytes (`uint2`) + 1 FP8 E4M3 scale byte.
 //    Global `outer_scale` multiplies the row sum.
@@ -399,12 +469,37 @@ extern "C" __global__ void smalltide_gemv_multi(GemvMultiArgs a) {
     uint32_t row = grow - sg.row_start;
     const float4* xv = reinterpret_cast<const float4*>(sg.x);
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    if (sg.is_f32 != 0u) {
+    if (sg.is_f32 == 1u) {
         const float4* wv = reinterpret_cast<const float4*>(reinterpret_cast<const float*>(sg.w) + static_cast<size_t>(row) * sg.k_cols);
         for (uint32_t i = lane; i < (sg.k_cols >> 2); i += 32u) {
             float4 w4 = wv[i], x4 = xv[i];
             a0 = fmaf(w4.x, x4.x, a0); a1 = fmaf(w4.y, x4.y, a1); a2 = fmaf(w4.z, x4.z, a2); a3 = fmaf(w4.w, x4.w, a3);
         }
+        float s = wave32_sum((a0 + a1) + (a2 + a3));
+        if (lane == 0u) sg.y[row] = s;
+        return;
+    }
+    if (sg.is_f32 == 2u) {
+        const uint4* w_vec = reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(sg.w) + static_cast<size_t>(row) * sg.k_cols);
+        uint32_t k8 = sg.k_cols >> 3;
+        auto dot8 = [&](uint4 w8, uint32_t c) {
+            uint32_t b4 = c << 1;
+            float4 x0 = xv[b4 + 0], x1 = xv[b4 + 1];
+            float4 d0 = decode_bf16x4(make_uint2(w8.x, w8.y));
+            float4 d1 = decode_bf16x4(make_uint2(w8.z, w8.w));
+            a0 = fmaf(d0.x, x0.x, a0); a1 = fmaf(d0.y, x0.y, a1);
+            a2 = fmaf(d0.z, x0.z, a2); a3 = fmaf(d0.w, x0.w, a3);
+            a0 = fmaf(d1.x, x1.x, a0); a1 = fmaf(d1.y, x1.y, a1);
+            a2 = fmaf(d1.z, x1.z, a2); a3 = fmaf(d1.w, x1.w, a3);
+        };
+        uint32_t c = lane;
+        for (; c + 32u < k8; c += 64u) {
+            uint4 wa = w_vec[c];
+            uint4 wb = w_vec[c + 32u];
+            dot8(wa, c);
+            dot8(wb, c + 32u);
+        }
+        if (c < k8) dot8(w_vec[c], c);
         float s = wave32_sum((a0 + a1) + (a2 + a3));
         if (lane == 0u) sg.y[row] = s;
         return;
@@ -754,7 +849,7 @@ extern "C" __global__ void smalltide_gemv_multi_rows(GemvMultiArgs a, uint32_t m
     const GemvSeg sg = a.seg[si];
     uint32_t row = grow - sg.row_start;
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    if (sg.is_f32 != 0u) {
+    if (sg.is_f32 == 1u) {
         const float4* wv = reinterpret_cast<const float4*>(reinterpret_cast<const float*>(sg.w) + static_cast<size_t>(row) * sg.k_cols);
         for (uint32_t i = lane; i < (sg.k_cols >> 2); i += 32u) {
             float4 w4 = wv[i];
@@ -766,6 +861,41 @@ extern "C" __global__ void smalltide_gemv_multi_rows(GemvMultiArgs a, uint32_t m
                 }
             }
         }
+        #pragma unroll
+        for (uint32_t t = 0u; t < 8u; ++t) {
+            if (t < m_rows) {
+                float s = wave32_sum(acc[t]);
+                if (lane == 0u) sg.y[static_cast<size_t>(t) * sg.n_rows + row] = s;
+            }
+        }
+        return;
+    }
+    if (sg.is_f32 == 2u) {
+        const uint4* w_vec = reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(sg.w) + static_cast<size_t>(row) * sg.k_cols);
+        uint32_t k8 = sg.k_cols >> 3;
+        auto dot8 = [&](uint4 w8, uint32_t c) {
+            float4 d0 = decode_bf16x4(make_uint2(w8.x, w8.y));
+            float4 d1 = decode_bf16x4(make_uint2(w8.z, w8.w));
+            #pragma unroll
+            for (uint32_t t = 0u; t < 8u; ++t) {
+                if (t < m_rows) {
+                    const float4* xv = reinterpret_cast<const float4*>(sg.x + static_cast<size_t>(t) * sg.k_cols) + (c << 1);
+                    float4 x0 = xv[0], x1 = xv[1];
+                    float s = acc[t];
+                    s = fmaf(d0.x, x0.x, s); s = fmaf(d0.y, x0.y, s); s = fmaf(d0.z, x0.z, s); s = fmaf(d0.w, x0.w, s);
+                    s = fmaf(d1.x, x1.x, s); s = fmaf(d1.y, x1.y, s); s = fmaf(d1.z, x1.z, s); s = fmaf(d1.w, x1.w, s);
+                    acc[t] = s;
+                }
+            }
+        };
+        uint32_t c = lane;
+        for (; c + 32u < k8; c += 64u) {
+            uint4 wa = w_vec[c];
+            uint4 wb = w_vec[c + 32u];
+            dot8(wa, c);
+            dot8(wb, c + 32u);
+        }
+        if (c < k8) dot8(w_vec[c], c);
         #pragma unroll
         for (uint32_t t = 0u; t < 8u; ++t) {
             if (t < m_rows) {
@@ -930,6 +1060,76 @@ extern "C" __global__ void smalltide_gemv_multi_wmma_m32(GemvMultiArgs a, uint32
 
 extern "C" __global__ void smalltide_gemv_multi_wmma_m64(GemvMultiArgs a, uint32_t m_rows) {
     gemv_multi_wmma_rg<4u>(a, m_rows);
+}
+
+// Multi-segment native BF16 WMMA projection (RG = 1 for <=16 rows, 2 for <=32, 4 for <=64):
+// reads raw BF16 weights straight into gfx12 v_wmma_f32_16x16x16_bf16 fragments.
+//   Grid: (ceil(total_rows / 32)), Block: 64
+template <uint32_t RG>
+__device__ __forceinline__ void gemv_multi_wmma_bf16_rg(GemvMultiArgs a, uint32_t m_rows) {
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t n0 = (blockIdx.x * 2u + warp) * 16u;
+    if (n0 >= a.total_rows) return;
+    uint32_t si = 0u;
+    #pragma unroll
+    for (uint32_t i = 1u; i < 8u; ++i) {
+        if (i < a.n_seg && n0 >= a.seg[i].row_start) si = i;
+    }
+    const GemvSeg sg = a.seg[si];
+    uint32_t row = (n0 - sg.row_start) + (l & 15u);
+    bool b_ok = row < sg.n_rows;
+    const float* xr[RG];
+    bool a_ok[RG];
+    #pragma unroll
+    for (uint32_t g = 0u; g < RG; ++g) {
+        uint32_t am = 16u * g + (l & 15u);
+        a_ok[g] = am < m_rows;
+        xr[g] = sg.x + static_cast<size_t>(a_ok[g] ? am : 0u) * sg.k_cols;
+    }
+    const uint16_t* wr = reinterpret_cast<const uint16_t*>(sg.w) + static_cast<size_t>(b_ok ? row : 0u) * sg.k_cols;
+    st_float8 c[RG] = {};
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    uint32_t hoff = (l >> 4) * 16u;
+    for (uint32_t k = 0u; k < sg.k_cols; k += 32u) {
+        uint32_t base = k + hoff;
+        const uint4* wp = reinterpret_cast<const uint4*>(wr + base);
+        st_bf16_8 b0 = as_bf16_8(b_ok ? wp[0] : zero);
+        st_bf16_8 b1 = as_bf16_8(b_ok ? wp[1] : zero);
+        #pragma unroll
+        for (uint32_t g = 0u; g < RG; ++g) {
+            const float4* xp = reinterpret_cast<const float4*>(xr[g] + base);
+            float4 x0 = a_ok[g] ? xp[0] : make_float4(0, 0, 0, 0), x1 = a_ok[g] ? xp[1] : make_float4(0, 0, 0, 0);
+            float4 x2 = a_ok[g] ? xp[2] : make_float4(0, 0, 0, 0), x3 = a_ok[g] ? xp[3] : make_float4(0, 0, 0, 0);
+            st_bf16_8 a0, a1;
+            a0[0] = f32_to_bf16_rne(x0.x); a0[1] = f32_to_bf16_rne(x0.y); a0[2] = f32_to_bf16_rne(x0.z); a0[3] = f32_to_bf16_rne(x0.w);
+            a0[4] = f32_to_bf16_rne(x1.x); a0[5] = f32_to_bf16_rne(x1.y); a0[6] = f32_to_bf16_rne(x1.z); a0[7] = f32_to_bf16_rne(x1.w);
+            a1[0] = f32_to_bf16_rne(x2.x); a1[1] = f32_to_bf16_rne(x2.y); a1[2] = f32_to_bf16_rne(x2.z); a1[3] = f32_to_bf16_rne(x2.w);
+            a1[4] = f32_to_bf16_rne(x3.x); a1[5] = f32_to_bf16_rne(x3.y); a1[6] = f32_to_bf16_rne(x3.z); a1[7] = f32_to_bf16_rne(x3.w);
+            c[g] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a0, b0, c[g]);
+            c[g] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a1, b1, c[g]);
+        }
+    }
+    if (!b_ok) return;
+    #pragma unroll
+    for (uint32_t g = 0u; g < RG; ++g) {
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            uint32_t mm = 16u * g + (l >> 4) * 8u + i;
+            if (mm < m_rows) sg.y[static_cast<size_t>(mm) * sg.n_rows + row] = c[g][i];
+        }
+    }
+}
+
+extern "C" __global__ void smalltide_gemv_multi_wmma_bf16(GemvMultiArgs a, uint32_t m_rows) {
+    gemv_multi_wmma_bf16_rg<1u>(a, m_rows);
+}
+
+extern "C" __global__ void smalltide_gemv_multi_wmma_bf16_m32(GemvMultiArgs a, uint32_t m_rows) {
+    gemv_multi_wmma_bf16_rg<2u>(a, m_rows);
+}
+
+extern "C" __global__ void smalltide_gemv_multi_wmma_bf16_m64(GemvMultiArgs a, uint32_t m_rows) {
+    gemv_multi_wmma_bf16_rg<4u>(a, m_rows);
 }
 
 // ---------------------------------------------------------------------------

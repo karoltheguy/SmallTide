@@ -471,7 +471,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             let vocab = self.cfg.unpadded_vocab_size;
             let logits = self.batch_logits.expect("batch logits");
-            self.backend.gemm_fp8_rows_decode(logits, moe_norm, self.dense.unembed_fp8.data, self.dense.unembed_fp8.row_scales, m, vocab, h, s)?;
+            self.dense.unembed_fp8.gemm_rows_decode(self.backend.as_ref(), logits, moe_norm, m, vocab, s)?;
             let skip_softcap = matches!(
                 mode,
                 RowsMode::Verify { greedy: true, .. } | RowsMode::VerifyBatch { greedy: true, .. }
@@ -517,13 +517,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 }
             }
             let last = moe_norm.slice((m - 1) * h * 4, h * 4);
-            self.backend.gemv_fp8(
+            self.dense.unembed_fp8.gemv(
+                self.backend.as_ref(),
                 self.scratch.logits,
                 last,
-                self.dense.unembed_fp8.data,
-                self.dense.unembed_fp8.row_scales,
                 self.cfg.unpadded_vocab_size,
-                h,
                 s,
             )?;
             if self.cfg.final_logit_softcapping > 0.0 {
@@ -552,9 +550,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
 
     fn mm_rows(&self, y: DeviceBuf, x: DeviceBuf, w: &Fp8MatrixGpu, m: usize, s: Stream) -> Result<()> {
         if self.rows_decode {
-            self.backend.gemm_fp8_rows_decode(y, x, w.data, w.row_scales, m, w.n_rows, w.k_cols, s)
+            w.gemm_rows_decode(self.backend.as_ref(), y, x, m, w.n_rows, s)
         } else {
-            self.backend.gemm_fp8_rows(y, x, w.data, w.row_scales, m, w.n_rows, w.k_cols, s)
+            w.gemm_rows(self.backend.as_ref(), y, x, m, w.n_rows, s)
         }
     }
 
@@ -581,9 +579,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 self.backend.loop_control_prep_rows(sl(pf.ctrl_prep, j, 2 * h), *cur, *msg, h, self.cfg.rms_norm_eps, m, s)?;
             }
         }
-        let seg = |mm: &crate::weights::Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment {
-            w: mm.data, row_scales: Some(mm.row_scales), x, y, n_rows: mm.n_rows, k_cols: mm.k_cols,
-        };
+        let seg = |mm: &crate::weights::Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| mm.seg(x, y);
         let downs: Vec<GemvSegment> = items.iter().enumerate().map(|(j, it)| seg(&it.3.down, sl(pf.ctrl_prep, j, 2 * h), sl(pf.ctrl_gate, j, r))).collect();
         let mut gf = Vec::with_capacity(2 * items.len());
         for (j, it) in items.iter().enumerate() {
@@ -779,9 +775,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let fused_proj = self.rows_decode;
         let taps = nkv * cfg.sconv_kernel_size;
         if fused_proj {
-            let seg = |mm: &crate::weights::Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment {
-                w: mm.data, row_scales: Some(mm.row_scales), x, y, n_rows: mm.n_rows, k_cols: mm.k_cols,
-            };
+            let seg = |mm: &crate::weights::Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| mm.seg(x, y);
             let fp8_segs = [
                 seg(&layer.wq, nq, pf.q),
                 seg(&layer.wk, nk, pf.k_raw),
@@ -790,13 +784,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 seg(&layer.gate_attn, nq, pf.gate_out),
             ];
             let mut f32_segs = vec![
-                GemvSegment { w: layer.attn_sink, row_scales: None, x: nq, y: pf.sinks, n_rows: nqh, k_cols: h },
+                GemvSegment { w: layer.attn_sink, row_scales: None, x: nq, y: pf.sinks, n_rows: nqh, k_cols: h, is_bf16: false },
             ];
             if let Some(w) = layer.k_sconv_dyn_proj {
-                f32_segs.push(GemvSegment { w, row_scales: None, x: nk, y: pf.k_dyn, n_rows: taps, k_cols: h });
+                f32_segs.push(GemvSegment { w, row_scales: None, x: nk, y: pf.k_dyn, n_rows: taps, k_cols: h, is_bf16: false });
             }
             if let Some(w) = layer.v_sconv_dyn_proj {
-                f32_segs.push(GemvSegment { w, row_scales: None, x: nv, y: pf.v_dyn, n_rows: taps, k_cols: h });
+                f32_segs.push(GemvSegment { w, row_scales: None, x: nv, y: pf.v_dyn, n_rows: taps, k_cols: h, is_bf16: false });
             }
             if m >= 4 {
                 // Separate FP8 segments so gemv_multi_wmma fires on all 5 large projections in ONE launch (up to 64 rows!).

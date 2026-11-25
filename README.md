@@ -45,13 +45,15 @@ Reading a prompt (prefill) runs at about 1,750 tokens a second on a cold 11,658-
 
 *Same card and settings as the table above. Fed its own reference, the exact configuration agrees at every position of the single-token path (128 positions checked), so the differences come from the skipped experts, in decode and in reading the prompt.*
 
+**Against a lossless native BF16 dense reference (`SMALLTIDE_DENSE_FMT=bf16`, `exact` rescue, 0% skipped experts):** SmallTide's default `fp8` dense + adaptive configuration achieves **95.12%** top-1 agreement through draft-verify passes (`prose` 95.70%, `code` 94.53%; **94.92%** single-step, 512 positions). Setting `SMALLTIDE_DENSE_FMT=bf16` keeps all dense projections and `unembed` in native checkpoint BF16 (+1.05 GiB VRAM, ~30% slower on 16 GB; ideal for 32 GB R9700 lossless runs and parity evals).
+
 The test says how often the top choice changes, not whether the answers are worse.
 
 ---
 
 ## Requirements
 
-- **GPU:** an AMD Radeon RDNA 4 card with 16 GB: the RX 9070 XT (developed and measured here), or the RX 9070 or RX 9060 XT 16 GB (untested). See [Supported cards](#supported-cards).
+- **GPU:** an AMD Radeon RDNA 4 card with 16 GB+: **RX 9070 XT** (developed & measured here), **RX 9060 XT 16 GB** (verified by community), or **RX 9070 / Radeon AI PRO R9700 32 GB** (expected to work). See [Supported cards](#supported-cards).
 - **OS:** Windows 11 (64-bit)
 - **Driver:** **AMD Software: Adrenalin Edition 26.10.44 or newer** (ships `amdhip64_7.dll` and fixes the 26.5.1–26.9.1 WDDM residency cap bug — no ROCm SDK needed)
 - **System RAM:** 32 GB recommended (16 GB of it holds the warm RAM expert tier so misses rescue over PCIe instead of NVMe; 10 GB with the monitor on the motherboard)
@@ -63,13 +65,30 @@ The release carries two builds of the GPU kernels and loads the one for the card
 
 | Card | Kernel build | Status |
 | --- | --- | --- |
-| Radeon RX 9070 XT (16 GB) | `gfx1201` | Developed and measured on this card. Every number in this README is from it. |
-| Radeon RX 9070 (16 GB) | `gfx1201` | **Untested.** Same architecture and the same kernels as the XT, so it is expected to work. |
-| Radeon RX 9060 XT 16 GB | `gfx1200` | **Untested: no such card was available.** It has its own kernel build, which compiles but has never run on the card. Expect a clearly lower speed: the card has about half the compute units and half the memory bandwidth of the RX 9070 XT. |
+| Radeon RX 9070 XT (16 GB) | `gfx1201` | Developed and measured on this card. Primary benchmarks above are from it. |
+| Radeon RX 9060 XT 16 GB | `gfx1200` | **Verified (community report on Windows 11, monitor on GPU):** **48–71 tok/s** median (**72.1 tok/s** peak on `mario`), 97.3–98.3% VRAM hit rate (2,187/3,072 resident experts at 271 GB/s). See table below. |
+| Radeon RX 9070 (16 GB) | `gfx1201` | **Untested.** Same architecture and kernels as the XT, so it is expected to work. |
+| Radeon AI PRO R9700 (32 GB) | `gfx1201` | **Untested.** Same `gfx1201` kernels; all 3,072 experts fit 100% in VRAM (even with `SMALLTIDE_DENSE_FMT=bf16` for bit-exact native weights). |
 
-`.\smalltide.cmd probe` (the first step of `setup`, before the model download) prints the card, its architecture and the kernel build chosen, and runs a test kernel on the card. If you run an RX 9070 or an RX 9060 XT, please open an issue with that output, whether it works or not.
+<details>
+<summary><strong>Community Benchmark — RX 9060 XT 16 GB (<code>gfx1200</code>, Windows 11, monitor on GPU)</strong></summary>
 
-The RX 9070 GRE and the Radeon AI PRO R9700 are `gfx1201` as well and load the same kernels as the RX 9070 XT; they are untested too. The 8 GB RX 9060 XT and RX 9060 are not a target: the dense weights, KV cache and drafter take about 6 GB before the first expert. RDNA 3 and older cards are not supported. Details in [LIMITATIONS.md](LIMITATIONS.md).
+*Measured with `bench/bench.py` (`thinking: false`, `temp: 0.6`, 3 runs per workload; DXGI budget `13.06–13.16 GiB`, `2,015` NVFP4 + `172` MXFP8 resident slots, `271 GB/s` measured pool copy bandwidth):*
+
+| Workload | TTFT (med) | Decode (med) | Peak Decode | Hit Rate | Skipped Wt | Rescues / tok |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `prose` (1K out) | 316.5 ms | **48.36 tok/s** | 48.93 tok/s | 98.30% | 0.62% | 1.88 |
+| `code` (1K out) | 402.8 ms | **50.25 tok/s** | 53.99 tok/s | 97.85% | 0.72% | 3.63 |
+| `edit` (~1.4K in / 1K out) | 2,236.9 ms | **50.89 tok/s** | 52.38 tok/s | 97.72% | 1.15% | 5.82 |
+| `random` (~8.2K in / 1K out) | 9,429.2 ms | **39.50 tok/s** | 43.61 tok/s | 97.31% | 2.47% | 9.97 |
+| `angry-birds` (8K out) | 501.7 ms | **63.86 tok/s** | 64.71 tok/s | 97.37% | 1.05% | 4.04 |
+| `mario` (8K out) | 396.9 ms | **70.91 tok/s** | 72.11 tok/s | 97.41% | 1.02% | 3.45 |
+
+</details>
+
+`.\smalltide.cmd probe` (the first step of `setup`, before the model download) prints the card, its architecture and the kernel build chosen, and runs a test kernel on the card. If you run an RX 9070 or an R9700, please open an issue with your `probe` output and numbers!
+
+The RX 9070 GRE is `gfx1201` as well and loads the same kernels as the RX 9070 XT. The 8 GB RX 9060 XT and RX 9060 are not a target: the dense weights, KV cache and drafter take about 6 GB before the first expert. RDNA 3 and older cards are not supported. Details in [LIMITATIONS.md](LIMITATIONS.md).
 
 ---
 
@@ -176,9 +195,12 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 | `SMALLTIDE_MAX_CTX` / `SMALLTIDE_KV_TOKENS` | `131072` | Context length & unified paged KV pool ceiling across all lanes (128K default with `k8v4`). |
 | `SMALLTIDE_KV_INITIAL_TOKENS` / `SMALLTIDE_KV_IDLE_SHRINK_SECS` | `32768` / `300` | Elastic KV starting size in VRAM and idle timeout (seconds, `0` = off) before offloading expanded lanes to RAM prefix cache and shrinking back to baseline. |
 | `SMALLTIDE_KV_FMT` | `k8v4` | Global KV format: `k8v4` (FP8 keys + Q4 values, saves ~472 MiB @ 128K) or `fp8` (full FP8 K/V). |
+| `SMALLTIDE_DENSE_FMT` | `fp8` | Dense weight precision (attention projections, loop controllers, `unembed`): `fp8` (~1.10 GiB VRAM; recommended on 16 GB) or `bf16` (~2.15 GiB, exact native checkpoint weights for 32 GB R9700 / parity evals). |
 | `SMALLTIDE_LANES` | `4` | Concurrent serving lanes (all lanes share the unified paged KV pool; each extra lane costs only ~3.7 MiB VRAM and 0 extra host RAM). |
 | `SMALLTIDE_RESCUE_MODE` | `threshold` | `threshold` (balanced), `exact` (copy every miss, bit-exact MoE), or `disabled` (fastest, skip inline misses). |
 | `SMALLTIDE_RESCUE_THRESHOLD` / `..._CORE` | `0.07` / `0.07` | Routing-weight gate for inline rescues (Prelude & Coda / Loop Core). Lower gates rescue more: better fidelity, slower decode (a rescue costs about 0.7 ms). |
+| `SMALLTIDE_RESCUE_MUST_THRESHOLD` | `0.25` | Missing experts at or above this routing share **always** rescue regardless of zone budgets or auto-gate (`0` = off), preventing sudden domain/language switches from dropping dominant specialist experts. |
+| `SMALLTIDE_LOOP_DETECT` | `1` | Repetition loop detector (`1` = on, `0` = off): force-exits thinking loops into a clean answer and hard-stops runaway text loops (skips fuzzy checks inside tool-call JSON). |
 | `SMALLTIDE_RESCUE_BUDGET_PRELUDE` / `_CORE` / `_CODA` | `33` / `30` / `35` | Per-token inline rescue caps per architectural zone. |
 | `SMALLTIDE_RESCUE_AUTO_GATE` | `1` | `1` adjusts each zone's gate while decoding so the zone uses about 80% of its rescue budget (`SMALLTIDE_RESCUE_AUTO_TARGET`): it starts at the threshold above, falls while budget is left over and rises when the zone goes over. The gate stays within `SMALLTIDE_RESCUE_AUTO_MIN`..`_MAX` (`0.03`..`0.5`). A zone with fewer misses than its budget ends at the lower bound. |
 | `SMALLTIDE_PREFILL_CHUNK` | `1024` | Tokens per prefill chunk (64 to 1024). Larger chunks read a prompt faster for more scratch VRAM: 1024 costs about 80 resident experts against 256 and is almost twice as fast. |

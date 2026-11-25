@@ -14,7 +14,6 @@
 
 use crate::drafter::{quantize_f32_rows_to_fp8, DraftProposal};
 use crate::weights::{Fp8MatrixGpu, Inkling2DenseGpu, Uploader};
-use smalltide_core::backend::GemvSegment;
 use smalltide_core::{ComputeBackend, DeviceBuf, PinnedBuf, QueueKind, Result, SmallTideError, Stream};
 use smalltide_io::dense_loader::{read_f32_vec, read_fp8_matrix, read_raw_bytes};
 use smalltide_io::quant::bf16_to_f32;
@@ -416,14 +415,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
             let src = taps.slice((t * tap_stride + row_off) * D * 4, tap_row_bytes);
             let dst = if t == 0 { sc.ctx_c } else { sc.ctx_tmp };
             if m <= 8 {
-                let seg = [GemvSegment {
-                    w: self.fc[t].data,
-                    row_scales: Some(self.fc[t].row_scales),
-                    x: src,
-                    y: dst,
-                    n_rows: D,
-                    k_cols: D,
-                }];
+                let seg = [self.fc[t].seg(src, dst)];
                 b.gemv_multi_rows(&seg, m, s)?;
             } else {
                 b.gemm_fp8_rows(dst, src, self.fc[t].data, self.fc[t].row_scales, m, D, D, s)?;
@@ -436,10 +428,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
 
         for (l, ly) in self.layers.iter().enumerate() {
             if m <= 8 {
-                let segs = [
-                    GemvSegment { w: ly.k.data, row_scales: Some(ly.k.row_scales), x: sc.ctx_c, y: sc.ctx_k, n_rows: kvd, k_cols: D },
-                    GemvSegment { w: ly.v.data, row_scales: Some(ly.v.row_scales), x: sc.ctx_c, y: sc.ctx_v, n_rows: kvd, k_cols: D },
-                ];
+                let segs = [ly.k.seg(sc.ctx_c, sc.ctx_k), ly.v.seg(sc.ctx_c, sc.ctx_v)];
                 b.gemv_multi_rows(&segs, m, s)?;
             } else {
                 b.gemm_fp8_rows(sc.ctx_k, sc.ctx_c, ly.k.data, ly.k.row_scales, m, kvd, D, s)?;
@@ -508,14 +497,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
         b.memcpy_h2d_async(sc.anchor_in, 0, sc.pinned, 0, D * 4, s)?;
         b.dspark_embed_prep(sc.res, sc.xn, sc.anchor_in, dense.embed_norm, self.mask_embed_gpu, self.layers[0].in_ln, D, EPS, s)?;
 
-        let seg = |m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment {
-            w: m.data,
-            row_scales: Some(m.row_scales),
-            x,
-            y,
-            n_rows: m.n_rows,
-            k_cols: m.k_cols,
-        };
+        let seg = |m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| m.seg(x, y);
         let scale = 1.0 / (HD as f32).sqrt();
 
         for (l, ly) in self.layers.iter().enumerate() {
@@ -555,7 +537,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
         // exact Top-16 extraction, and selector hidden projection -> 1 tiny ~8 KB D2H copy.
         let hb = sc.xn.slice(D * 4, n * D * 4);
         let u = &dense.unembed_fp8;
-        b.gemm_fp8_rows_decode(sc.base, hb, u.data, u.row_scales, n, self.vocab, D, s)?;
+        u.gemm_rows_decode(b, sc.base, hb, n, self.vocab, s)?;
         b.topk16_rows(sc.topk_val, sc.topk_idx, sc.part_val, sc.part_idx, sc.base, n, self.vocab, s)?;
         b.gemv_multi_rows(&[seg(&self.sel_hidden_proj, hb, sc.h_proj)], n, s)?;
 
@@ -798,14 +780,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
             )?;
         }
 
-        let seg = |m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment {
-            w: m.data,
-            row_scales: Some(m.row_scales),
-            x,
-            y,
-            n_rows: m.n_rows,
-            k_cols: m.k_cols,
-        };
+        let seg = |m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| m.seg(x, y);
         let mm = |y: DeviceBuf, x: DeviceBuf, w: &Fp8MatrixGpu| -> Result<()> {
             if total_rows <= 64 {
                 b.gemv_multi_rows(&[seg(w, x, y)], total_rows, s)
@@ -928,7 +903,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
             pack_row += n;
         }
         let u = &dense.unembed_fp8;
-        b.gemm_fp8_rows_decode(base, hb_pack, u.data, u.row_scales, total_n, self.vocab, D, s)?;
+        u.gemm_rows_decode(b, base, hb_pack, total_n, self.vocab, s)?;
         b.topk16_rows(topk_val, topk_idx, part_val, part_idx, base, total_n, self.vocab, s)?;
         b.gemv_multi_rows(&[seg(&self.sel_hidden_proj, hb_pack, h_proj)], total_n, s)?;
 

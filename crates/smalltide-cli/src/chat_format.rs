@@ -904,6 +904,11 @@ impl AnswerParser {
         self.body == Body::Thinking
     }
 
+    /// True while the parser is inside a `<|content_invoke_tool_json|>` block.
+    pub fn in_tool_call(&self) -> bool {
+        self.body == Body::ToolJson
+    }
+
     fn flush_streams(&mut self, out: &mut Vec<AnswerEvent>) {
         let t = self.text.finish();
         if !t.is_empty() {

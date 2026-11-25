@@ -463,9 +463,10 @@ fn loop_detect_enabled() -> bool {
 }
 
 /// Checks the tail of `tokens` for either an exact periodic loop (`1..=256` tokens, covering
-/// single-token spam up to 1-paragraph repeats) or a fuzzy near-exact paragraph loop (8-gram
-/// recycling across a rolling 1,024-token window).
-fn detect_loop(tokens: &[u32], in_thinking: bool) -> Option<LoopHit> {
+/// single-token spam up to 1-paragraph repeats) or (outside tool-call JSON) a fuzzy near-exact
+/// paragraph loop (8-grams in the trailing 256 tokens that already appeared >= 2 times in the
+/// preceding 768 tokens, so 2-copy before/after diffs never false-positive).
+fn detect_loop(tokens: &[u32], in_thinking: bool, in_tool_call: bool) -> Option<LoopHit> {
     let n = tokens.len();
     if n < 16 {
         return None;
@@ -488,8 +489,11 @@ fn detect_loop(tokens: &[u32], in_thinking: bool) -> Option<LoopHit> {
             return Some(LoopHit::Exact { period: p, repeats: need });
         }
     }
-    // 2. Fuzzy paragraph loop: check every 16 tokens once we have >= 512 tokens.
-    if n >= 512 && n % 16 == 0 {
+    // 2. Fuzzy paragraph loop: skip inside ToolJson (edit_file / python replace calls legitimately
+    // emit near-identical old_text/new_text blocks and repetitive HTML/code tables). Elsewhere,
+    // require each matched 8-gram to have appeared >= 2 times in the prior window (i.e. 3rd+ pass)
+    // so before/after code diffs never false-positive.
+    if !in_tool_call && n >= 512 && n % 16 == 0 {
         const TAIL: usize = 256;
         const NG: usize = 8;
         let prior_start = n.saturating_sub(1024);
@@ -503,15 +507,16 @@ fn detect_loop(tokens: &[u32], in_thinking: bool) -> Option<LoopHit> {
             }
             h
         };
-        let mut prior_set = std::collections::HashSet::with_capacity(prior.len());
+        let mut prior_counts: std::collections::HashMap<u64, u16> =
+            std::collections::HashMap::with_capacity(prior.len());
         for w in prior.windows(NG) {
-            prior_set.insert(hash8(w));
+            *prior_counts.entry(hash8(w)).or_insert(0) += 1;
         }
         let mut matched = 0usize;
         let mut distinct = std::collections::HashSet::new();
         for w in tail.windows(NG) {
             let h = hash8(w);
-            if prior_set.contains(&h) {
+            if prior_counts.get(&h).copied().unwrap_or(0) >= 2 {
                 matched += 1;
                 distinct.insert(h);
             }
@@ -662,7 +667,8 @@ impl ActiveReq {
         }
         if self.loop_detect && self.pending_thinking_exit.is_none() {
             let in_thinking = self.is_chat && self.parser.in_thinking();
-            if let Some(hit) = detect_loop(&self.generated[self.loop_scan_start..], in_thinking) {
+            let in_tool_call = self.is_chat && self.parser.in_tool_call();
+            if let Some(hit) = detect_loop(&self.generated[self.loop_scan_start..], in_thinking, in_tool_call) {
                 if in_thinking && !self.thinking_loop_exited {
                     self.pending_thinking_exit = Some(hit);
                 } else {
@@ -2838,18 +2844,18 @@ mod loop_detect_tests {
     #[test]
     fn catches_single_token_and_short_phrase_loops() {
         let single = vec![42u32; 24];
-        assert_eq!(detect_loop(&single, false), Some(LoopHit::Exact { period: 1, repeats: 24 }));
-        assert_eq!(detect_loop(&vec![42u32; 12], false), None);
+        assert_eq!(detect_loop(&single, false, false), Some(LoopHit::Exact { period: 1, repeats: 24 }));
+        assert_eq!(detect_loop(&vec![42u32; 12], false, false), None);
 
         let phrase = vec![1u32, 2, 3, 4];
         let mut seq = Vec::new();
         for _ in 0..8 {
             seq.extend_from_slice(&phrase);
         }
-        assert_eq!(detect_loop(&seq, false), Some(LoopHit::Exact { period: 4, repeats: 8 }));
+        assert_eq!(detect_loop(&seq, false, false), Some(LoopHit::Exact { period: 4, repeats: 8 }));
         let idx = seq.len() - 4;
         seq[idx] = 99;
-        assert_eq!(detect_loop(&seq, false), None);
+        assert_eq!(detect_loop(&seq, false, false), None);
     }
 
     #[test]
@@ -2858,13 +2864,13 @@ mod loop_detect_tests {
         let mut seq = vec![10, 20, 30];
         seq.extend_from_slice(&para);
         seq.extend_from_slice(&para);
-        assert_eq!(detect_loop(&seq, true), None); // 2 copies: not yet
+        assert_eq!(detect_loop(&seq, true, false), None); // 2 copies: not yet
         seq.extend_from_slice(&para);
-        assert_eq!(detect_loop(&seq, true), Some(LoopHit::Exact { period: 120, repeats: 3 }));
+        assert_eq!(detect_loop(&seq, true, false), Some(LoopHit::Exact { period: 120, repeats: 3 }));
     }
 
     #[test]
-    fn catches_fuzzy_mutated_paragraph_loop_and_ignores_normal_text() {
+    fn catches_fuzzy_mutated_paragraph_loop_and_ignores_diffs_and_tool_json() {
         // 120-token paragraph repeated with a few mutated tokens each pass (no exact period).
         let base: Vec<u32> = (5000..5120).collect();
         let mut seq: Vec<u32> = Vec::new();
@@ -2876,12 +2882,23 @@ mod loop_detect_tests {
         }
         // Align length to a multiple of 16 (>= 512) where fuzzy check runs.
         let n = (seq.len() / 16) * 16;
-        let hit = detect_loop(&seq[..n], true);
+        let hit = detect_loop(&seq[..n], true, false);
         assert!(matches!(hit, Some(LoopHit::Fuzzy { pct }) if pct >= 60), "got {hit:?}");
+        // Inside ToolJson, fuzzy check is disabled so repetitive HTML/code edits aren't cut off.
+        assert_eq!(detect_loop(&seq[..n], false, true), None);
+
+        // A 2-copy before/after diff (e.g. old_text + new_text of 260 tokens) must NOT trigger fuzzy.
+        let mut diff: Vec<u32> = (2000..2260).collect();
+        let mut after = diff.clone();
+        after[130] = 99_999;
+        diff.extend_from_slice(&after);
+        let dn = (diff.len() / 16) * 16;
+        assert_eq!(detect_loop(&diff[..dn], false, false), None);
+        assert_eq!(detect_loop(&diff[..dn], true, false), None);
 
         // Distinct non-repeating tokens must never trigger.
         let normal: Vec<u32> = (0..1024).collect();
-        assert_eq!(detect_loop(&normal, true), None);
-        assert_eq!(detect_loop(&normal, false), None);
+        assert_eq!(detect_loop(&normal, true, false), None);
+        assert_eq!(detect_loop(&normal, false, false), None);
     }
 }

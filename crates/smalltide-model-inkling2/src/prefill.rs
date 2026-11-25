@@ -35,11 +35,11 @@ pub(crate) struct PrefillScratch {
     ffn_inp: DeviceBuf,
     prelude_cur: DeviceBuf,
     bank_out: DeviceBuf,
-    blocks: DeviceBuf,   // [8][M][H]
-    bank: DeviceBuf,     // [8][M][H]
-    messages: DeviceBuf, // [4][M][H]
-    in_qkv: DeviceBuf,   // [3][M][H]
-    ctrl_qkv: DeviceBuf, // [3][M][H]
+    pub(crate) blocks: DeviceBuf,   // [8][M][H]
+    pub(crate) bank: DeviceBuf,     // [8][M][H]
+    pub(crate) messages: DeviceBuf, // [4][M][H]
+    pub(crate) in_qkv: DeviceBuf,   // [3][M][H]
+    pub(crate) ctrl_qkv: DeviceBuf, // [3][M][H]
     norm_qkv: DeviceBuf, // [3][M][H]
     ctrl_prep: DeviceBuf,
     ctrl_gate: DeviceBuf,
@@ -65,12 +65,13 @@ pub(crate) struct PrefillScratch {
     router_logits: DeviceBuf, // [M][128]
     route: DeviceBuf,         // [M][16] u32
     moe_mid: DeviceBuf,       // [M*8][I]
-    moe_tmp: DeviceBuf,       // [M*8][H]
+    pub(crate) moe_tmp: DeviceBuf, // [M*8][H]
     moe_out: DeviceBuf,
     desc: DeviceBuf,
     attn_part_o: DeviceBuf, // [MAX_BATCH_ROWS][n_q_heads][16][head_dim] for Split-K verify attn
     attn_part_m: DeviceBuf, // [MAX_BATCH_ROWS][n_q_heads][16]
     attn_part_l: DeviceBuf, // [MAX_BATCH_ROWS][n_q_heads][16]
+    attn_part_owned: bool,
     embed_host: PinnedBuf,
     /// image rows of a chunk on their way to `cur` (same layout as `embed_host`)
     img_host: PinnedBuf,
@@ -95,7 +96,9 @@ impl PrefillScratch {
             desc_host.push((b.alloc_pinned(DESC_BYTES)?, b.create_event()?, false));
         }
         // 256 bytes per ring position and KV head; the ring must be whole 16-key tiles.
-        let ring = cfg.local_window_size + m;
+        // Sized to match the unified paged KV local ring (`(window + m).div_ceil(PAGE_POS) + 1`).
+        let ring = ((cfg.local_window_size + m).div_ceil(crate::kv_pager::PAGE_POS) + 1)
+            * crate::kv_pager::PAGE_POS;
         // SMALLTIDE_ATTN_VTILES: all (default) | local (no 268 MiB global scratch) | 0 (off).
         let v_tiles = std::env::var("SMALLTIDE_ATTN_VTILES").map(|v| v.trim().to_ascii_lowercase()).unwrap_or_else(|_| "all".into());
         let v_tiles_local = if v_tiles != "0" && ring % 16 == 0 {
@@ -107,6 +110,29 @@ impl PrefillScratch {
             Some(b.alloc_device((global_ctx + 16) * cfg.num_key_value_heads * 256)?)
         } else {
             None
+        };
+        let moe_tmp = f(m * 8 * h)?;
+        let po_bytes = crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS * cfg.head_dim * 4;
+        let pm_bytes = crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS * 4;
+        // During m <= MAX_BATCH_ROWS (64), moe_tmp only uses 64*8*H*4 = 4.5 MiB,
+        // so alias attn_part_o/m/l at offset 5 MiB (12.2 MiB, zero extra VRAM!).
+        let alias_off = 5usize << 20;
+        let pm_off = (alias_off + po_bytes).next_multiple_of(256);
+        let pl_off = (pm_off + pm_bytes).next_multiple_of(256);
+        let (attn_part_o, attn_part_m, attn_part_l, attn_part_owned) = if pl_off + pm_bytes <= moe_tmp.size_bytes {
+            (
+                moe_tmp.slice(alias_off, po_bytes),
+                moe_tmp.slice(pm_off, pm_bytes),
+                moe_tmp.slice(pl_off, pm_bytes),
+                false,
+            )
+        } else {
+            (
+                b.alloc_device(po_bytes)?,
+                b.alloc_device(pm_bytes)?,
+                b.alloc_device(pm_bytes)?,
+                true,
+            )
         };
         Ok(Self {
             v_tiles_local,
@@ -147,12 +173,13 @@ impl PrefillScratch {
             router_logits: f(m * cfg.n_routed_experts)?,
             route: b.alloc_device(m * 16 * 4)?,
             moe_mid: f(m * 8 * cfg.intermediate_size)?,
-            moe_tmp: f(m * 8 * h)?,
+            moe_tmp,
             moe_out: f(m * h)?,
             desc: b.alloc_device(DESC_BYTES)?,
-            attn_part_o: f(crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS * cfg.head_dim)?,
-            attn_part_m: f(crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS)?,
-            attn_part_l: f(crate::engine::MAX_BATCH_ROWS * cfg.num_attention_heads * VERIFY_ATTN_SPLITS)?,
+            attn_part_o,
+            attn_part_m,
+            attn_part_l,
+            attn_part_owned,
             embed_host: b.alloc_pinned(m * h * 4)?,
             img_host: b.alloc_pinned(m * h * 4)?,
             embed_done: b.create_event()?,
@@ -170,9 +197,13 @@ impl PrefillScratch {
             self.v, self.k_dyn, self.v_dyn, self.r, self.sinks, self.rel_table, self.attn_out,
             self.gate_out, self.o_raw, self.sconv_tmp, self.moe_in, self.moe_ctrl, self.moe_norm,
             self.router_logits, self.route, self.moe_mid, self.moe_tmp, self.moe_out, self.desc,
-            self.attn_part_o, self.attn_part_m, self.attn_part_l,
         ] {
             let _ = b.free_device(d);
+        }
+        if self.attn_part_owned {
+            let _ = b.free_device(self.attn_part_o);
+            let _ = b.free_device(self.attn_part_m);
+            let _ = b.free_device(self.attn_part_l);
         }
         let _ = b.free_pinned(self.embed_host);
         let _ = b.free_pinned(self.img_host);
@@ -182,6 +213,18 @@ impl PrefillScratch {
             let _ = b.destroy_event(e);
         }
     }
+}
+
+/// One lane's contiguous token slice inside a multi-lane `VerifyBatch` pass (`sum(width) <= 8`).
+#[derive(Clone, Copy, Debug)]
+pub struct VerifySlice {
+    pub lane: usize,
+    pub pos0: usize,
+    pub row_off: usize,
+    pub width: usize,
+    /// Starting row offset in `verify_hist_slice(il, kind)` (`Some` when `width >= 2` so short-conv
+    /// histories can be rewound independently per slice; `None` when `width == 1`).
+    pub hist_off: Option<usize>,
 }
 
 /// What the rows of a rows-batched forward are.
@@ -196,12 +239,23 @@ pub(crate) enum RowsMode<'a> {
     /// semantics: causal attention, sequential short convs) with decode-style device-side MoE
     /// (no host sync), logits for every row, and short-conv histories for the rewind.
     Verify { pos0: usize, greedy: bool },
+    /// Batched multi-lane speculative verify: up to `MAX_BATCH_ROWS = 8` total rows partitioned
+    /// across multiple concurrent lanes (`slices`). All weight-bound ops (projections, MoE,
+    /// rescued experts, lm_head) run ONCE shared across all rows; KV caches and short-convs run
+    /// per slice.
+    VerifyBatch { slices: &'a [VerifySlice], greedy: bool },
 }
 
 /// Row `r` of a `[m][n]` f32 buffer.
 #[inline]
 fn row(buf: DeviceBuf, r: usize, n: usize) -> DeviceBuf {
     buf.slice(r * n * 4, n * 4)
+}
+
+/// Contiguous rows `[r0 .. r0 + count)` of a `[m][n]` f32 buffer.
+#[inline]
+fn row_range(buf: DeviceBuf, r0: usize, count: usize, n: usize) -> DeviceBuf {
+    buf.slice(r0 * n * 4, count * n * 4)
 }
 
 /// `[nq][m][H]` slice helper.
@@ -221,11 +275,11 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if self.pf.is_none() {
             self.pf = Some(PrefillScratch::new(&*self.backend, &self.cfg, self.lane_max_seq.iter().copied().max().unwrap_or(0))?);
         }
-        // Token boundary bookkeeping (same as forward_token) and a free scratch ring.
+        // Token boundary bookkeeping (same as forward_token); keep any still-live scratch-ring
+        // experts resident so Wave 0 of prefill_moe can reuse them BEFORE unloading them.
         self.run_deferred_tide_step()?;
         let published = self.tide.poll_pending()?;
         self.tide.scheduler.telemetry.stage1_async_published += published as u64;
-        self.tide.release_scratch_ring()?;
         self.route_log_inflight = false;
         let mut off = 0usize;
         while off < tokens.len() {
@@ -262,9 +316,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     pub(crate) fn rows_forward(&mut self, tokens: &[u32], mode: RowsMode, need_logits: bool) -> Result<()> {
         let pos0 = match mode {
             RowsMode::Prefill { pos0 } | RowsMode::Verify { pos0, .. } => pos0,
+            RowsMode::VerifyBatch { slices, .. } => slices.first().map_or(0, |sl| sl.pos0),
             RowsMode::Decode { .. } => 0,
         };
-        let verify = matches!(mode, RowsMode::Verify { .. });
+        let verify = matches!(mode, RowsMode::Verify { .. } | RowsMode::VerifyBatch { .. });
         let decode = matches!(mode, RowsMode::Decode { .. }) || verify;
         // Verify and batched decode (<= 8 rows) use the GEMV-style kernels (faster than WMMA at
         // this size, and f32 activations like the single-row path).
@@ -417,7 +472,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let vocab = self.cfg.unpadded_vocab_size;
             let logits = self.batch_logits.expect("batch logits");
             self.backend.gemm_fp8_rows_decode(logits, moe_norm, self.dense.unembed_fp8.data, self.dense.unembed_fp8.row_scales, m, vocab, h, s)?;
-            let skip_softcap = matches!(mode, RowsMode::Verify { greedy: true, .. }) && self.dump.is_none();
+            let skip_softcap = matches!(
+                mode,
+                RowsMode::Verify { greedy: true, .. } | RowsMode::VerifyBatch { greedy: true, .. }
+            ) && self.dump.is_none();
             if self.cfg.final_logit_softcapping > 0.0 && !skip_softcap {
                 self.backend.final_logit_softcap(logits, m * vocab, self.cfg.final_logit_softcapping, s)?;
             }
@@ -500,8 +558,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
     }
 
-    /// Up to 4 controllers over the same <= 8 rows: down and gain / forget projections each in one
-    /// launch (scratch slices of 8 rows per controller).
+    /// Up to 4 controllers over the same <= MAX_BATCH_ROWS rows: down and gain / forget
+    /// projections each in one launch (scratch slices of MAX_BATCH_ROWS per controller).
     fn control_rows_multi(
         &self,
         items: &[(DeviceBuf, DeviceBuf, DeviceBuf, &LoopControllerGpu)],
@@ -512,8 +570,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let pf = self.pf.as_ref().unwrap();
         let h = self.cfg.hidden_size;
         let r = self.cfg.loop_gate_rank;
-        const R8: usize = 8;
-        let sl = |buf: DeviceBuf, j: usize, n: usize| buf.slice(j * R8 * n * 4, m * n * 4);
+        let r_stride = m;
+        let sl = |buf: DeviceBuf, j: usize, n: usize| buf.slice(j * r_stride * n * 4, m * n * 4);
         let fused = norms.is_some();
         if fused {
             let prep: Vec<_> = items.iter().enumerate().map(|(j, it)| (sl(pf.ctrl_prep, j, 2 * h), it.1, it.2)).collect();
@@ -527,12 +585,12 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             w: mm.data, row_scales: Some(mm.row_scales), x, y, n_rows: mm.n_rows, k_cols: mm.k_cols,
         };
         let downs: Vec<GemvSegment> = items.iter().enumerate().map(|(j, it)| seg(&it.3.down, sl(pf.ctrl_prep, j, 2 * h), sl(pf.ctrl_gate, j, r))).collect();
-        self.backend.gemv_multi_rows(&downs, m, s)?;
         let mut gf = Vec::with_capacity(2 * items.len());
         for (j, it) in items.iter().enumerate() {
             gf.push(seg(&it.3.gain, sl(pf.ctrl_gate, j, r), sl(pf.ctrl_gain, j, h)));
             gf.push(seg(&it.3.forget, sl(pf.ctrl_gate, j, r), sl(pf.ctrl_forget, j, h)));
         }
+        self.backend.gemv_multi_rows(&downs, m, s)?;
         self.backend.gemv_multi_rows(&gf, m, s)?;
         if let Some(nw) = norms {
             let ap: Vec<_> = items.iter().enumerate().map(|(j, it)| (it.0, it.1, it.2, sl(pf.ctrl_gain, j, h), sl(pf.ctrl_forget, j, h), nw.get(j).copied())).collect();
@@ -572,18 +630,22 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         nb: &mut usize,
         messages: Option<DeviceBuf>,
     ) -> Result<Vec<u32>> {
-        let (pos0, lanes, verify) = match mode {
-            RowsMode::Prefill { pos0 } => (pos0, None, false),
-            RowsMode::Verify { pos0, .. } => (pos0, None, true),
-            RowsMode::Decode { rows } => (0, Some(rows), false),
+        let (pos0, lanes, verify, vbatch) = match mode {
+            RowsMode::Prefill { pos0 } => (pos0, None, false, None),
+            RowsMode::Verify { pos0, .. } => (pos0, None, true, None),
+            RowsMode::VerifyBatch { slices, .. } => (0, None, true, Some(slices)),
+            RowsMode::Decode { rows } => (0, Some(rows), false, None),
         };
         // Verify: every short conv of this layer records its history (rewind after acceptance).
-        let hist_s: [Option<DeviceBuf>; 4] = if verify {
+        let hist_s: [Option<DeviceBuf>; 4] = if verify && vbatch.is_none() {
             [0, 1, 2, 3].map(|k| Some(self.verify_hist_slice(il, k)))
         } else {
             [None; 4]
         };
         let hist = move |kind: usize| -> Option<DeviceBuf> { hist_s[kind] };
+        let hist_vb = |eng: &Self, kind: usize, sl: &VerifySlice| -> Option<DeviceBuf> {
+            sl.hist_off.map(|hoff| eng.verify_hist_slice_at(il, kind, hoff, 3 + sl.width))
+        };
         let s = self.tide.compute_stream;
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -737,9 +799,15 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 f32_segs.push(GemvSegment { w, row_scales: None, x: nv, y: pf.v_dyn, n_rows: taps, k_cols: h });
             }
             if m >= 4 {
-                // Separate FP8 segments so gemv_multi_wmma fires on all 5 large projections.
+                // Separate FP8 segments so gemv_multi_wmma fires on all 5 large projections in ONE launch (up to 64 rows!).
                 b.gemv_multi_rows(&fp8_segs, m, s)?;
-                b.gemv_multi_rows(&f32_segs, m, s)?;
+                if m > 16 {
+                    for sg in &f32_segs {
+                        b.gemm_f32_rows(sg.y, sg.x, sg.w, m, sg.n_rows, sg.k_cols, s)?;
+                    }
+                } else {
+                    b.gemv_multi_rows(&f32_segs, m, s)?;
+                }
             } else {
                 let mut segs = Vec::with_capacity(fp8_segs.len() + f32_segs.len());
                 segs.extend_from_slice(&fp8_segs);
@@ -752,51 +820,114 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.mm_rows(pf.v_raw, nv, &layer.wv, m, s)?;
             self.mm_rows(pf.r, nq, &layer.wr, m, s)?;
         }
+        // During prefill, local sliding-window layers allocate pages layer-by-layer and evict
+        // expired pages immediately after attention, keeping peak temporary overhead to ~4 pages.
+        let prefill_local_li = if matches!(mode, RowsMode::Prefill { .. }) && is_local {
+            let li = self.layer_states[il].local_idx;
+            if let Some(li) = li {
+                let win = self.cfg.local_window_size;
+                self.kv_ensure_local(self.active_lane(), Some(li), pos0.saturating_sub(win), pos0 + m)?;
+            }
+            li
+        } else {
+            None
+        };
+        let pf = self.pf.as_ref().unwrap();
+        let layer = &self.dense.layers[ip];
+        let cfg = &self.cfg;
         let st = &self.layer_states[il];
         // Speculative verify: one fused launch for the K/V convs (+histories), clips, value norm,
         // relative tables and the KV store.
         let prepped = verify && fused_proj && std::env::var_os("SMALLTIDE_VERIFY_UNFUSED").is_none();
         if prepped {
             let tau = (!is_local).then_some((cfg.log_scaling_alpha, cfg.log_scaling_n_floor as f32));
-            b.attn_prep_rows(
-                smalltide_core::backend::AttnPrepParams {
-                    page_table: st.page_table,
-                    q: pf.q,
-                    r: pf.r,
-                    k_raw: pf.k_raw,
-                    v_raw: pf.v_raw,
-                    k_dyn: layer.k_sconv_dyn_proj.map(|_| pf.k_dyn),
-                    v_dyn: layer.v_sconv_dyn_proj.map(|_| pf.v_dyn),
-                    sconv_k: st.sconv_k,
-                    sconv_v: st.sconv_v,
-                    k_w: layer.k_sconv_static,
-                    v_w: layer.v_sconv_static,
-                    q_scale: layer.q_l2_clip_scale,
-                    r_scale: layer.rel_l2_clip_scale,
-                    rel_proj: layer.rel_logits_proj,
-                    rel_table: pf.rel_table,
-                    k_cache: st.k_cache,
-                    k_scales: st.k_scales,
-                    v_cache: st.v_cache,
-                    v_scales: st.v_scales,
-                    n_q_heads: nqh,
-                    n_kv_heads: nkv,
-                    max_seq: st.max_seq,
-                    slot: 0,
-                    rel_extent: cfg.rel_extent,
-                    qk_threshold: cfg.qk_l2_clip_threshold,
-                    rel_threshold: cfg.rel_l2_clip_threshold,
-                    tau: 1.0,
-                    eps,
-                    v_q4: st.v_q4,
-                },
-                hist(0).zip(hist(1)),
-                pos0,
-                is_local,
-                m,
-                tau,
-                s,
-            )?;
+            if let Some(slices) = vbatch {
+                for sl in slices {
+                    let ls = self.lane_layer_state(sl.lane, il);
+                    let (off, w) = (sl.row_off, sl.width);
+                    let hk = hist_vb(self, 0, sl);
+                    let hv = hist_vb(self, 1, sl);
+                    b.attn_prep_rows(
+                        smalltide_core::backend::AttnPrepParams {
+                            page_table: ls.page_table,
+                            q: row_range(pf.q, off, w, q_dim),
+                            r: row_range(pf.r, off, w, nqh * cfg.d_rel),
+                            k_raw: row_range(pf.k_raw, off, w, kv_dim),
+                            v_raw: row_range(pf.v_raw, off, w, kv_dim),
+                            k_dyn: layer.k_sconv_dyn_proj.map(|_| row_range(pf.k_dyn, off, w, taps)),
+                            v_dyn: layer.v_sconv_dyn_proj.map(|_| row_range(pf.v_dyn, off, w, taps)),
+                            sconv_k: ls.sconv_k,
+                            sconv_v: ls.sconv_v,
+                            k_w: layer.k_sconv_static,
+                            v_w: layer.v_sconv_static,
+                            q_scale: layer.q_l2_clip_scale,
+                            r_scale: layer.rel_l2_clip_scale,
+                            rel_proj: layer.rel_logits_proj,
+                            rel_table: row_range(pf.rel_table, off, w, nqh * cfg.rel_extent),
+                            k_cache: ls.k_cache,
+                            k_scales: ls.k_scales,
+                            v_cache: ls.v_cache,
+                            v_scales: ls.v_scales,
+                            n_q_heads: nqh,
+                            n_kv_heads: nkv,
+                            max_seq: ls.max_seq,
+                            slot: 0,
+                            rel_extent: cfg.rel_extent,
+                            qk_threshold: cfg.qk_l2_clip_threshold,
+                            rel_threshold: cfg.rel_l2_clip_threshold,
+                            tau: 1.0,
+                            eps,
+                            v_q4: ls.v_q4,
+                        },
+                        hk.zip(hv),
+                        sl.pos0,
+                        is_local,
+                        w,
+                        tau,
+                        s,
+                    )?;
+                }
+            } else {
+                b.attn_prep_rows(
+                    smalltide_core::backend::AttnPrepParams {
+                        page_table: st.page_table,
+                        q: pf.q,
+                        r: pf.r,
+                        k_raw: pf.k_raw,
+                        v_raw: pf.v_raw,
+                        k_dyn: layer.k_sconv_dyn_proj.map(|_| pf.k_dyn),
+                        v_dyn: layer.v_sconv_dyn_proj.map(|_| pf.v_dyn),
+                        sconv_k: st.sconv_k,
+                        sconv_v: st.sconv_v,
+                        k_w: layer.k_sconv_static,
+                        v_w: layer.v_sconv_static,
+                        q_scale: layer.q_l2_clip_scale,
+                        r_scale: layer.rel_l2_clip_scale,
+                        rel_proj: layer.rel_logits_proj,
+                        rel_table: pf.rel_table,
+                        k_cache: st.k_cache,
+                        k_scales: st.k_scales,
+                        v_cache: st.v_cache,
+                        v_scales: st.v_scales,
+                        n_q_heads: nqh,
+                        n_kv_heads: nkv,
+                        max_seq: st.max_seq,
+                        slot: 0,
+                        rel_extent: cfg.rel_extent,
+                        qk_threshold: cfg.qk_l2_clip_threshold,
+                        rel_threshold: cfg.rel_l2_clip_threshold,
+                        tau: 1.0,
+                        eps,
+                        v_q4: st.v_q4,
+                    },
+                    hist(0).zip(hist(1)),
+                    pos0,
+                    is_local,
+                    m,
+                    tau,
+                    s,
+                )?;
+            }
         }
         let k_dyn = match layer.k_sconv_dyn_proj {
             Some(w) => {
@@ -807,10 +938,21 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             None => None,
         };
-        match lanes {
-            None if prepped => {}
-            None => b.sconv_k4_rows_hist(pf.k, st.sconv_k, pf.k_raw, layer.k_sconv_static, k_dyn, kv_dim, hd, m, taps, hist(0), s)?,
-            Some(rows) => {
+        match (lanes, vbatch) {
+            (_, _) if prepped => {}
+            (None, Some(slices)) => {
+                for sl in slices {
+                    let ls = self.lane_layer_state(sl.lane, il);
+                    let (off, w) = (sl.row_off, sl.width);
+                    b.sconv_k4_rows_hist(
+                        row_range(pf.k, off, w, kv_dim), ls.sconv_k, row_range(pf.k_raw, off, w, kv_dim),
+                        layer.k_sconv_static, k_dyn.map(|d| row_range(d, off, w, taps)), kv_dim, hd, w, taps,
+                        hist_vb(self, 0, sl), s,
+                    )?;
+                }
+            }
+            (None, None) => b.sconv_k4_rows_hist(pf.k, st.sconv_k, pf.k_raw, layer.k_sconv_static, k_dyn, kv_dim, hd, m, taps, hist(0), s)?,
+            (Some(rows), _) => {
                 for (r, &(lane, _)) in rows.iter().enumerate() {
                     let ls = self.lane_layer_state(lane, il);
                     b.sconv_k4_rows(row(pf.k, r, kv_dim), ls.sconv_k, row(pf.k_raw, r, kv_dim), layer.k_sconv_static,
@@ -827,10 +969,21 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             None => None,
         };
-        match lanes {
-            None if prepped => {}
-            None => b.sconv_k4_rows_hist(pf.v, st.sconv_v, pf.v_raw, layer.v_sconv_static, v_dyn, kv_dim, hd, m, taps, hist(1), s)?,
-            Some(rows) => {
+        match (lanes, vbatch) {
+            (_, _) if prepped => {}
+            (None, Some(slices)) => {
+                for sl in slices {
+                    let ls = self.lane_layer_state(sl.lane, il);
+                    let (off, w) = (sl.row_off, sl.width);
+                    b.sconv_k4_rows_hist(
+                        row_range(pf.v, off, w, kv_dim), ls.sconv_v, row_range(pf.v_raw, off, w, kv_dim),
+                        layer.v_sconv_static, v_dyn.map(|d| row_range(d, off, w, taps)), kv_dim, hd, w, taps,
+                        hist_vb(self, 1, sl), s,
+                    )?;
+                }
+            }
+            (None, None) => b.sconv_k4_rows_hist(pf.v, st.sconv_v, pf.v_raw, layer.v_sconv_static, v_dyn, kv_dim, hd, m, taps, hist(1), s)?,
+            (Some(rows), _) => {
                 for (r, &(lane, _)) in rows.iter().enumerate() {
                     let ls = self.lane_layer_state(lane, il);
                     b.sconv_k4_rows(row(pf.v, r, kv_dim), ls.sconv_v, row(pf.v_raw, r, kv_dim), layer.v_sconv_static,
@@ -840,8 +993,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         // 5. clips, value norm, tau (global layers)
         let tau_at = |p: usize| (!is_local).then_some((p, cfg.log_scaling_alpha, cfg.log_scaling_n_floor as f32));
-        match lanes {
-            Some(rows) if !is_local => {
+        match (lanes, vbatch) {
+            _ if prepped => {}
+            (Some(rows), _) if !is_local => {
                 // tau depends on each row's own position.
                 for (r, &(_, p)) in rows.iter().enumerate() {
                     b.head_l2_clip_rows(row(pf.q, r, q_dim), Some(layer.q_l2_clip_scale), nqh, hd, nqh, cfg.qk_l2_clip_threshold, tau_at(p), s)?;
@@ -849,7 +1003,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                         cfg.rel_l2_clip_threshold, tau_at(p), s)?;
                 }
             }
-            _ if prepped => {}
+            (None, Some(slices)) if !is_local => {
+                for sl in slices {
+                    let (off, w) = (sl.row_off, sl.width);
+                    b.head_l2_clip_rows(row_range(pf.q, off, w, q_dim), Some(layer.q_l2_clip_scale), w * nqh, hd, nqh, cfg.qk_l2_clip_threshold, tau_at(sl.pos0), s)?;
+                    b.head_l2_clip_rows(row_range(pf.r, off, w, nqh * cfg.d_rel), Some(layer.rel_l2_clip_scale), w * nqh, cfg.d_rel, nqh, cfg.rel_l2_clip_threshold, tau_at(sl.pos0), s)?;
+                }
+            }
             _ => {
                 b.head_l2_clip_rows(pf.q, Some(layer.q_l2_clip_scale), m * nqh, hd, nqh, cfg.qk_l2_clip_threshold, tau_at(pos0), s)?;
                 b.head_l2_clip_rows(pf.r, Some(layer.rel_l2_clip_scale), m * nqh, cfg.d_rel, nqh, cfg.rel_l2_clip_threshold, tau_at(pos0), s)?;
@@ -867,8 +1027,44 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if !prepped {
             b.rel_table(pf.rel_table, pf.r, layer.rel_logits_proj, m * nqh, cfg.rel_extent, s)?;
         }
-        match lanes {
-            None => {
+        match (lanes, vbatch) {
+            (None, Some(slices)) => {
+                for sl in slices {
+                    let ls = self.lane_layer_state(sl.lane, il);
+                    let (off, w) = (sl.row_off, sl.width);
+                    if !prepped {
+                        b.kv_store_fp8_rows(
+                            ls.k_cache, ls.k_scales, ls.v_cache, ls.v_scales,
+                            row_range(pf.k, off, w, kv_dim), row_range(pf.v, off, w, kv_dim),
+                            nkv, ls.max_seq, hd, sl.pos0, w, is_local, ls.page_table, ls.v_q4, s,
+                        )?;
+                    }
+                    let attn_params = PrefillAttnParams {
+                        page_table: ls.page_table,
+                        n_q_heads: nqh,
+                        n_kv_heads: nkv,
+                        max_seq: ls.max_seq,
+                        window: if is_local { ls.window } else { 0 },
+                        pos0: sl.pos0,
+                        rows: w,
+                        rel_extent: cfg.rel_extent,
+                        inv_sqrt_d: 1.0 / (hd as f32).sqrt(),
+                        v_q4: ls.v_q4,
+                        v_tiles: None,
+                    };
+                    b.attn_prefill_fp8_split(
+                        row_range(pf.attn_out, off, w, q_dim),
+                        pf.attn_part_o, pf.attn_part_m, pf.attn_part_l,
+                        row_range(pf.q, off, w, q_dim),
+                        ls.k_cache, ls.k_scales, ls.v_cache, ls.v_scales,
+                        Some(row_range(pf.rel_table, off, w, nqh * cfg.rel_extent)),
+                        Some(row_range(pf.sinks, off, w, nqh)),
+                        attn_params,
+                        s,
+                    )?;
+                }
+            }
+            (None, None) => {
                 if !prepped {
                     b.kv_store_fp8_rows(st.k_cache, st.k_scales, st.v_cache, st.v_scales, pf.k, pf.v, nkv, st.max_seq, hd, pos0, m, is_local, st.page_table, st.v_q4, s)?;
                 }
@@ -905,8 +1101,12 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                         Some(pf.rel_table), Some(pf.sinks), attn_params, s,
                     )?;
                 }
+                if let Some(li) = prefill_local_li {
+                    let win = self.cfg.local_window_size;
+                    self.kv_evict_local(self.active_lane(), Some(li), (pos0 + m).saturating_sub(win), pos0 + m);
+                }
             }
-            Some(rows) => {
+            (Some(rows), _) => {
                 // Each row attends over its own lane's cache (decode flash attention).
                 for (r, &(lane, p)) in rows.iter().enumerate() {
                     let ls = self.lane_layer_state(lane, il);
@@ -944,6 +1144,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 }
             }
         }
+        let pf = self.pf.as_ref().unwrap();
+        let layer = &self.dense.layers[ip];
+        let cfg = &self.cfg;
+        let st = &self.layer_states[il];
         // 7. output gate, wo, post-attention conv
         b.seg_mark("pf: gate,wo,conv,mix,router", s);
         if !fused_proj {
@@ -951,9 +1155,19 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         b.gate_attn_sigmoid_mul(pf.attn_out, pf.attn_out, pf.gate_out, m * q_dim, s)?;
         self.mm_rows(pf.o_raw, pf.attn_out, &layer.wo, m, s)?;
-        match lanes {
-            None => b.sconv_k4_rows_hist(pf.sconv_tmp, st.sconv_attn, pf.o_raw, layer.attn_sconv, None, h, 0, m, 0, hist(2), s)?,
-            Some(rows) => {
+        match (lanes, vbatch) {
+            (None, Some(slices)) => {
+                for sl in slices {
+                    let ls = self.lane_layer_state(sl.lane, il);
+                    let (off, w) = (sl.row_off, sl.width);
+                    b.sconv_k4_rows_hist(
+                        row_range(pf.sconv_tmp, off, w, h), ls.sconv_attn, row_range(pf.o_raw, off, w, h),
+                        layer.attn_sconv, None, h, 0, w, 0, hist_vb(self, 2, sl), s,
+                    )?;
+                }
+            }
+            (None, None) => b.sconv_k4_rows_hist(pf.sconv_tmp, st.sconv_attn, pf.o_raw, layer.attn_sconv, None, h, 0, m, 0, hist(2), s)?,
+            (Some(rows), _) => {
                 for (r, &(lane, _)) in rows.iter().enumerate() {
                     let ls = self.lane_layer_state(lane, il);
                     b.sconv_k4_rows(row(pf.sconv_tmp, r, h), ls.sconv_attn, row(pf.o_raw, r, h), layer.attn_sconv, None, h, 0, 1, 0, s)?;
@@ -1101,9 +1315,29 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             b.moe_rows_grouped(pf.moe_mid, pf.moe_tmp, pf.moe_norm, pf.moe_out, route, slot_table, pool, pf.desc, m, params, s)?;
             if std::env::var_os("SMALLTIDE_VERIFY_UNFUSED").is_none() {
                 // Fused epilogue: weighted sum + MLP conv (+history) + residual; done here.
-                let st = &self.layer_states[il];
                 let layer = &self.dense.layers[ip];
-                b.moe_post_sconv_rows(pf.cur, pf.ffn_inp, pf.moe_tmp, slot_table, route, st.sconv_mlp, layer.mlp_sconv, hist(3), h, m, s)?;
+                if let Some(slices) = vbatch {
+                    for sl in slices {
+                        let ls = self.lane_layer_state(sl.lane, il);
+                        let (off, w) = (sl.row_off, sl.width);
+                        b.moe_post_sconv_rows(
+                            row_range(pf.cur, off, w, h),
+                            row_range(pf.ffn_inp, off, w, h),
+                            pf.moe_tmp.slice(off * 8 * h * 4, w * 8 * h * 4),
+                            slot_table,
+                            route.slice(off * 64, w * 64),
+                            ls.sconv_mlp,
+                            layer.mlp_sconv,
+                            hist_vb(self, 3, sl),
+                            h,
+                            w,
+                            s,
+                        )?;
+                    }
+                } else {
+                    let st = &self.layer_states[il];
+                    b.moe_post_sconv_rows(pf.cur, pf.ffn_inp, pf.moe_tmp, slot_table, route, st.sconv_mlp, layer.mlp_sconv, hist(3), h, m, s)?;
+                }
                 b.seg_mark("pf: moe post", s);
                 return Ok(Vec::new());
             }
@@ -1115,9 +1349,20 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         b.seg_mark("pf: moe post", s);
 
         let pf = self.pf.as_ref().unwrap();
-        let st = &self.layer_states[il];
         let layer = &self.dense.layers[ip];
-        b.sconv_k4_rows_hist(pf.sconv_tmp, st.sconv_mlp, pf.moe_out, layer.mlp_sconv, None, h, 0, m, 0, hist(3), s)?;
+        if let Some(slices) = vbatch {
+            for sl in slices {
+                let ls = self.lane_layer_state(sl.lane, il);
+                let (off, w) = (sl.row_off, sl.width);
+                b.sconv_k4_rows_hist(
+                    row_range(pf.sconv_tmp, off, w, h), ls.sconv_mlp, row_range(pf.moe_out, off, w, h),
+                    layer.mlp_sconv, None, h, 0, w, 0, hist_vb(self, 3, sl), s,
+                )?;
+            }
+        } else {
+            let st = &self.layer_states[il];
+            b.sconv_k4_rows_hist(pf.sconv_tmp, st.sconv_mlp, pf.moe_out, layer.mlp_sconv, None, h, 0, m, 0, hist(3), s)?;
+        }
         b.vec_add(pf.cur, pf.ffn_inp, pf.sconv_tmp, m * h, s)?;
         Ok(ids)
     }
@@ -1190,13 +1435,20 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let mut resident: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut missing: Vec<(ExpertId, Vec<u32>)> = Vec::new();
         let mut skipped_pairs: Vec<u32> = Vec::new();
+        let mut used_scratch = false;
         for (e, prs) in by_expert.into_iter().enumerate() {
             if prs.is_empty() {
                 continue;
             }
             let id = ExpertId { layer: phys, expert: e as u16 };
+            let entry = self.tide.scheduler.cache.entry(id);
             let slot = self.tide.scheduler.cache.gpu_slot_table()[self.tide.scheduler.cache.flat_index(id)];
-            if slot != SlotIndex::MISSING.0 && !self.tide.scheduler.cache.entry(id).is_scratch_slot {
+            // Use BOTH resident experts AND still-live scratch-ring experts in Wave 0 BEFORE
+            // Wave 1 unloads/overwrites the scratch ring!
+            if slot != SlotIndex::MISSING.0 && !entry.vram_pending {
+                if entry.is_scratch_slot {
+                    used_scratch = true;
+                }
                 resident.push((slot, prs));
             } else if min_share.is_some_and(|t| prs.iter().map(|&pr| share(pr)).sum::<f32>() < t) {
                 skipped_pairs.extend_from_slice(&prs);
@@ -1249,12 +1501,16 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             // Skipped pairs are never written by the expert kernels: their tmp rows must be 0.
             self.backend.zero_f32(tmp, m * 8 * h, s)?;
         }
-        // Wave 0: the resident experts. With missing experts too, it runs on its own while the
-        // first `ring` of them are copied into scratch (the copy starts at the fence, before the
-        // wave); each further wave stages and runs the next `ring` missing experts.
+        // Wave 0: resident experts (plus any still-live scratch-ring experts we use BEFORE
+        // unloading the scratch ring!). When Wave 0 does not touch the scratch ring, fence before
+        // Wave 0 so Wave 1 DMA overlaps Wave 0; when Wave 0 reads unloading scratch experts, run
+        // Wave 0 first and release/fence the scratch ring right before Wave 1 overwrites it.
         self.backend.seg_mark("pf: moe kernels (+staging)", s);
         let split = !resident.is_empty() && !missing.is_empty();
-        if split {
+        let mut scratch_released = false;
+        if split && !used_scratch {
+            self.tide.release_scratch_ring_for_class(cls)?;
+            scratch_released = true;
             self.tide.fence_scratch()?;
         }
         let mut next_missing = 0usize;
@@ -1264,11 +1520,19 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             if wave == 0 {
                 items.extend(resident.iter().map(|(sl, p)| (*sl, p.as_slice())));
             }
-            if !(split && wave == 0) {
+            if !(split && wave == 0) && next_missing < missing.len() {
+                if !scratch_released {
+                    self.tide.release_scratch_ring_for_class(cls)?;
+                    scratch_released = true;
+                }
                 let take = (missing.len() - next_missing).min(ring);
                 let batch = &missing[next_missing..next_missing + take];
                 let ids_to_stage: Vec<ExpertId> = batch.iter().map(|(id, _)| *id).collect();
-                let staged = if split && next_missing == 0 { self.tide.stage_into_scratch_fenced(&ids_to_stage)? } else { self.tide.stage_into_scratch(&ids_to_stage)? };
+                let staged = if split && !used_scratch && next_missing == 0 {
+                    self.tide.stage_into_scratch_fenced(&ids_to_stage)?
+                } else {
+                    self.tide.stage_into_scratch(&ids_to_stage)?
+                };
                 next_missing += take;
                 items.extend(staged.iter().zip(batch).map(|(sl, (_, p))| (sl.0, p.as_slice())));
             }

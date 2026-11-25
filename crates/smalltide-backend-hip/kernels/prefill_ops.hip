@@ -1715,6 +1715,68 @@ extern "C" __global__ void smalltide_gemm_fp8_rows_wmma_x16(
     }
 }
 
+// Full-occupancy FP8 WMMA GEMM for 17..=64 rows (`x` pre-converted to f16):
+// 2 warps/block (32 N-columns/block -> 100% active warps across all CUs, zero dead M-warps)
+// and each warp decodes its 16-column FP8 weight tile ONCE for all RG*16 rows.
+//   Grid: (ceil(N / 32), 1, 1), Block: 64
+template <uint32_t RG>
+__device__ __forceinline__ void gemm_fp8_rows_wmma_x16_mid(
+    float* __restrict__ y, const _Float16* __restrict__ x, const uint8_t* __restrict__ w_fp8,
+    const float* __restrict__ row_scale, uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) {
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t n0 = (blockIdx.x * 2u + warp) * 16u;
+    if (n0 >= n_rows) return;
+    uint32_t n = n0 + (l & 15u);
+    bool b_ok = n < n_rows;
+    const uint8_t* wr = w_fp8 + static_cast<size_t>(b_ok ? n : 0u) * k_cols;
+    const _Float16* xr[RG];
+    bool a_ok[RG];
+    #pragma unroll
+    for (uint32_t g = 0u; g < RG; ++g) {
+        uint32_t am = 16u * g + (l & 15u);
+        a_ok[g] = am < m_rows;
+        xr[g] = x + static_cast<size_t>(a_ok[g] ? am : 0u) * k_cols;
+    }
+    st_float8 c[RG] = {};
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    uint32_t hoff = (l >> 4) * 16u;
+    for (uint32_t k = 0u; k < k_cols; k += 32u) {
+        uint32_t base = k + hoff;
+        uint4 wv = b_ok ? *reinterpret_cast<const uint4*>(wr + base) : zero;
+        st_half8 b0 = fp8x8_to_half8(make_uint2(wv.x, wv.y));
+        st_half8 b1 = fp8x8_to_half8(make_uint2(wv.z, wv.w));
+        #pragma unroll
+        for (uint32_t g = 0u; g < RG; ++g) {
+            const uint4* xp = reinterpret_cast<const uint4*>(xr[g] + base);
+            st_half8 a0 = as_half8(a_ok[g] ? xp[0] : zero);
+            st_half8 a1 = as_half8(a_ok[g] ? xp[1] : zero);
+            c[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, c[g]);
+            c[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, c[g]);
+        }
+    }
+    if (!b_ok) return;
+    float sc = (row_scale != nullptr) ? row_scale[n] : 1.0f;
+    #pragma unroll
+    for (uint32_t g = 0u; g < RG; ++g) {
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            uint32_t mm = 16u * g + (l >> 4) * 8u + i;
+            if (mm < m_rows) y[static_cast<size_t>(mm) * n_rows + n] = c[g][i] * sc;
+        }
+    }
+}
+
+extern "C" __global__ void smalltide_gemm_fp8_rows_wmma_x16_m32(
+    float* __restrict__ y, const _Float16* __restrict__ x, const uint8_t* __restrict__ w_fp8,
+    const float* __restrict__ row_scale, uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) { gemm_fp8_rows_wmma_x16_mid<2u>(y, x, w_fp8, row_scale, m_rows, n_rows, k_cols); }
+
+extern "C" __global__ void smalltide_gemm_fp8_rows_wmma_x16_m64(
+    float* __restrict__ y, const _Float16* __restrict__ x, const uint8_t* __restrict__ w_fp8,
+    const float* __restrict__ row_scale, uint32_t m_rows, uint32_t n_rows, uint32_t k_cols
+) { gemm_fp8_rows_wmma_x16_mid<4u>(y, x, w_fp8, row_scale, m_rows, n_rows, k_cols); }
+
 // Same arithmetic per output element as smalltide_gemm_fp8_rows_wmma (k order and WMMA steps
 // identical), for m_rows <= 16: one warp per 32-column tile (2 N-tiles reuse A fragment, 2x K-unroll).
 //   Grid: (ceil(N / 256)), Block: 256
@@ -2963,7 +3025,7 @@ extern "C" __global__ void smalltide_dflash2_attn_fp8_split(
     const uint8_t* __restrict__ kc, const float* __restrict__ ks,
     const uint8_t* __restrict__ vc, const float* __restrict__ vs,
     uint32_t P, uint32_t lo, uint32_t window, uint32_t ring, uint32_t nh, uint32_t nkv, uint32_t nblk,
-    uint32_t num_splits, float scale
+    uint32_t num_splits, float scale, uint32_t v_q4, const uint32_t* __restrict__ page_table
 ) {
     uint32_t kvh = blockIdx.x, sp = blockIdx.y;
     uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
@@ -2999,15 +3061,26 @@ extern "C" __global__ void smalltide_dflash2_attn_fp8_split(
         uint32_t tlen = min(16u, c_end - j0);
         if (lt < tlen) {
             uint32_t pos = lo + j0 + lt;
-            uint32_t slot = (ring != 0u) ? (pos % ring) : pos;
+            uint32_t slot = kv_phys(page_table, (ring != 0u) ? (pos % ring) : pos);
             size_t head_idx = static_cast<size_t>(slot) * nkv + kvh;
             uint2 kw = reinterpret_cast<const uint2*>(kc + head_idx * 128u)[lw];
             s_k8[lt][lw * 2u + 0u] = kw.x; s_k8[lt][lw * 2u + 1u] = kw.y;
-            uint2 vw = reinterpret_cast<const uint2*>(vc + head_idx * 128u)[lw];
-            s_v8[lt][lw * 2u + 0u] = vw.x; s_v8[lt][lw * 2u + 1u] = vw.y;
-            if (lw == 0u) {
-                s_ks[lt] = ks[head_idx] * scale;
-                s_vs[lt] = vs[head_idx];
+            if (v_q4 != 0u) {
+                s_v8[lt][lw] = reinterpret_cast<const uint32_t*>(vc + head_idx * 64u)[lw];
+                if (lw < 4u) {
+                    s_v8[lt][16u + lw] = reinterpret_cast<const uint32_t*>(vs)[head_idx * 4u + lw];
+                }
+                if (lw == 0u) {
+                    s_ks[lt] = ks[head_idx] * scale;
+                    s_vs[lt] = 1.0f;
+                }
+            } else {
+                uint2 vw = reinterpret_cast<const uint2*>(vc + head_idx * 128u)[lw];
+                s_v8[lt][lw * 2u + 0u] = vw.x; s_v8[lt][lw * 2u + 1u] = vw.y;
+                if (lw == 0u) {
+                    s_ks[lt] = ks[head_idx] * scale;
+                    s_vs[lt] = vs[head_idx];
+                }
             }
         }
         __syncthreads();
@@ -3015,7 +3088,25 @@ extern "C" __global__ void smalltide_dflash2_attn_fp8_split(
             uint32_t pos = lo + j0 + t;
             if (pos + window <= q_pos) continue;
             float4 kv4 = decode_fp8x4(s_k8[t][lane]);
-            float4 vv4 = decode_fp8x4(s_v8[t][lane]);
+            float4 vv4;
+            if (v_q4 != 0u) {
+                uint32_t w = s_v8[t][lane >> 1];
+                uint32_t v2 = (lane & 1u) ? (w >> 16) : (w & 0xFFFFu);
+                uint32_t pku = s_v8[t][16u + (lane >> 3)];
+                KvV4Scale pk;
+                static_assert(sizeof(KvV4Scale) == 4, "KvV4Scale must be 4 bytes");
+                __builtin_memcpy(&pk, &pku, 4);
+                float vlo = static_cast<float>(pk.lo);
+                float vsc_g = static_cast<float>(pk.sc);
+                vv4 = make_float4(
+                    fmaf(static_cast<float>(v2 & 0xFu), vsc_g, vlo),
+                    fmaf(static_cast<float>((v2 >> 4) & 0xFu), vsc_g, vlo),
+                    fmaf(static_cast<float>((v2 >> 8) & 0xFu), vsc_g, vlo),
+                    fmaf(static_cast<float>((v2 >> 12) & 0xFu), vsc_g, vlo)
+                );
+            } else {
+                vv4 = decode_fp8x4(s_v8[t][lane]);
+            }
             float ksc = s_ks[t], vsc = s_vs[t];
             #pragma unroll
             for (uint32_t g = 0u; g < 4u; ++g) {

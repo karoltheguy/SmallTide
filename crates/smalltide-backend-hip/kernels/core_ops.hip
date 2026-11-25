@@ -351,7 +351,7 @@ extern "C" __global__ void smalltide_gemv_mxfp8_f32(
 // Paged KV: a sequence position's row in a KV pool shared by all sequences. `page_table` maps
 // the sequence's pages (KV_PAGE_POS positions each) to pool pages; null: the position itself
 // (an unpaged cache, e.g. a sliding-window ring).
-#define KV_PAGE_SHIFT 11u
+#define KV_PAGE_SHIFT 8u
 __device__ __forceinline__ uint32_t kv_phys(const uint32_t* __restrict__ page_table, uint32_t slot) {
     return (page_table != nullptr)
         ? ((page_table[slot >> KV_PAGE_SHIFT] << KV_PAGE_SHIFT) | (slot & ((1u << KV_PAGE_SHIFT) - 1u)))
@@ -866,6 +866,72 @@ extern "C" __global__ void smalltide_gemv_multi_wmma(GemvMultiArgs a, uint32_t m
     }
 }
 
+// Multi-row-group (RG = 2 for 17..=32 rows, RG = 4 for 33..=64 rows) fused FP8 WMMA projection:
+// reads and decodes each weight tile ONCE across all RG*16 rows with 100% active warps.
+//   Grid: (ceil(total_rows / 32)), Block: 64
+template <uint32_t RG>
+__device__ __forceinline__ void gemv_multi_wmma_rg(GemvMultiArgs a, uint32_t m_rows) {
+    uint32_t warp = threadIdx.x >> 5, l = threadIdx.x & 31u;
+    uint32_t n0 = (blockIdx.x * 2u + warp) * 16u;
+    if (n0 >= a.total_rows) return;
+    uint32_t si = 0u;
+    #pragma unroll
+    for (uint32_t i = 1u; i < 8u; ++i) {
+        if (i < a.n_seg && n0 >= a.seg[i].row_start) si = i;
+    }
+    const GemvSeg sg = a.seg[si];
+    uint32_t row = (n0 - sg.row_start) + (l & 15u);
+    bool b_ok = row < sg.n_rows;
+    const float* xr[RG];
+    bool a_ok[RG];
+    #pragma unroll
+    for (uint32_t g = 0u; g < RG; ++g) {
+        uint32_t am = 16u * g + (l & 15u);
+        a_ok[g] = am < m_rows;
+        xr[g] = sg.x + static_cast<size_t>(a_ok[g] ? am : 0u) * sg.k_cols;
+    }
+    const uint8_t* wr = sg.w + static_cast<size_t>(b_ok ? row : 0u) * sg.k_cols;
+    st_float8 c[RG] = {};
+    uint32_t hoff = (l >> 4) * 16u;
+    for (uint32_t k = 0u; k < sg.k_cols; k += 32u) {
+        uint32_t base = k + hoff;
+        uint4 wv = b_ok ? *reinterpret_cast<const uint4*>(wr + base) : make_uint4(0u, 0u, 0u, 0u);
+        st_half8 b0 = fp8x8_to_half8(make_uint2(wv.x, wv.y));
+        st_half8 b1 = fp8x8_to_half8(make_uint2(wv.z, wv.w));
+        #pragma unroll
+        for (uint32_t g = 0u; g < RG; ++g) {
+            const float4* xp = reinterpret_cast<const float4*>(xr[g] + base);
+            float4 x0 = a_ok[g] ? xp[0] : make_float4(0, 0, 0, 0), x1 = a_ok[g] ? xp[1] : make_float4(0, 0, 0, 0);
+            float4 x2 = a_ok[g] ? xp[2] : make_float4(0, 0, 0, 0), x3 = a_ok[g] ? xp[3] : make_float4(0, 0, 0, 0);
+            st_half8 a0, a1;
+            a0[0] = (_Float16)x0.x; a0[1] = (_Float16)x0.y; a0[2] = (_Float16)x0.z; a0[3] = (_Float16)x0.w;
+            a0[4] = (_Float16)x1.x; a0[5] = (_Float16)x1.y; a0[6] = (_Float16)x1.z; a0[7] = (_Float16)x1.w;
+            a1[0] = (_Float16)x2.x; a1[1] = (_Float16)x2.y; a1[2] = (_Float16)x2.z; a1[3] = (_Float16)x2.w;
+            a1[4] = (_Float16)x3.x; a1[5] = (_Float16)x3.y; a1[6] = (_Float16)x3.z; a1[7] = (_Float16)x3.w;
+            c[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, c[g]);
+            c[g] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, c[g]);
+        }
+    }
+    if (!b_ok) return;
+    float sc = (sg.scale != nullptr) ? sg.scale[row] : 1.0f;
+    #pragma unroll
+    for (uint32_t g = 0u; g < RG; ++g) {
+        #pragma unroll
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            uint32_t mm = 16u * g + (l >> 4) * 8u + i;
+            if (mm < m_rows) sg.y[static_cast<size_t>(mm) * sg.n_rows + row] = c[g][i] * sc;
+        }
+    }
+}
+
+extern "C" __global__ void smalltide_gemv_multi_wmma_m32(GemvMultiArgs a, uint32_t m_rows) {
+    gemv_multi_wmma_rg<2u>(a, m_rows);
+}
+
+extern "C" __global__ void smalltide_gemv_multi_wmma_m64(GemvMultiArgs a, uint32_t m_rows) {
+    gemv_multi_wmma_rg<4u>(a, m_rows);
+}
+
 // ---------------------------------------------------------------------------
 // Attention prep for `rows` consecutive positions of one sequence (speculative verify): the
 // decode fusion with the K/V short convs run row by row (+ verify histories), FP8 KV store at
@@ -1191,8 +1257,10 @@ extern "C" __global__ void smalltide_ctrl_apply_norm_multi(CtrlMultiArgs a) {
     }
 }
 
-// Expert grouping (as smalltide_moe_group_rows2) plus the f32 -> f16 copy of the MoE input in the
-// same launch.   Grid: 1, Block: 256 (threads < 64 plan; all convert)
+// Bucket-by-expert GPU grouping + f32 -> f16 copy of the MoE input in one launch.
+// Supports up to 64 rows (512 pairs across 128 experts), splitting any expert picked by > 16 rows
+// into ceil(cnt / 16) standard 16-row WMMA work items (at most 160 work items total).
+//   Grid: 1, Block: 256
 extern "C" __global__ void smalltide_moe_group_rows3(
     uint32_t* __restrict__ work, uint32_t* __restrict__ pairs, const uint32_t* __restrict__ route,
     const uint32_t* __restrict__ slot_table, uint32_t rows, _Float16* __restrict__ x16,
@@ -1206,36 +1274,55 @@ extern "C" __global__ void smalltide_moe_group_rows3(
             for (uint32_t j = i; j < n_x; ++j) x16[j] = (_Float16)x[j];
         }
     }
-    __shared__ uint32_t s_e[64], s_cnt[64], s_wi[64], s_off[64];
-    __shared__ uint32_t s_nw;
+    __shared__ uint16_t s_pe[512];
+    __shared__ uint32_t s_cnt[128], s_nw[128], s_wi[128], s_off[128], s_slot[128];
+    __shared__ uint32_t s_tot_nw;
     uint32_t p = threadIdx.x, np_total = rows * 8u;
-    bool lead = p < 64u;
-    bool valid = p < np_total;
-    uint32_t e = valid ? route[(p >> 3) * 16u + (p & 7u)] : 0xFFFFFFFFu;
-    if (lead) s_e[p] = e;
+    if (p < np_total) s_pe[p] = static_cast<uint16_t>(route[(p >> 3) * 16u + (p & 7u)]);
+    if (p + 256u < np_total) s_pe[p + 256u] = static_cast<uint16_t>(route[((p + 256u) >> 3) * 16u + ((p + 256u) & 7u)]);
     __syncthreads();
-    uint32_t slot = valid ? slot_table[e] : 0xFFFFFFFFu;
-    bool first = valid && slot != 0xFFFFFFFFu;
-    for (uint32_t q = 0u; q < p && first; ++q) if (s_e[q] == e) first = false;
-    uint32_t cnt = 0u;
-    if (first) for (uint32_t q = p; q < np_total; ++q) cnt += (s_e[q] == e) ? 1u : 0u;
-    if (lead) { s_cnt[p] = first ? cnt : 0u; s_wi[p] = first ? 1u : 0u; }
+    if (p < 128u) {
+        uint32_t slot = slot_table[p];
+        uint32_t cnt = 0u;
+        if (slot != 0xFFFFFFFFu) {
+            for (uint32_t q = 0u; q < np_total; ++q) {
+                if (s_pe[q] == p) ++cnt;
+            }
+        }
+        s_slot[p] = slot;
+        s_cnt[p] = cnt;
+        s_nw[p] = (cnt + 15u) >> 4;
+    }
     __syncthreads();
     if (p == 0u) {
         uint32_t wsum = 0u, osum = 0u;
-        for (uint32_t q = 0u; q < 64u; ++q) {
-            uint32_t f = s_wi[q], c = s_cnt[q];
-            s_wi[q] = wsum; s_off[q] = osum;
-            wsum += f; osum += c;
+        for (uint32_t e = 0u; e < 128u; ++e) {
+            s_wi[e] = wsum;
+            s_off[e] = osum;
+            wsum += s_nw[e];
+            osum += s_cnt[e];
         }
-        s_nw = wsum;
+        s_tot_nw = wsum;
     }
     __syncthreads();
-    if (first) {
-        uint32_t wi = s_wi[p], off = s_off[p];
-        work[wi * 4u] = slot; work[wi * 4u + 1u] = off; work[wi * 4u + 2u] = cnt; work[wi * 4u + 3u] = 0u;
+    if (p < 128u && s_nw[p] > 0u) {
+        uint32_t cnt = s_cnt[p], off = s_off[p], slot = s_slot[p], wi0 = s_wi[p], nw = s_nw[p];
         uint32_t j = 0u;
-        for (uint32_t q = p; q < np_total; ++q) if (s_e[q] == e) pairs[off + j++] = q;
+        for (uint32_t q = 0u; q < np_total; ++q) {
+            if (s_pe[q] == p) pairs[off + j++] = q;
+        }
+        for (uint32_t ch = 0u; ch < nw; ++ch) {
+            uint32_t wi = wi0 + ch;
+            uint32_t c0 = ch * 16u;
+            uint32_t cn = (cnt - c0 < 16u) ? (cnt - c0) : 16u;
+            work[wi * 4u] = slot;
+            work[wi * 4u + 1u] = off + c0;
+            work[wi * 4u + 2u] = cn;
+            work[wi * 4u + 3u] = 0u;
+        }
     }
-    if (lead && p >= s_nw) { work[p * 4u] = 0u; work[p * 4u + 1u] = 0u; work[p * 4u + 2u] = 0u; work[p * 4u + 3u] = 0u; }
+    uint32_t max_work = (rows <= 16u) ? (rows * 8u) : 160u;
+    if (p >= s_tot_nw && p < max_work) {
+        work[p * 4u] = 0u; work[p * 4u + 1u] = 0u; work[p * 4u + 2u] = 0u; work[p * 4u + 3u] = 0u;
+    }
 }

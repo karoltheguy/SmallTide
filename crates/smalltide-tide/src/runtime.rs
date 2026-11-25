@@ -867,6 +867,15 @@ impl<B: ComputeBackend> TideExecutor<B> {
         Ok(())
     }
 
+    /// Frees only one class's Scratch Rescue Ring (unmaps its occupants on the compute stream).
+    pub fn release_scratch_ring_for_class(&mut self, cls: ExpertClass) -> Result<()> {
+        self.scheduler.cache.clear_scratch_ring_class(cls);
+        if self.scheduler.cache.has_dirty_gpu_table() {
+            self.upload_table_on_compute()?;
+        }
+        Ok(())
+    }
+
     /// Copies `experts` (all of one class, at most the ring size) into consecutive Scratch Rescue
     /// slots and makes the compute stream wait for them; returns their slots. The slots are NOT
     /// published in the GPU table: the caller addresses them directly (batched prefill MoE).

@@ -112,6 +112,16 @@ struct Scratch {
     pinned: PinnedBuf,      // [D] f32 (single anchor row)
 }
 
+/// One lane's request inside a batched multi-lane DFlash 2 draft pass (`draft_proposals_batch`).
+#[derive(Clone, Copy, Debug)]
+pub struct DraftLaneReq {
+    pub lane: usize,
+    pub anchor: u32,
+    pub pos: usize,
+    pub n_draft: usize,
+    pub temperature: f32,
+}
+
 pub struct DFlash2Drafter<B: ComputeBackend> {
     backend: Arc<B>,
     /// `fc.weight [D, 4*D]` split into 4 FP8 `[D, D]` projections (one per target tap).
@@ -130,6 +140,12 @@ pub struct DFlash2Drafter<B: ComputeBackend> {
     sc: Scratch,
     pub vram_bytes: usize,
     lane: usize,
+    /// When true, KV lives in the engine's unified `KvPoolBufs` (0 private KV VRAM).
+    paged: bool,
+    v_q4: bool,
+    ring_slots: usize,
+    page_tables: Option<Vec<DeviceBuf>>,
+    lanes_count: usize,
 }
 
 impl<B: ComputeBackend> DFlash2Drafter<B> {
@@ -142,6 +158,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
         max_seq: usize,
         chunk: usize,
         lanes: usize,
+        paged: bool,
     ) -> Result<Self> {
         let hdr = inspect_safetensors_header(path)?;
         let base = 8u64 + hdr.header_len;
@@ -204,16 +221,21 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
                 let mlp_conv_base = vec(&mut f, "mlp_conv.base_kernel")?;
 
                 let mut lane_ctx: Vec<[DeviceBuf; 4]> = Vec::new();
-                for _ in 0..lanes.max(1) {
-                    lane_ctx.push([
-                        backend.alloc_device(RING * HK * HD)?,
-                        backend.alloc_device(RING * HK * 4)?,
-                        backend.alloc_device(RING * HK * HD)?,
-                        backend.alloc_device(RING * HK * 4)?,
-                    ]);
-                    bytes += RING * HK * (2 * HD + 8);
-                }
-                let [kc, ks, vc, vs] = lane_ctx[0];
+                let z = DeviceBuf { id: 0, offset_bytes: 0, size_bytes: 0 };
+                let [kc, ks, vc, vs] = if paged {
+                    [z, z, z, z]
+                } else {
+                    for _ in 0..lanes.max(1) {
+                        lane_ctx.push([
+                            backend.alloc_device(RING * HK * HD)?,
+                            backend.alloc_device(RING * HK * 4)?,
+                            backend.alloc_device(RING * HK * HD)?,
+                            backend.alloc_device(RING * HK * 4)?,
+                        ]);
+                        bytes += RING * HK * (2 * HD + 8);
+                    }
+                    lane_ctx[0]
+                };
                 layers.push(DFlash2Layer {
                     in_ln, post_ln, attn_conv_base, attn_conv_proj, mlp_conv_base, mlp_conv_proj,
                     q, k, v, o, gate, up: upm, down, q_norm, k_norm, kc, ks, vc, vs, lane_ctx,
@@ -280,7 +302,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
                 topk_val,
                 topk_idx,
                 h_proj,
-                pinned: backend.alloc_pinned(D * 4)?,
+                pinned: backend.alloc_pinned(32 * D * 4)?,
             };
             bytes += ((BLOCK - 1) * vocab
                 + chunk * (2 * D + 2 * HK * HD)
@@ -302,6 +324,11 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
                 sc,
                 vram_bytes: bytes,
                 lane: 0,
+                paged,
+                v_q4: false,
+                ring_slots: RING,
+                page_tables: None,
+                lanes_count: lanes.max(1),
             })
         })();
         let _ = backend.sync_stream(stream);
@@ -310,8 +337,37 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
         res
     }
 
-    pub fn set_lane(&mut self, lane: usize, _page_table: Option<DeviceBuf>) {
+    pub fn is_paged(&self) -> bool {
+        self.paged
+    }
+
+    /// Binds all 5 DFlash 2 layers to the engine's unified `KvPoolBufs`.
+    pub fn bind_kv_pool(
+        &mut self,
+        k: DeviceBuf,
+        ks: DeviceBuf,
+        v: DeviceBuf,
+        vs: DeviceBuf,
+        v_q4: bool,
+        ring_slots: usize,
+    ) {
+        self.paged = true;
+        self.v_q4 = v_q4;
+        self.ring_slots = ring_slots;
+        for ly in &mut self.layers {
+            ly.kc = k;
+            ly.ks = ks;
+            ly.vc = v;
+            ly.vs = vs;
+        }
+    }
+
+    pub fn set_lane(&mut self, lane: usize, drafter_tables: Option<&[DeviceBuf]>) {
         self.lane = lane;
+        if self.paged {
+            self.page_tables = drafter_tables.map(|t| t.to_vec());
+            return;
+        }
         for ly in self.layers.iter_mut() {
             if let Some(&[kc, ks, vc, vs]) = ly.lane_ctx.get(lane) {
                 (ly.kc, ly.ks, ly.vc, ly.vs) = (kc, ks, vc, vs);
@@ -320,10 +376,28 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
     }
 
     pub fn lanes(&self) -> usize {
-        self.layers.iter().map(|ly| ly.lane_ctx.len()).max().unwrap_or(1).max(1)
+        if self.paged {
+            self.lanes_count
+        } else {
+            self.layers.iter().map(|ly| ly.lane_ctx.len()).max().unwrap_or(1).max(1)
+        }
     }
 
     pub fn ingest(&self, taps: DeviceBuf, tap_stride: usize, pos0: usize, m: usize, s: Stream) -> Result<()> {
+        self.ingest_at_row(taps, tap_stride, 0, pos0, m, s)
+    }
+
+    /// Ingests `m` committed rows starting at `row_off` inside `taps` (`[4][tap_stride][D]`)
+    /// into positions `pos0..pos0+m` of the active lane.
+    pub fn ingest_at_row(
+        &self,
+        taps: DeviceBuf,
+        tap_stride: usize,
+        row_off: usize,
+        pos0: usize,
+        m: usize,
+        s: Stream,
+    ) -> Result<()> {
         if m == 0 {
             return Ok(());
         }
@@ -339,7 +413,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
         let tap_row_bytes = m * D * 4;
         // Project concatenated 4 taps through fc [D, 4*D] -> ctx_c [m, D], then hidden_norm.
         for t in 0..4 {
-            let src = taps.slice(t * tap_stride * D * 4, tap_row_bytes);
+            let src = taps.slice((t * tap_stride + row_off) * D * 4, tap_row_bytes);
             let dst = if t == 0 { sc.ctx_c } else { sc.ctx_tmp };
             if m <= 8 {
                 let seg = [GemvSegment {
@@ -360,7 +434,7 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
         }
         b.rms_norm(sc.ctx_c, sc.ctx_c, self.hidden_norm, m, D, EPS, s)?;
 
-        for ly in &self.layers {
+        for (l, ly) in self.layers.iter().enumerate() {
             if m <= 8 {
                 let segs = [
                     GemvSegment { w: ly.k.data, row_scales: Some(ly.k.row_scales), x: sc.ctx_c, y: sc.ctx_k, n_rows: kvd, k_cols: D },
@@ -372,7 +446,8 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
                 b.gemm_fp8_rows(sc.ctx_v, sc.ctx_c, ly.v.data, ly.v.row_scales, m, kvd, D, s)?;
             }
             b.dspark_head_norm_rope(sc.ctx_k, ly.k_norm, HK, m, pos0, THETA, EPS, s)?;
-            b.dspark_ctx_store_fp8(ly.kc, ly.ks, ly.vc, ly.vs, sc.ctx_k, sc.ctx_v, pos0, m, RING, HK, false, None, s)?;
+            let pt = self.page_tables.as_ref().and_then(|v| v.get(l).copied());
+            b.dspark_ctx_store_fp8(ly.kc, ly.ks, ly.vc, ly.vs, sc.ctx_k, sc.ctx_v, pos0, m, self.ring_slots, HK, self.v_q4, pt, s)?;
         }
         Ok(())
     }
@@ -453,10 +528,11 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
                 s,
             )?;
             b.dspark_qk_norm_rope(sc.q, sc.kb, ly.q_norm, ly.k_norm, HQ, HK, BLOCK, p, THETA, EPS, s)?;
+            let pt = self.page_tables.as_ref().and_then(|v| v.get(l).copied());
             b.dflash2_attn_fp8(
                 sc.att, sc.part_o, sc.part_m, sc.part_l,
                 sc.q, sc.kb, sc.vb, ly.kc, ly.ks, ly.vc, ly.vs,
-                BLOCK, p, WINDOW, RING, HQ, HK, BLOCK, scale, s,
+                BLOCK, p, WINDOW, self.ring_slots, HQ, HK, BLOCK, scale, self.v_q4, pt, s,
             )?;
             b.gemv_multi_rows(&[seg(&ly.o, sc.att, sc.tmp)], BLOCK, s)?;
             b.dflash2_conv_finish_add_rmsnorm(
@@ -490,6 +566,21 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
         let idx_off = (BLOCK - 1) * TOP_K * 4;
         let hp_off = idx_off + (BLOCK - 1) * TOP_K * 4;
 
+        Ok(self.select_proposals(&raw, val_off, idx_off, hp_off, anchor, n, temperature, rng))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_proposals(
+        &self,
+        raw: &[u8],
+        val_off: usize,
+        idx_off: usize,
+        hp_off: usize,
+        anchor: u32,
+        n: usize,
+        temperature: f32,
+        rng: &mut u64,
+    ) -> Vec<DraftProposal> {
         let rd_f32 = |byte_off: usize| -> f32 {
             f32::from_le_bytes(raw[byte_off..byte_off + 4].try_into().unwrap())
         };
@@ -589,10 +680,276 @@ impl<B: ComputeBackend> DFlash2Drafter<B> {
                 out.push(DraftProposal { token: best_id, margin, q_dist: None });
             }
         }
+        out
+    }
+
+    /// Batched multi-lane DFlash 2 drafting: runs `reqs` (`1..=8` lanes, `sum(n_draft) <= 16`)
+    /// through all 5 DFlash 2 layers and the target `unembed_fp8` with ONE shared weight read
+    /// across all concurrent lanes, using caller-provided scratch (`pf.blocks` + `batch_logits`)
+    /// for 0 extra VRAM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft_proposals_batch(
+        &mut self,
+        dense: &Inkling2DenseGpu<B>,
+        reqs: &[DraftLaneReq],
+        lane_tables: &[Option<Vec<DeviceBuf>>],
+        rngs: &mut [u64],
+        scratch_pool: DeviceBuf,
+        logits_buf: DeviceBuf,
+        s: Stream,
+    ) -> Result<Vec<Vec<DraftProposal>>> {
+        let k = reqs.len();
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        if k == 1 {
+            self.set_lane(reqs[0].lane, lane_tables[0].as_deref());
+            let mut r = rngs[0];
+            let res = self.draft_proposals(dense, reqs[0].anchor, reqs[0].pos, reqs[0].n_draft, reqs[0].temperature, &mut r, s)?;
+            rngs[0] = r;
+            return Ok(vec![res]);
+        }
+        if k > 32 {
+            return Err(SmallTideError::Backend {
+                backend: "dflash2",
+                message: format!("draft_proposals_batch: {k} lanes > 32"),
+            });
+        }
+        let mut total_n = 0usize;
+        for req in reqs {
+            let n = req.n_draft.clamp(1, BLOCK - 1);
+            if req.pos + 1 + n > self.max_seq {
+                return Err(SmallTideError::Backend {
+                    backend: "dflash2",
+                    message: format!("draft {n} at {} past max_seq {}", req.pos, self.max_seq),
+                });
+            }
+            total_n += n;
+        }
+        let total_rows = k * BLOCK;
+        let num_topk_blocks = self.vocab.div_ceil(4096).max(1);
+        // Carve 256-byte-aligned scratch buffers out of `scratch_pool` (e.g. `pf.blocks`, 72 MiB).
+        let mut cur_off = 0usize;
+        let mut alloc = |bytes: usize| -> Result<DeviceBuf> {
+            let aligned = bytes.next_multiple_of(256);
+            if cur_off + aligned > scratch_pool.size_bytes {
+                return Err(SmallTideError::Backend {
+                    backend: "dflash2",
+                    message: format!(
+                        "draft_proposals_batch scratch overflow: need {} > {}",
+                        cur_off + aligned,
+                        scratch_pool.size_bytes
+                    ),
+                });
+            }
+            let buf = scratch_pool.slice(cur_off, bytes);
+            cur_off += aligned;
+            Ok(buf)
+        };
+        let anchor_in = alloc(k * D * 4)?;
+        let res = alloc(total_rows * D * 4)?;
+        let xn = alloc(total_rows * D * 4)?;
+        let xn_conv = alloc(total_rows * D * 4)?;
+        let tmp = alloc(total_rows * D * 4)?;
+        let conv_coeff = alloc(total_rows * CONV_PROJ_OUT * 4)?;
+        let q = alloc(total_rows * HQ * HD * 4)?;
+        let kb = alloc(total_rows * HK * HD * 4)?;
+        let vb = alloc(total_rows * HK * HD * 4)?;
+        let att = alloc(total_rows * HQ * HD * 4)?;
+        let g = alloc(total_rows * FF * 4)?;
+        let u_buf = alloc(total_rows * FF * 4)?;
+        let hb_pack = alloc(total_n * D * 4)?;
+        let topk_val_bytes = total_n * TOP_K * 4;
+        let topk_idx_bytes = total_n * TOP_K * 4;
+        let h_proj_bytes = total_n * R * 4;
+        let sel_out = alloc(topk_val_bytes + topk_idx_bytes + h_proj_bytes)?;
+        let topk_val = sel_out.slice(0, topk_val_bytes);
+        let topk_idx = sel_out.slice(topk_val_bytes, topk_idx_bytes);
+        let h_proj = sel_out.slice(topk_val_bytes + topk_idx_bytes, h_proj_bytes);
+        let part_val = alloc(total_n * num_topk_blocks * TOP_K * 4)?;
+        let part_idx = alloc(total_n * num_topk_blocks * TOP_K * 4)?;
+        let base = logits_buf.slice(0, total_n * self.vocab * 4);
+
+        let b = self.backend.as_ref();
+        // Upload all `k` anchor embeddings in ONE single H2D transfer.
+        unsafe {
+            let dst = b.pinned_as_mut_slice(self.sc.pinned)?;
+            for (i, req) in reqs.iter().enumerate() {
+                let row = &dense.embed_bf16_host[req.anchor as usize * D * 2..(req.anchor as usize + 1) * D * 2];
+                let out_off = i * D * 4;
+                for j in 0..D {
+                    let v = bf16_to_f32(u16::from_le_bytes([row[2 * j], row[2 * j + 1]]));
+                    dst[out_off + j * 4..out_off + j * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        b.memcpy_h2d_async(anchor_in, 0, self.sc.pinned, 0, k * D * 4, s)?;
+        for i in 0..k {
+            b.dspark_embed_prep(
+                res.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                xn.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                anchor_in.slice(i * D * 4, D * 4),
+                dense.embed_norm,
+                self.mask_embed_gpu,
+                self.layers[0].in_ln,
+                D,
+                EPS,
+                s,
+            )?;
+        }
+
+        let seg = |m: &Fp8MatrixGpu, x: DeviceBuf, y: DeviceBuf| GemvSegment {
+            w: m.data,
+            row_scales: Some(m.row_scales),
+            x,
+            y,
+            n_rows: m.n_rows,
+            k_cols: m.k_cols,
+        };
+        let mm = |y: DeviceBuf, x: DeviceBuf, w: &Fp8MatrixGpu| -> Result<()> {
+            if total_rows <= 64 {
+                b.gemv_multi_rows(&[seg(w, x, y)], total_rows, s)
+            } else {
+                b.gemm_fp8_rows(y, x, w.data, w.row_scales, total_rows, w.n_rows, w.k_cols, s)
+            }
+        };
+        let scale = 1.0 / (HD as f32).sqrt();
+
+        for (l, ly) in self.layers.iter().enumerate() {
+            // 1. Attention dynamic conv prepare (projection shared across all k*8 rows!)
+            mm(conv_coeff, xn, &ly.attn_conv_proj)?;
+            for i in 0..k {
+                b.dflash2_conv_prepare(
+                    xn_conv.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    xn.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    conv_coeff.slice(i * BLOCK * CONV_PROJ_OUT * 4, BLOCK * CONV_PROJ_OUT * 4),
+                    ly.attn_conv_base,
+                    BLOCK,
+                    D,
+                    CONV_G,
+                    s,
+                )?;
+            }
+            // 2. Q/K/V projections shared across all k*8 rows (1 weight read!)
+            if total_rows <= 32 {
+                b.gemv_multi_rows(&[seg(&ly.q, xn_conv, q), seg(&ly.k, xn_conv, kb), seg(&ly.v, xn_conv, vb)], total_rows, s)?;
+            } else {
+                b.gemm_fp8_rows(q, xn_conv, ly.q.data, ly.q.row_scales, total_rows, ly.q.n_rows, ly.q.k_cols, s)?;
+                b.gemm_fp8_rows(kb, xn_conv, ly.k.data, ly.k.row_scales, total_rows, ly.k.n_rows, ly.k.k_cols, s)?;
+                b.gemm_fp8_rows(vb, xn_conv, ly.v.data, ly.v.row_scales, total_rows, ly.v.n_rows, ly.v.k_cols, s)?;
+            }
+            // 3. Per-lane QK norm + RoPE + context attention (each lane has its own pos & page table!)
+            for (i, req) in reqs.iter().enumerate() {
+                let qi = q.slice(i * BLOCK * HQ * HD * 4, BLOCK * HQ * HD * 4);
+                let ki = kb.slice(i * BLOCK * HK * HD * 4, BLOCK * HK * HD * 4);
+                let vi = vb.slice(i * BLOCK * HK * HD * 4, BLOCK * HK * HD * 4);
+                let atti = att.slice(i * BLOCK * HQ * HD * 4, BLOCK * HQ * HD * 4);
+                b.dspark_qk_norm_rope(qi, ki, ly.q_norm, ly.k_norm, HQ, HK, BLOCK, req.pos, THETA, EPS, s)?;
+                let (kc, ks, vc, vs, pt) = if self.paged {
+                    let p = lane_tables[i].as_ref().and_then(|v| v.get(l).copied());
+                    (ly.kc, ly.ks, ly.vc, ly.vs, p)
+                } else {
+                    let c = ly.lane_ctx[req.lane.min(ly.lane_ctx.len() - 1)];
+                    (c[0], c[1], c[2], c[3], None)
+                };
+                b.dflash2_attn_fp8(
+                    atti, self.sc.part_o, self.sc.part_m, self.sc.part_l,
+                    qi, ki, vi, kc, ks, vc, vs,
+                    BLOCK, req.pos, WINDOW, self.ring_slots, HQ, HK, BLOCK, scale, self.v_q4, pt, s,
+                )?;
+            }
+            // 4. O projection shared across all k*8 rows + per-lane conv finish
+            mm(tmp, att, &ly.o)?;
+            for i in 0..k {
+                b.dflash2_conv_finish_add_rmsnorm(
+                    res.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    xn.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    tmp.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    conv_coeff.slice(i * BLOCK * CONV_PROJ_OUT * 4, BLOCK * CONV_PROJ_OUT * 4),
+                    ly.attn_conv_base,
+                    ly.post_ln,
+                    BLOCK,
+                    D,
+                    CONV_G,
+                    EPS,
+                    s,
+                )?;
+            }
+            // 5. MLP dynamic conv + gate/up/down shared across all k*8 rows (1 weight read!)
+            mm(conv_coeff, xn, &ly.mlp_conv_proj)?;
+            for i in 0..k {
+                b.dflash2_conv_prepare(
+                    xn_conv.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    xn.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    conv_coeff.slice(i * BLOCK * CONV_PROJ_OUT * 4, BLOCK * CONV_PROJ_OUT * 4),
+                    ly.mlp_conv_base,
+                    BLOCK,
+                    D,
+                    CONV_G,
+                    s,
+                )?;
+            }
+            if total_rows <= 32 {
+                b.gemv_multi_rows(&[seg(&ly.gate, xn_conv, g), seg(&ly.up, xn_conv, u_buf)], total_rows, s)?;
+            } else {
+                b.gemm_fp8_rows(g, xn_conv, ly.gate.data, ly.gate.row_scales, total_rows, ly.gate.n_rows, ly.gate.k_cols, s)?;
+                b.gemm_fp8_rows(u_buf, xn_conv, ly.up.data, ly.up.row_scales, total_rows, ly.up.n_rows, ly.up.k_cols, s)?;
+            }
+            b.silu_mul(g, g, u_buf, total_rows * FF, s)?;
+            mm(tmp, g, &ly.down)?;
+            let next = if l + 1 < self.layers.len() { self.layers[l + 1].in_ln } else { self.norm_w };
+            for i in 0..k {
+                b.dflash2_conv_finish_add_rmsnorm(
+                    res.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    xn.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    tmp.slice(i * BLOCK * D * 4, BLOCK * D * 4),
+                    conv_coeff.slice(i * BLOCK * CONV_PROJ_OUT * 4, BLOCK * CONV_PROJ_OUT * 4),
+                    ly.mlp_conv_base,
+                    next,
+                    BLOCK,
+                    D,
+                    CONV_G,
+                    EPS,
+                    s,
+                )?;
+            }
+        }
+
+        // Pack each lane's requested `n_i` draft rows (`1..=n_i`) contiguously so `unembed_fp8`
+        // (460 MiB!), `topk16_rows`, and `sel_hidden_proj` each run ONCE across all `total_n <= 16` rows!
+        let mut pack_row = 0usize;
+        let mut lane_offsets = Vec::with_capacity(k);
+        for (i, req) in reqs.iter().enumerate() {
+            let n = req.n_draft.clamp(1, BLOCK - 1);
+            let src = xn.slice((i * BLOCK + 1) * D * 4, n * D * 4);
+            let dst = hb_pack.slice(pack_row * D * 4, n * D * 4);
+            b.vec_copy(dst, src, n * D, s)?;
+            lane_offsets.push((pack_row, n));
+            pack_row += n;
+        }
+        let u = &dense.unembed_fp8;
+        b.gemm_fp8_rows_decode(base, hb_pack, u.data, u.row_scales, total_n, self.vocab, D, s)?;
+        b.topk16_rows(topk_val, topk_idx, part_val, part_idx, base, total_n, self.vocab, s)?;
+        b.gemv_multi_rows(&[seg(&self.sel_hidden_proj, hb_pack, h_proj)], total_n, s)?;
+
+        let mut raw = vec![0u8; topk_val_bytes + topk_idx_bytes + h_proj_bytes];
+        b.memcpy_d2h_sync(&mut raw, sel_out, 0, s)?;
+
+        let mut out = Vec::with_capacity(k);
+        for (i, req) in reqs.iter().enumerate() {
+            let (r0, n) = lane_offsets[i];
+            let v_off = r0 * TOP_K * 4;
+            let i_off = topk_val_bytes + r0 * TOP_K * 4;
+            let h_off = topk_val_bytes + topk_idx_bytes + r0 * R * 4;
+            out.push(self.select_proposals(&raw, v_off, i_off, h_off, req.anchor, n, req.temperature, &mut rngs[i]));
+        }
         Ok(out)
     }
 
     pub fn local_kv_regions(&self) -> Vec<DeviceBuf> {
+        if self.paged {
+            return Vec::new();
+        }
         let mut v = Vec::with_capacity(self.layers.len() * 4);
         for ly in &self.layers {
             v.extend_from_slice(&[ly.kc, ly.ks, ly.vc, ly.vs]);

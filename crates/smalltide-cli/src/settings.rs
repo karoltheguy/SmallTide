@@ -314,20 +314,24 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     // Extra lanes: their own KV (local rings + global KV of `lane_ctx`), allocated before the pools.
     let extra_lanes = lanes.max(1) - 1;
     let lane_ctx = s.lane_ctx.min(s.max_ctx).max(cfg.local_window_size);
-    // Paged global KV (default where the backend can page memory): one pool of
-    // SMALLTIDE_KV_TOKENS positions shared by all lanes (default: what lane 0 at max_ctx plus the
-    // other lanes at lane_ctx held before), any lane up to max_ctx; pages carry one per lane of slack.
+    // Unified hybrid paged KV pool (default on, even for lanes=1): one shared physical pool of
+    // single-layer pages (256 positions each) backing all 40 local sliding-window layers, 8 global
+    // layers, and 5 DFlash 2 layers across all lanes. Idle lanes hold 0 pages (0 VRAM).
     let page = smalltide_model_inkling2::kv_pager::PAGE_POS;
+    let n_glob = smalltide_model_inkling2::kv_pager::NUM_GLOBAL_LAYERS;
+    let single_page_bytes = page * cfg.num_key_value_heads * global_head_bytes;
     let kv_tokens = parse("SMALLTIDE_KV_TOKENS", s.max_ctx + extra_lanes * lane_ctx, "a token count");
     let kv_paged = std::env::var("SMALLTIDE_KV_PAGED").map_or(true, |v| v.trim() != "0");
-    let kv_max_pages = kv_paged.then(|| kv_tokens.div_ceil(page) + lanes.max(1));
+    // Reserve 256 single-layer pages for 1 active lane's local (40x5=200) + DFlash 2 (5x9=45)
+    // sliding windows + prefill chunk slack; max_pages allows all lanes active simultaneously.
+    let kv_max_pages = kv_paged.then(|| n_glob * kv_tokens.div_ceil(page) + 256 * lanes.max(1));
     let kv_initial_tokens = parse("SMALLTIDE_KV_INITIAL_TOKENS", kv_tokens, "a token count");
     let kv_pool_pages = kv_max_pages.map(|max_p| {
-        let init_p = (kv_initial_tokens.div_ceil(page) + lanes.max(1)).max(4);
+        let init_p = (n_glob * kv_initial_tokens.div_ceil(page) + 256).max(320);
         init_p.min(max_p)
     });
     let est_kv_bytes = match kv_pool_pages {
-        Some(p) => 40 * (2 * 8 * (cfg.local_window_size + 128) * 132) * lanes.max(1) + p * page * global_per_pos + 64 * 1024 * 1024,
+        Some(p) => p * single_page_bytes + lanes.max(1) * 4 * 1024 * 1024 + 64 * 1024 * 1024,
         None => est_kv_bytes
             + extra_lanes * (40 * (2 * 8 * (cfg.local_window_size + 128) * 132) + lane_ctx * global_per_pos),
     };
@@ -356,6 +360,7 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
             std::process::exit(1);
         }
         let d = if let Some(path) = dflash2_path {
+            let paged = kv_pool_pages.is_some();
             let d = smalltide_model_inkling2::drafter::Drafter::load_dflash2(
                 backend.clone(),
                 &path,
@@ -364,11 +369,13 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
                 s.max_ctx,
                 smalltide_model_inkling2::engine::prefill_chunk(),
                 lanes.max(1),
+                paged,
             )
             .expect("load DFlash2 drafter (model.safetensors)");
             println!(
-                "[spec] DFlash2 drafter loaded ({:.0} MiB VRAM, window=2048, 0 global KV, {:.1}s) from {}",
+                "[spec] DFlash2 drafter loaded ({:.0} MiB VRAM, window=2048, {}, {:.1}s) from {}",
                 d.vram_bytes() as f64 / (1u64 << 20) as f64,
+                if paged { "shared paged KV" } else { "private KV rings" },
                 t.elapsed().as_secs_f64(),
                 path.display()
             );
@@ -383,10 +390,8 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
                 s.max_ctx,
                 smalltide_model_inkling2::engine::prefill_chunk(),
                 s.kv_v_q4,
-                // Every lane keeps its own drafter context: local rings a lane, and the global layer
-                // in the same pages of the shared KV pool as the lane's global KV.
                 lanes.max(1),
-                kv_pool_pages.map_or(s.max_ctx, |p| p * page),
+                s.max_ctx,
             )
             .expect("load drafter (mtp.safetensors)");
             println!(
@@ -524,8 +529,14 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     let kv_fmt = if s.kv_v_q4 { "k8v4" } else { "fp8" };
     match engine.kv_pool_info() {
         Some((pages, _, per, bytes)) => {
-            println!("[kv] paged ({kv_fmt}): {} concurrent sequences share {} pages x {} positions ({:.2} GiB, {} positions); any sequence up to {} ctx",
-                lanes.max(1), pages, per, (pages * bytes) as f64 / (1u64 << 30) as f64, pages * per, s.max_ctx);
+            println!(
+                "[kv] unified paged ({kv_fmt}): {} lane(s) share {} single-layer pages x {} pos ({:.2} GiB, all 40 local + 8 global + DFlash2); any seq up to {} ctx",
+                lanes.max(1),
+                pages,
+                per,
+                (pages * bytes) as f64 / (1u64 << 30) as f64,
+                s.max_ctx
+            );
         }
         None if extra_lanes > 0 => println!("[lanes] ({kv_fmt}) {} concurrent sequences (lane 0: {} ctx, lanes 1..: {} ctx)", lanes, s.max_ctx, lane_ctx),
         None => {}
@@ -565,11 +576,11 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
         if max_p > init_p {
             engine.configure_elastic_kv(init_p, max_p);
             println!(
-                "[kv-elastic] enabled: starts at {} pages ({}K), grows on demand up to {} pages ({}K) by borrowing NVFP4 slots",
+                "[kv-elastic] enabled: starts at {} pages ({:.0} MiB), grows on demand up to {} pages ({:.0} MiB) by borrowing NVFP4 slots",
                 init_p,
-                (init_p * page) / 1024,
+                (init_p * single_page_bytes) as f64 / (1u64 << 20) as f64,
                 max_p,
-                (max_p * page) / 1024
+                (max_p * single_page_bytes) as f64 / (1u64 << 20) as f64
             );
         }
     }

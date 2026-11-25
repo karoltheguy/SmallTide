@@ -878,12 +878,13 @@ pub trait ComputeBackend: Send + Sync {
         Err(crate::SmallTideError::Unsupported("dspark_qk_norm_rope".into()))
     }
 
-    /// DFlash 2 grouped Split-K FP8 sliding-window attention (`rows == nblk == 8`, `nh == 4 * nkv`).
+    /// DFlash 2 grouped Split-K FP8/K8V4 sliding-window attention (`rows == nblk == 8`, `nh == 4 * nkv`).
     #[allow(clippy::too_many_arguments)]
     fn dflash2_attn_fp8(&self, _out: DeviceBuf, _part_o: DeviceBuf, _part_m: DeviceBuf, _part_l: DeviceBuf,
         _q: DeviceBuf, _kb: DeviceBuf, _vb: DeviceBuf, _kc: DeviceBuf, _ks: DeviceBuf,
         _vc: DeviceBuf, _vs: DeviceBuf, _rows: usize, _p: usize, _window: usize, _ring: usize,
-        _nh: usize, _nkv: usize, _nblk: usize, _scale: f32, _stream: Stream) -> Result<()> {
+        _nh: usize, _nkv: usize, _nblk: usize, _scale: f32, _v_q4: bool, _page_table: Option<DeviceBuf>,
+        _stream: Stream) -> Result<()> {
         Err(crate::SmallTideError::Unsupported("dflash2_attn_fp8".into()))
     }
 

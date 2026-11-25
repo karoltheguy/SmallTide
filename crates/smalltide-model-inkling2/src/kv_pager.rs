@@ -1,52 +1,165 @@
-//! Paged global KV: every sequence's global-attention caches live in one fixed pool of pages
-//! shared by all lanes (TideLM's paged KV; there through CUDA virtual memory, here through page
-//! tables the attention kernels read - HIP virtual memory is not usable on the Windows driver).
+//! Unified Hybrid Paged KV pool: every sequence's target local sliding-window layers (40),
+//! target global-attention layers (8), and DFlash 2 sliding-window layers (5) share ONE single
+//! physical pool of single-layer pages (`PAGE_POS = 256` positions per page, matching
+//! `KV_PAGE_SHIFT = 8` in the HIP kernels).
 //!
-//! The pool holds `PAGE_POS` positions a page of every global buffer (8 layers x K, V and their
-//! scales); a lane owns the pages its sequence reaches, listed in its device page table
-//! (`kv_phys` in the kernels maps a position through it). The pool's VRAM never changes: a long
-//! conversation takes pages other lanes are not using and never evicts experts; no lane is
-//! special - any may grow to the full context while the pool has pages.
-//!
-//! `ensure` gives a lane pages up to a step's end before the step's device work (the table upload
-//! is stream-ordered on the compute stream); an empty pool reclaims every page of an idle
-//! (unpinned) lane, whose conversation then lives on in the prefix cache's host snapshot.
-//! `release` returns a lane's pages past a position (reset, restore to a shorter prefix).
+//! Why unified?
+//! - All 53 layers (40 local + 8 global + 5 DFlash 2) have identical KV head geometry (`8 x 128`).
+//! - Idle lanes hold 0 physical pages (0 bytes of KV VRAM), so raising `SMALLTIDE_LANES` (e.g. to
+//!   4 or 8 true parallel lanes) costs no extra upfront VRAM when fewer requests are active.
+//! - Local sliding-window layers (`window = 1024`) evict expired pages back to the shared pool as
+//!   the sequence advances (during prefill, layer-by-layer so peak temporary prefill overhead is
+//!   only ~4 single-layer pages / ~1.7 MiB across all 40 layers).
+//! - Elastic KV grows/shrinks just 4 contiguous buffers `(k, ks, v, vs)` on demand by trading
+//!   VRAM with tail NVFP4 expert slots.
 
 use smalltide_core::{ComputeBackend, DeviceBuf, PinnedBuf, Result, Stream};
 
-/// Positions a page covers (must match `KV_PAGE_SHIFT` in the kernels).
-pub const PAGE_POS: usize = 2048;
+/// Positions a single-layer physical page covers (must match `KV_PAGE_SHIFT = 8` in `core_ops.hip`).
+pub const PAGE_POS: usize = 256;
+pub const NUM_LOCAL_LAYERS: usize = 40;
+pub const NUM_GLOBAL_LAYERS: usize = 8;
+pub const NUM_DFLASH2_LAYERS: usize = 5;
+pub const LOCAL_WINDOW: usize = 1024;
+pub const DFLASH2_WINDOW: usize = 2048;
 
-struct LanePages {
-    pages: Vec<u32>,
-    /// device page table `[max_pages]` u32 and its pinned staging copy
-    table: DeviceBuf,
-    staging: PinnedBuf,
+const STAGING_RING: usize = 4;
+
+/// Device page-table slices belonging to one lane (all sliced from 3 tiny per-lane allocations).
+#[derive(Clone)]
+pub struct LaneTables {
+    /// One `[local_ring_pages]` u32 device slice per target local layer (40).
+    pub local: Vec<DeviceBuf>,
+    /// One `[max_global_pages]` u32 device slice per target global layer (8).
+    pub global: Vec<DeviceBuf>,
+    /// One `[drafter_ring_pages]` u32 device slice per DFlash 2 layer (5).
+    pub drafter: Vec<DeviceBuf>,
+}
+
+/// Ordered list of live physical page IDs for a prefix snapshot at `pos`.
+#[derive(Clone, Debug)]
+pub struct SnapshotPages {
+    /// For each of the 40 local layers: `(logical_ring_slot, phys_page_id)` pairs.
+    pub local: Vec<Vec<(usize, u32)>>,
+    /// For each of the 8 global layers: `phys_page_id` for logical pages `0..n_global`.
+    pub global: Vec<Vec<u32>>,
+    /// For each of the 5 DFlash 2 layers (empty if not included): `(logical_ring_slot, phys_page_id)`.
+    pub drafter: Vec<Vec<(usize, u32)>>,
+}
+
+impl SnapshotPages {
+    pub fn total_pages(&self) -> usize {
+        self.local.iter().map(Vec::len).sum::<usize>()
+            + self.global.iter().map(Vec::len).sum::<usize>()
+            + self.drafter.iter().map(Vec::len).sum::<usize>()
+    }
+}
+
+struct LaneState {
+    /// `[40][local_ring_pages]`
+    local_slots: Vec<Vec<Option<u32>>>,
+    /// `[8]` contiguous `0..n_mapped`
+    global_slots: Vec<Vec<u32>>,
+    /// `[5][drafter_ring_pages]`
+    drafter_slots: Vec<Vec<Option<u32>>>,
+    local_table: DeviceBuf,
+    global_table: DeviceBuf,
+    drafter_table: DeviceBuf,
+    /// Separate 4-deep pinned staging rings per table so per-layer local uploads, global uploads,
+    /// and drafter uploads never overwrite each other's in-flight H2D staging slices.
+    local_staging: [PinnedBuf; STAGING_RING],
+    local_stage_idx: usize,
+    global_staging: [PinnedBuf; STAGING_RING],
+    global_stage_idx: usize,
+    drafter_staging: [PinnedBuf; STAGING_RING],
+    drafter_stage_idx: usize,
+}
+
+impl LaneState {
+    fn total_pages(&self) -> usize {
+        let loc: usize = self.local_slots.iter().map(|v| v.iter().filter(|x| x.is_some()).count()).sum();
+        let glob: usize = self.global_slots.iter().map(Vec::len).sum();
+        let dr: usize = self.drafter_slots.iter().map(|v| v.iter().filter(|x| x.is_some()).count()).sum();
+        loc + glob + dr
+    }
+
+    fn local_staging_buf(&mut self, advance: bool) -> PinnedBuf {
+        if advance {
+            self.local_stage_idx = (self.local_stage_idx + 1) % STAGING_RING;
+        }
+        self.local_staging[self.local_stage_idx]
+    }
+
+    fn next_global_staging(&mut self) -> PinnedBuf {
+        let buf = self.global_staging[self.global_stage_idx];
+        self.global_stage_idx = (self.global_stage_idx + 1) % STAGING_RING;
+        buf
+    }
+
+    fn next_drafter_staging(&mut self) -> PinnedBuf {
+        let buf = self.drafter_staging[self.drafter_stage_idx];
+        self.drafter_stage_idx = (self.drafter_stage_idx + 1) % STAGING_RING;
+        buf
+    }
+}
+
+/// Logical ring slots touched by position interval `[lo, hi)` (`hi > lo`) in a ring of `ring_pages` pages.
+#[inline]
+pub fn ring_logical_pages(lo: usize, hi: usize, ring_pages: usize) -> Vec<usize> {
+    if hi <= lo || ring_pages == 0 {
+        return Vec::new();
+    }
+    let first = lo / PAGE_POS;
+    let last = (hi - 1) / PAGE_POS;
+    let mut out = Vec::with_capacity((last - first + 1).min(ring_pages));
+    for abs_p in first..=last {
+        let lp = abs_p % ring_pages;
+        if !out.contains(&lp) {
+            out.push(lp);
+        }
+    }
+    out
 }
 
 pub struct KvPool {
     n_pages: usize,
     max_pages: usize,
+    max_global_pages: usize,
+    local_ring_pages: usize,
+    drafter_ring_pages: usize,
     free: Vec<u32>,
-    lanes: Vec<LanePages>,
-    /// lanes serving a request (never reclaimed)
+    lanes: Vec<LaneState>,
+    /// Lanes currently serving a request (never reclaimed when free pool runs empty).
     pub pinned: Vec<bool>,
-    /// lanes whose pages were reclaimed since the last `take_lost`
+    /// Lanes whose pages were reclaimed since the last `take_lost`.
     lost: Vec<bool>,
 }
 
 impl KvPool {
-    /// A pool of `n_pages` pages; every lane may hold up to `max_positions`.
-    pub fn new(n_pages: usize, max_positions: usize) -> Self {
+    /// Creates a unified hybrid paged KV pool of `n_pages` single-layer pages (each `PAGE_POS = 256`
+    /// positions), supporting up to `max_positions` global context per lane and `prefill_chunk`-token
+    /// prefill chunks for sliding-window layers.
+    pub fn new(n_pages: usize, max_positions: usize, prefill_chunk: usize) -> Self {
+        let max_global_pages = max_positions.div_ceil(PAGE_POS);
+        // +1 extra ring page guarantees zero logical wrap collision between oldest window token
+        // and newest prefill-chunk token even across unaligned boundaries.
+        let local_ring_pages = (LOCAL_WINDOW + prefill_chunk).div_ceil(PAGE_POS) + 1;
+        let drafter_ring_pages = (DFLASH2_WINDOW + prefill_chunk).div_ceil(PAGE_POS) + 1;
         Self {
             n_pages,
-            max_pages: max_positions.div_ceil(PAGE_POS),
+            max_pages: n_pages,
+            max_global_pages,
+            local_ring_pages,
+            drafter_ring_pages,
             free: (0..n_pages as u32).rev().collect(),
             lanes: Vec::new(),
             pinned: Vec::new(),
             lost: Vec::new(),
         }
+    }
+
+    pub fn set_max_pages(&mut self, max_pages: usize) {
+        self.max_pages = max_pages.max(self.n_pages);
     }
 
     pub fn pages_total(&self) -> usize {
@@ -57,81 +170,475 @@ impl KvPool {
         self.free.len()
     }
 
-    /// Adds a lane; returns its device page table (pass it to the kernels of its global layers).
-    pub fn add_lane<B: ComputeBackend>(&mut self, b: &B) -> Result<DeviceBuf> {
-        let table = b.alloc_device(self.max_pages * 4)?;
-        let staging = b.alloc_pinned(self.max_pages * 4)?;
-        self.lanes.push(LanePages { pages: Vec::new(), table, staging });
+    pub fn pages_used(&self) -> usize {
+        self.n_pages.saturating_sub(self.free.len())
+    }
+
+    pub fn local_ring_slots(&self) -> usize {
+        self.local_ring_pages * PAGE_POS
+    }
+
+    pub fn drafter_ring_slots(&self) -> usize {
+        self.drafter_ring_pages * PAGE_POS
+    }
+
+    pub fn local_ring_pages(&self) -> usize {
+        self.local_ring_pages
+    }
+
+    pub fn drafter_ring_pages(&self) -> usize {
+        self.drafter_ring_pages
+    }
+
+    pub fn max_global_pages(&self) -> usize {
+        self.max_global_pages
+    }
+
+    /// Adds a lane; allocates its tiny device page tables (~18 KB) and staging rings.
+    pub fn add_lane<B: ComputeBackend>(&mut self, b: &B) -> Result<LaneTables> {
+        let local_bytes = NUM_LOCAL_LAYERS * self.local_ring_pages * 4;
+        let global_bytes = NUM_GLOBAL_LAYERS * self.max_global_pages * 4;
+        let drafter_bytes = NUM_DFLASH2_LAYERS * self.drafter_ring_pages * 4;
+
+        let local_table = b.alloc_device(local_bytes)?;
+        let global_table = b.alloc_device(global_bytes)?;
+        let drafter_table = b.alloc_device(drafter_bytes)?;
+        let local_staging = [
+            b.alloc_pinned(local_bytes)?,
+            b.alloc_pinned(local_bytes)?,
+            b.alloc_pinned(local_bytes)?,
+            b.alloc_pinned(local_bytes)?,
+        ];
+        let global_staging = [
+            b.alloc_pinned(global_bytes)?,
+            b.alloc_pinned(global_bytes)?,
+            b.alloc_pinned(global_bytes)?,
+            b.alloc_pinned(global_bytes)?,
+        ];
+        let drafter_staging = [
+            b.alloc_pinned(drafter_bytes)?,
+            b.alloc_pinned(drafter_bytes)?,
+            b.alloc_pinned(drafter_bytes)?,
+            b.alloc_pinned(drafter_bytes)?,
+        ];
+
+        let tables = self.slice_lane_tables(local_table, global_table, drafter_table);
+        self.lanes.push(LaneState {
+            local_slots: vec![vec![None; self.local_ring_pages]; NUM_LOCAL_LAYERS],
+            global_slots: vec![Vec::new(); NUM_GLOBAL_LAYERS],
+            drafter_slots: vec![vec![None; self.drafter_ring_pages]; NUM_DFLASH2_LAYERS],
+            local_table,
+            global_table,
+            drafter_table,
+            local_staging,
+            local_stage_idx: 0,
+            global_staging,
+            global_stage_idx: 0,
+            drafter_staging,
+            drafter_stage_idx: 0,
+        });
         self.pinned.push(false);
         self.lost.push(false);
-        Ok(table)
+        Ok(tables)
     }
 
-    pub fn lane_pages(&self, lane: usize) -> &[u32] {
-        &self.lanes[lane].pages
+    pub fn lane_tables(&self, lane: usize) -> LaneTables {
+        let l = &self.lanes[lane];
+        self.slice_lane_tables(l.local_table, l.global_table, l.drafter_table)
     }
 
-    /// Gives `lane` pages up to position `end` (exclusive), reclaiming an idle lane when the pool
-    /// is empty; the new table is uploaded on `stream`. False when it cannot.
-    pub fn ensure<B: ComputeBackend>(&mut self, b: &B, lane: usize, end: usize, stream: Stream) -> Result<bool> {
+    fn slice_lane_tables(&self, local_table: DeviceBuf, global_table: DeviceBuf, drafter_table: DeviceBuf) -> LaneTables {
+        let l_stride = self.local_ring_pages * 4;
+        let g_stride = self.max_global_pages * 4;
+        let d_stride = self.drafter_ring_pages * 4;
+        LaneTables {
+            local: (0..NUM_LOCAL_LAYERS).map(|i| local_table.slice(i * l_stride, l_stride)).collect(),
+            global: (0..NUM_GLOBAL_LAYERS).map(|i| global_table.slice(i * g_stride, g_stride)).collect(),
+            drafter: (0..NUM_DFLASH2_LAYERS).map(|i| drafter_table.slice(i * d_stride, d_stride)).collect(),
+        }
+    }
+
+    /// Global layer `gi` page IDs for `lane`.
+    pub fn lane_global_pages(&self, lane: usize, gi: usize) -> &[u32] {
+        &self.lanes[lane].global_slots[gi]
+    }
+
+    /// Allocates one physical page (lowest free ID so Elastic KV shrinks cleanly), reclaiming
+    /// the unpinned idle lane holding the most pages if `free` is empty.
+    fn alloc_page(&mut self, exclude_lane: usize) -> Option<u32> {
+        if self.free.is_empty() {
+            let victim = (0..self.lanes.len())
+                .filter(|&l| l != exclude_lane && !self.pinned[l] && self.lanes[l].total_pages() > 0)
+                .max_by_key(|&l| self.lanes[l].total_pages());
+            let v = victim?;
+            self.free_lane_all_internal(v);
+            self.lost[v] = true;
+        }
+        let min_pos = self
+            .free
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &p)| p)
+            .map(|(i, _)| i)?;
+        Some(self.free.swap_remove(min_pos))
+    }
+
+    fn free_lane_all_internal(&mut self, lane: usize) {
+        let st = &mut self.lanes[lane];
+        for layer in &mut st.local_slots {
+            for slot in layer.iter_mut() {
+                if let Some(p) = slot.take() {
+                    self.free.push(p);
+                }
+            }
+        }
+        for layer in &mut st.global_slots {
+            for p in layer.drain(..).rev() {
+                self.free.push(p);
+            }
+        }
+        for layer in &mut st.drafter_slots {
+            for slot in layer.iter_mut() {
+                if let Some(p) = slot.take() {
+                    self.free.push(p);
+                }
+            }
+        }
+    }
+
+    /// Counts how many additional physical pages are needed for `lane` to cover:
+    /// - global `[0, global_end)` (if `global_end > 0`)
+    /// - local ring `[local_lo, local_hi)` (across `local_layers` count, e.g. 1 or 40)
+    /// - drafter ring `[drafter_lo, drafter_hi)` (across `drafter_layers` count, e.g. 0, 1, or 5)
+    pub fn missing_pages(
+        &self,
+        lane: usize,
+        global_end: usize,
+        local_range: Option<(usize, usize, Option<usize>)>,
+        drafter_range: Option<(usize, usize, Option<usize>)>,
+    ) -> usize {
+        let st = &self.lanes[lane];
+        let mut need = 0usize;
+        if global_end > 0 {
+            let g_need = global_end.div_ceil(PAGE_POS).min(self.max_global_pages);
+            for gi in 0..NUM_GLOBAL_LAYERS {
+                need += g_need.saturating_sub(st.global_slots[gi].len());
+            }
+        }
+        if let Some((lo, hi, single_layer)) = local_range {
+            let lps = ring_logical_pages(lo, hi, self.local_ring_pages);
+            let layers = match single_layer {
+                Some(li) => li..li + 1,
+                None => 0..NUM_LOCAL_LAYERS,
+            };
+            for li in layers {
+                for &lp in &lps {
+                    if st.local_slots[li][lp].is_none() {
+                        need += 1;
+                    }
+                }
+            }
+        }
+        if let Some((lo, hi, single_layer)) = drafter_range {
+            let lps = ring_logical_pages(lo, hi, self.drafter_ring_pages);
+            let layers = match single_layer {
+                Some(di) => di..di + 1,
+                None => 0..NUM_DFLASH2_LAYERS,
+            };
+            for di in layers {
+                for &lp in &lps {
+                    if st.drafter_slots[di][lp].is_none() {
+                        need += 1;
+                    }
+                }
+            }
+        }
+        need
+    }
+
+    /// Ensures all 8 global layers of `lane` have pages covering `[0, end)`.
+    pub fn ensure_global<B: ComputeBackend>(&mut self, b: &B, lane: usize, end: usize, stream: Stream) -> Result<bool> {
         let need = end.div_ceil(PAGE_POS);
-        if need > self.max_pages {
+        if need > self.max_global_pages {
             return Ok(false);
         }
-        let had = self.lanes[lane].pages.len();
-        while self.lanes[lane].pages.len() < need {
-            if self.free.is_empty() {
-                // the idle lane holding the most pages gives them all back
-                let victim = (0..self.lanes.len())
-                    .filter(|&l| l != lane && !self.pinned[l] && !self.lanes[l].pages.is_empty())
-                    .max_by_key(|&l| self.lanes[l].pages.len());
-                let Some(v) = victim else {
-                    self.upload(b, lane, had, stream)?;
+        let had = self.lanes[lane].global_slots[0].len();
+        if had >= need {
+            return Ok(true);
+        }
+        // Check/allocate layer by layer; if out of pages, leave already-allocated pages uploaded cleanly.
+        let mut changed = false;
+        for gi in 0..NUM_GLOBAL_LAYERS {
+            while self.lanes[lane].global_slots[gi].len() < need {
+                let Some(p) = self.alloc_page(lane) else {
+                    if changed {
+                        self.upload_global(b, lane, stream)?;
+                    }
                     return Ok(false);
                 };
-                let taken = std::mem::take(&mut self.lanes[v].pages);
-                self.free.extend(taken.into_iter().rev());
-                self.lost[v] = true;
+                self.lanes[lane].global_slots[gi].push(p);
+                changed = true;
             }
-            // Prefer the lowest free page ID so short sequences stay packed in 0..initial_pages,
-            // allowing elastic KV to shrink back cleanly once long sequences finish.
-            let min_pos = self
-                .free
-                .iter()
-                .enumerate()
-                .min_by_key(|&(_, &p)| p)
-                .map(|(i, _)| i)
-                .expect("a free page");
-            let page = self.free.swap_remove(min_pos);
-            self.lanes[lane].pages.push(page);
         }
-        self.upload(b, lane, had, stream)?;
+        if changed {
+            self.upload_global(b, lane, stream)?;
+        }
         Ok(true)
     }
 
-    /// Uploads `lane`'s table entries from `from` on (stream-ordered: later kernels see them).
-    fn upload<B: ComputeBackend>(&mut self, b: &B, lane: usize, from: usize, stream: Stream) -> Result<()> {
-        let l = &self.lanes[lane];
-        let n = l.pages.len();
-        if n <= from {
-            return Ok(());
-        }
+    fn upload_global<B: ComputeBackend>(&mut self, b: &B, lane: usize, stream: Stream) -> Result<()> {
+        let stride = self.max_global_pages;
+        let bytes = NUM_GLOBAL_LAYERS * stride * 4;
+        let st = &mut self.lanes[lane];
+        let stage = st.next_global_staging();
+        let dev = st.global_table;
         unsafe {
-            let dst = b.pinned_as_mut_slice(l.staging)?;
-            for (i, &p) in l.pages.iter().enumerate().skip(from) {
-                dst[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+            let dst = b.pinned_as_mut_slice(stage)?;
+            for (gi, pages) in st.global_slots.iter().enumerate() {
+                let base = gi * stride;
+                for (i, &p) in pages.iter().enumerate() {
+                    let off = (base + i) * 4;
+                    dst[off..off + 4].copy_from_slice(&p.to_le_bytes());
+                }
             }
         }
-        b.memcpy_h2d_async(l.table, from * 4, l.staging, from * 4, (n - from) * 4, stream)
+        b.memcpy_h2d_async(dev, 0, stage, 0, bytes, stream)
     }
 
-    /// Returns `lane`'s pages past position `keep` to the pool.
-    pub fn release(&mut self, lane: usize, keep: usize) {
-        let keep_pages = keep.div_ceil(PAGE_POS);
-        while self.lanes[lane].pages.len() > keep_pages {
-            let p = self.lanes[lane].pages.pop().unwrap();
-            self.free.push(p);
+    /// Ensures physical pages exist for local layer `li` (or all 40 if `li.is_none()`) covering `[lo, hi)`.
+    pub fn ensure_local<B: ComputeBackend>(
+        &mut self,
+        b: &B,
+        lane: usize,
+        single_layer: Option<usize>,
+        lo: usize,
+        hi: usize,
+        stream: Stream,
+    ) -> Result<bool> {
+        let lps = ring_logical_pages(lo, hi, self.local_ring_pages);
+        if lps.is_empty() {
+            return Ok(true);
         }
+        let layers = match single_layer {
+            Some(li) => li..li + 1,
+            None => 0..NUM_LOCAL_LAYERS,
+        };
+        let mut changed = false;
+        for li in layers.clone() {
+            for &lp in &lps {
+                if self.lanes[lane].local_slots[li][lp].is_none() {
+                    let Some(p) = self.alloc_page(lane) else {
+                        if changed {
+                            self.upload_local(b, lane, single_layer, stream)?;
+                        }
+                        return Ok(false);
+                    };
+                    self.lanes[lane].local_slots[li][lp] = Some(p);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.upload_local(b, lane, single_layer, stream)?;
+        }
+        Ok(true)
+    }
+
+    fn upload_local<B: ComputeBackend>(
+        &mut self,
+        b: &B,
+        lane: usize,
+        single_layer: Option<usize>,
+        stream: Stream,
+    ) -> Result<()> {
+        let rp = self.local_ring_pages;
+        let st = &mut self.lanes[lane];
+        // Advance the 4-deep ring when uploading all 40 layers or starting layer 0 of a chunk;
+        // layers 1..39 write to disjoint byte offsets in the same staging buffer.
+        let advance = matches!(single_layer, None | Some(0));
+        let stage = st.local_staging_buf(advance);
+        let dev = st.local_table;
+        let (byte_off, byte_len, range) = match single_layer {
+            Some(li) => (li * rp * 4, rp * 4, li..li + 1),
+            None => (0, NUM_LOCAL_LAYERS * rp * 4, 0..NUM_LOCAL_LAYERS),
+        };
+        unsafe {
+            let dst = b.pinned_as_mut_slice(stage)?;
+            for li in range {
+                let base = li * rp;
+                for (lp, opt) in st.local_slots[li].iter().enumerate() {
+                    let v = opt.unwrap_or(0);
+                    let off = (base + lp) * 4;
+                    dst[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        b.memcpy_h2d_async(dev, byte_off, stage, byte_off, byte_len, stream)
+    }
+
+    /// Evicts local ring pages of `lane` (one layer or all 40) that do not overlap `[keep_lo, keep_hi)`.
+    pub fn evict_local(&mut self, lane: usize, single_layer: Option<usize>, keep_lo: usize, keep_hi: usize) {
+        let keep = ring_logical_pages(keep_lo, keep_hi, self.local_ring_pages);
+        let layers = match single_layer {
+            Some(li) => li..li + 1,
+            None => 0..NUM_LOCAL_LAYERS,
+        };
+        let st = &mut self.lanes[lane];
+        for li in layers {
+            for (lp, slot) in st.local_slots[li].iter_mut().enumerate() {
+                if !keep.contains(&lp) {
+                    if let Some(p) = slot.take() {
+                        self.free.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensures physical pages exist for DFlash 2 layer `di` (or all 5 if `None`) covering `[lo, hi)`.
+    pub fn ensure_drafter<B: ComputeBackend>(
+        &mut self,
+        b: &B,
+        lane: usize,
+        single_layer: Option<usize>,
+        lo: usize,
+        hi: usize,
+        stream: Stream,
+    ) -> Result<bool> {
+        let lps = ring_logical_pages(lo, hi, self.drafter_ring_pages);
+        if lps.is_empty() {
+            return Ok(true);
+        }
+        let layers = match single_layer {
+            Some(di) => di..di + 1,
+            None => 0..NUM_DFLASH2_LAYERS,
+        };
+        let mut changed = false;
+        for di in layers {
+            for &lp in &lps {
+                if self.lanes[lane].drafter_slots[di][lp].is_none() {
+                    let Some(p) = self.alloc_page(lane) else {
+                        if changed {
+                            self.upload_drafter(b, lane, single_layer, stream)?;
+                        }
+                        return Ok(false);
+                    };
+                    self.lanes[lane].drafter_slots[di][lp] = Some(p);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.upload_drafter(b, lane, single_layer, stream)?;
+        }
+        Ok(true)
+    }
+
+    fn upload_drafter<B: ComputeBackend>(
+        &mut self,
+        b: &B,
+        lane: usize,
+        single_layer: Option<usize>,
+        stream: Stream,
+    ) -> Result<()> {
+        let rp = self.drafter_ring_pages;
+        let st = &mut self.lanes[lane];
+        let stage = st.next_drafter_staging();
+        let dev = st.drafter_table;
+        let (byte_off, byte_len, range) = match single_layer {
+            Some(di) => (di * rp * 4, rp * 4, di..di + 1),
+            None => (0, NUM_DFLASH2_LAYERS * rp * 4, 0..NUM_DFLASH2_LAYERS),
+        };
+        unsafe {
+            let dst = b.pinned_as_mut_slice(stage)?;
+            for di in range {
+                let base = di * rp;
+                for (lp, opt) in st.drafter_slots[di].iter().enumerate() {
+                    let v = opt.unwrap_or(0);
+                    let off = (base + lp) * 4;
+                    dst[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        b.memcpy_h2d_async(dev, byte_off, stage, byte_off, byte_len, stream)
+    }
+
+    /// Evicts DFlash 2 ring pages of `lane` (one layer or all 5) outside `[keep_lo, keep_hi)`.
+    pub fn evict_drafter(&mut self, lane: usize, single_layer: Option<usize>, keep_lo: usize, keep_hi: usize) {
+        let keep = ring_logical_pages(keep_lo, keep_hi, self.drafter_ring_pages);
+        let layers = match single_layer {
+            Some(di) => di..di + 1,
+            None => 0..NUM_DFLASH2_LAYERS,
+        };
+        let st = &mut self.lanes[lane];
+        for di in layers {
+            for (lp, slot) in st.drafter_slots[di].iter_mut().enumerate() {
+                if !keep.contains(&lp) {
+                    if let Some(p) = slot.take() {
+                        self.free.push(p);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns `lane`'s pages past position `keep` to the pool (when `keep == 0`, frees every page!).
+    pub fn release(&mut self, lane: usize, keep: usize) {
+        if keep == 0 {
+            self.free_lane_all_internal(lane);
+            return;
+        }
+        let keep_global = keep.div_ceil(PAGE_POS);
+        let st = &mut self.lanes[lane];
+        for layer in &mut st.global_slots {
+            while layer.len() > keep_global {
+                if let Some(p) = layer.pop() {
+                    self.free.push(p);
+                }
+            }
+        }
+        let loc_lo = keep.saturating_sub(LOCAL_WINDOW);
+        self.evict_local(lane, None, loc_lo, keep);
+        let dr_lo = keep.saturating_sub(DFLASH2_WINDOW);
+        self.evict_drafter(lane, None, dr_lo, keep);
+    }
+
+    /// Collects the ordered list of live physical page IDs for `lane` at position `pos`
+    /// (for prefix snapshotting & restore).
+    pub fn snapshot_pages(&self, lane: usize, pos: usize, include_drafter: bool) -> SnapshotPages {
+        let st = &self.lanes[lane];
+        let loc_lps = ring_logical_pages(pos.saturating_sub(LOCAL_WINDOW), pos, self.local_ring_pages);
+        let mut local = Vec::with_capacity(NUM_LOCAL_LAYERS);
+        for li in 0..NUM_LOCAL_LAYERS {
+            let mut v = Vec::with_capacity(loc_lps.len());
+            for &lp in &loc_lps {
+                if let Some(p) = st.local_slots[li][lp] {
+                    v.push((lp, p));
+                }
+            }
+            local.push(v);
+        }
+        let g_cnt = pos.div_ceil(PAGE_POS);
+        let mut global = Vec::with_capacity(NUM_GLOBAL_LAYERS);
+        for gi in 0..NUM_GLOBAL_LAYERS {
+            let take = g_cnt.min(st.global_slots[gi].len());
+            global.push(st.global_slots[gi][..take].to_vec());
+        }
+        let mut drafter = Vec::new();
+        if include_drafter {
+            let dr_lps = ring_logical_pages(pos.saturating_sub(DFLASH2_WINDOW), pos, self.drafter_ring_pages);
+            drafter.reserve(NUM_DFLASH2_LAYERS);
+            for di in 0..NUM_DFLASH2_LAYERS {
+                let mut v = Vec::with_capacity(dr_lps.len());
+                for &lp in &dr_lps {
+                    if let Some(p) = st.drafter_slots[di][lp] {
+                        v.push((lp, p));
+                    }
+                }
+                drafter.push(v);
+            }
+        }
+        SnapshotPages { local, global, drafter }
     }
 
     /// Lanes whose pages were reclaimed since the last call (their device sequence is gone).
@@ -149,11 +656,21 @@ impl KvPool {
             return false;
         }
         let limit = target_pages as u32;
-        self.lanes.iter().all(|l| l.pages.iter().all(|&p| p < limit))
+        for l in &self.lanes {
+            if l.local_slots.iter().any(|v| v.iter().flatten().any(|&p| p >= limit)) {
+                return false;
+            }
+            if l.global_slots.iter().any(|v| v.iter().any(|&p| p >= limit)) {
+                return false;
+            }
+            if l.drafter_slots.iter().any(|v| v.iter().flatten().any(|&p| p >= limit)) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Resizes the pool's physical page count to `new_n_pages` (capped at `max_pages`).
-    /// On shrink, caller must ensure `can_shrink_to(new_n_pages)` is true.
     pub fn resize(&mut self, new_n_pages: usize) {
         let new_n = new_n_pages.min(self.max_pages);
         if new_n > self.n_pages {
@@ -174,36 +691,93 @@ impl KvPool {
 mod tests {
     use super::*;
 
+    fn dummy_lane(local_rp: usize, drafter_rp: usize) -> LaneState {
+        let z = DeviceBuf { id: 0, offset_bytes: 0, size_bytes: 0 };
+        let zp = PinnedBuf { id: 0, size_bytes: 0 };
+        LaneState {
+            local_slots: vec![vec![None; local_rp]; NUM_LOCAL_LAYERS],
+            global_slots: vec![Vec::new(); NUM_GLOBAL_LAYERS],
+            drafter_slots: vec![vec![None; drafter_rp]; NUM_DFLASH2_LAYERS],
+            local_table: z,
+            global_table: z,
+            drafter_table: z,
+            local_staging: [zp, zp, zp, zp],
+            local_stage_idx: 0,
+            global_staging: [zp, zp, zp, zp],
+            global_stage_idx: 0,
+            drafter_staging: [zp, zp, zp, zp],
+            drafter_stage_idx: 0,
+        }
+    }
+
     #[test]
-    fn elastic_grow_and_shrink_packs_low_pages() {
-        let mut p = KvPool::new(4, 16 * PAGE_POS);
-        // Simulate 2 lanes without GPU buffers by manipulating lanes directly
-        p.lanes.push(LanePages {
-            pages: vec![0, 1, 2, 3],
-            table: DeviceBuf { id: 0, offset_bytes: 0, size_bytes: 0 },
-            staging: PinnedBuf { id: 0, size_bytes: 0 },
-        });
+    fn unified_sliding_window_caps_pages_and_recycles() {
+        let mut p = KvPool::new(512, 32_768, 1024);
+        p.set_max_pages(2048);
+        p.lanes.push(dummy_lane(p.local_ring_pages, p.drafter_ring_pages));
         p.pinned.push(true);
         p.lost.push(false);
-        p.free.clear();
 
-        // Grow from 4 -> 8 pages
-        p.resize(8);
-        assert_eq!(p.pages_total(), 8);
-        assert_eq!(p.pages_free(), 4);
+        // Advance lane 0 through 10,000 tokens in 1024-token chunks: per-layer prefill borrow + evict.
+        for chunk_idx in 0usize..10 {
+            let pos0 = chunk_idx * 1024;
+            let hi = pos0 + 1024;
+            let lo = pos0.saturating_sub(LOCAL_WINDOW - 1);
+            for li in 0..NUM_LOCAL_LAYERS {
+                let lps = ring_logical_pages(lo, hi, p.local_ring_pages);
+                for lp in lps {
+                    if p.lanes[0].local_slots[li][lp].is_none() {
+                        let pg = p.alloc_page(0).expect("page");
+                        p.lanes[0].local_slots[li][lp] = Some(pg);
+                    }
+                }
+                p.evict_local(0, Some(li), hi.saturating_sub(LOCAL_WINDOW), hi);
+            }
+        }
+        // After 10,240 tokens, each of the 40 local layers holds exactly 4 pages (1024 / 256) = 160 pages total!
+        assert_eq!(p.lanes[0].total_pages(), NUM_LOCAL_LAYERS * 4);
+        assert_eq!(p.pages_used(), NUM_LOCAL_LAYERS * 4);
 
-        // Allocate high pages 4, 5
-        p.lanes[0].pages.push(4);
-        p.lanes[0].pages.push(5);
-        p.free.retain(|&x| x != 4 && x != 5);
-        assert!(!p.can_shrink_to(4));
+        // Reset lane to 0 -> 0 pages held!
+        p.release(0, 0);
+        assert_eq!(p.lanes[0].total_pages(), 0);
+        assert_eq!(p.pages_free(), 512);
+    }
 
-        // Release back to 2 pages (0, 1) -> pages 2,3,4,5 freed
-        p.release(0, 2 * PAGE_POS);
-        assert!(p.can_shrink_to(4));
-        p.resize(4);
-        assert_eq!(p.pages_total(), 4);
-        assert_eq!(p.pages_free(), 2);
-        assert!(p.free.iter().all(|&x| x < 4));
+    #[test]
+    fn elastic_grow_and_shrink_packs_low_pages() {
+        let mut p = KvPool::new(64, 32_768, 1024);
+        p.set_max_pages(256);
+        p.lanes.push(dummy_lane(p.local_ring_pages, p.drafter_ring_pages));
+        p.pinned.push(true);
+        p.lost.push(false);
+
+        // Allocate 8 global layers x 8 pages = 64 pages (fills initial pool).
+        for gi in 0..NUM_GLOBAL_LAYERS {
+            for _ in 0..8 {
+                let pg = p.alloc_page(0).unwrap();
+                p.lanes[0].global_slots[gi].push(pg);
+            }
+        }
+        assert_eq!(p.pages_free(), 0);
+
+        // Grow 64 -> 128 pages, allocate 16 more global pages (pages 64..80).
+        p.resize(128);
+        assert_eq!(p.pages_total(), 128);
+        for gi in 0..NUM_GLOBAL_LAYERS {
+            for _ in 0..2 {
+                let pg = p.alloc_page(0).unwrap();
+                p.lanes[0].global_slots[gi].push(pg);
+            }
+        }
+        assert!(!p.can_shrink_to(64));
+
+        // Release back to 4 global pages (1024 tokens) -> high pages freed, shrink succeeds!
+        p.release(0, 4 * PAGE_POS);
+        assert!(p.can_shrink_to(64));
+        p.resize(64);
+        assert_eq!(p.pages_total(), 64);
+        assert_eq!(p.pages_free(), 32);
+        assert!(p.free.iter().all(|&x| x < 64));
     }
 }

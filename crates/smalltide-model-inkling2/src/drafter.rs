@@ -423,8 +423,12 @@ impl<B: ComputeBackend> DSparkDrafter<B> {
     }
 
     /// Context K/V of `m` committed rows at positions `pos0..` from their taps
-    /// (`taps` = `[4][tap_stride][D]`, rows from 0).
+    /// (`taps` = `[4][tap_stride][D]`, starting at row `row_off`).
     pub fn ingest(&self, taps: DeviceBuf, tap_stride: usize, pos0: usize, m: usize, s: Stream) -> Result<()> {
+        self.ingest_at_row(taps, tap_stride, 0, pos0, m, s)
+    }
+
+    pub fn ingest_at_row(&self, taps: DeviceBuf, tap_stride: usize, row_off: usize, pos0: usize, m: usize, s: Stream) -> Result<()> {
         if m == 0 {
             return Ok(());
         }
@@ -434,8 +438,10 @@ impl<B: ComputeBackend> DSparkDrafter<B> {
         let b = self.backend.as_ref();
         let sc = &self.sc;
         let kvd = HK * HD;
+        let toff = row_off * D * 4;
+        let taps_shifted = if toff > 0 { taps.slice(toff, taps.size_bytes - toff) } else { taps };
         for (l, ly) in self.layers.iter().enumerate() {
-            b.dspark_mix_rms(sc.ctx_c, taps, tap_stride, self.alpha[l], ly.dflare, m, D, EPS, s)?;
+            b.dspark_mix_rms(sc.ctx_c, taps_shifted, tap_stride, self.alpha[l], ly.dflare, m, D, EPS, s)?;
             if m <= 8 {
                 let segs = [
                     GemvSegment { w: ly.k_ctx.data, row_scales: Some(ly.k_ctx.row_scales), x: sc.ctx_c, y: sc.ctx_k, n_rows: kvd, k_cols: D },
@@ -649,10 +655,41 @@ impl<B: ComputeBackend> Drafter<B> {
         max_seq: usize,
         chunk: usize,
         lanes: usize,
+        paged: bool,
     ) -> Result<Self> {
         Ok(Self::DFlash2(crate::dflash2::DFlash2Drafter::load(
-            backend, path, dense, vocab, max_seq, chunk, lanes,
+            backend, path, dense, vocab, max_seq, chunk, lanes, paged,
         )?))
+    }
+
+    pub fn is_dflash2_paged(&self) -> bool {
+        matches!(self, Self::DFlash2(d) if d.is_paged())
+    }
+
+    pub fn bind_dflash2_kv_pool(
+        &mut self,
+        k: DeviceBuf,
+        ks: DeviceBuf,
+        v: DeviceBuf,
+        vs: DeviceBuf,
+        v_q4: bool,
+        ring_slots: usize,
+    ) {
+        if let Self::DFlash2(d) = self {
+            d.bind_kv_pool(k, ks, v, vs, v_q4, ring_slots);
+        }
+    }
+
+    pub fn set_lane_unified(
+        &mut self,
+        lane: usize,
+        drafter_tables: Option<&[DeviceBuf]>,
+        dspark_global_table: Option<DeviceBuf>,
+    ) {
+        match self {
+            Self::DSpark(d) => d.set_lane(lane, dspark_global_table),
+            Self::DFlash2(d) => d.set_lane(lane, drafter_tables),
+        }
     }
 
     pub fn vram_bytes(&self) -> usize {
@@ -672,7 +709,7 @@ impl<B: ComputeBackend> Drafter<B> {
     pub fn set_lane(&mut self, lane: usize, page_table: Option<DeviceBuf>) {
         match self {
             Self::DSpark(d) => d.set_lane(lane, page_table),
-            Self::DFlash2(d) => d.set_lane(lane, page_table),
+            Self::DFlash2(d) => d.set_lane(lane, None),
         }
     }
 
@@ -698,9 +735,13 @@ impl<B: ComputeBackend> Drafter<B> {
     }
 
     pub fn ingest(&self, taps: DeviceBuf, tap_stride: usize, pos0: usize, m: usize, s: Stream) -> Result<()> {
+        self.ingest_at_row(taps, tap_stride, 0, pos0, m, s)
+    }
+
+    pub fn ingest_at_row(&self, taps: DeviceBuf, tap_stride: usize, row_off: usize, pos0: usize, m: usize, s: Stream) -> Result<()> {
         match self {
-            Self::DSpark(d) => d.ingest(taps, tap_stride, pos0, m, s),
-            Self::DFlash2(d) => d.ingest(taps, tap_stride, pos0, m, s),
+            Self::DSpark(d) => d.ingest_at_row(taps, tap_stride, row_off, pos0, m, s),
+            Self::DFlash2(d) => d.ingest_at_row(taps, tap_stride, row_off, pos0, m, s),
         }
     }
 
@@ -760,6 +801,30 @@ impl<B: ComputeBackend> Drafter<B> {
                 .map(|(token, margin)| DraftProposal { token, margin, q_dist: None })
                 .collect()),
             Self::DFlash2(d) => d.draft_proposals(dense, anchor, p, n, temperature, rng, s),
+        }
+    }
+
+    /// Batched multi-lane drafting (DFlash 2): reads DFlash 2 weights & unembed ONCE across all
+    /// concurrent lanes using caller-provided scratch (`pf.blocks` + `batch_logits`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft_proposals_batch(
+        &mut self,
+        dense: &Inkling2DenseGpu<B>,
+        reqs: &[crate::dflash2::DraftLaneReq],
+        lane_tables: &[Option<Vec<DeviceBuf>>],
+        rngs: &mut [u64],
+        scratch_pool: DeviceBuf,
+        logits_buf: DeviceBuf,
+        s: Stream,
+    ) -> Result<Vec<Vec<DraftProposal>>> {
+        match self {
+            Self::DFlash2(d) => {
+                d.draft_proposals_batch(dense, reqs, lane_tables, rngs, scratch_pool, logits_buf, s)
+            }
+            Self::DSpark(_) => Err(SmallTideError::Backend {
+                backend: "drafter",
+                message: "draft_proposals_batch is only supported for DFlash 2".into(),
+            }),
         }
     }
 

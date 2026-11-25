@@ -639,6 +639,7 @@ impl TideScheduler {
         self.rescues_this_token = 0;
         self.rescues_by_zone = [0; 3];
         self.step_rescued.clear();
+        self.cache.clear_step_protected();
         self.speculative_verify = speculative && verify_rows > 1;
     }
 
@@ -1020,10 +1021,11 @@ impl TideScheduler {
         if verify_rows <= 1 {
             return base;
         }
+        let vr = verify_rows.min(16);
         [
-            if base[0] > 0 { base[0] + verify_rows / 4 } else { 0 },
-            if base[1] > 0 { base[1] + verify_rows / 4 } else { 0 },
-            if base[2] > 0 { base[2] + verify_rows / 2 } else { 0 },
+            if base[0] > 0 { base[0] + vr / 4 } else { 0 },
+            if base[1] > 0 { base[1] + vr / 4 } else { 0 },
+            if base[2] > 0 { base[2] + vr / 2 } else { 0 },
         ]
     }
 
@@ -1063,6 +1065,9 @@ impl TideScheduler {
             .map(|&e| ExpertId { layer, expert: e })
             .collect();
         self.cache.set_protected(&protect);
+        if self.model_cfg.is_loop_core_layer(layer.0 as usize) {
+            self.cache.add_step_protected(&protect);
+        }
 
         let total_weight: f32 = topk_weights.iter().sum();
         let inv_total_w = if total_weight > 1e-8 { 1.0 / total_weight } else { 1.0 };
@@ -1157,8 +1162,7 @@ impl TideScheduler {
                         self.telemetry.stage1_skipped_tail_misses += 1;
                         self.telemetry.routed_weight_skipped += norm_w as f64;
                     }
-                } else {
-                    let op = self.cache.stage_scratch_rescue(id);
+                } else if let Some(op) = self.cache.stage_scratch_rescue(id) {
                     self.record_transfer_telemetry(&op, true);
                     let scratch_slot = self.cache.entry(id).vram_slot;
                     sync_transfers.push(op);
@@ -1175,6 +1179,9 @@ impl TideScheduler {
                         *self.pending_async_ram.entry(id).or_insert(0.0) += norm_w;
                     }
                     *self.pending_async_vram.entry(id).or_insert(0.0) += norm_w;
+                } else {
+                    self.telemetry.stage1_skipped_tail_misses += 1;
+                    self.telemetry.routed_weight_skipped += norm_w as f64;
                 }
                 if rescued_ok {
                     self.step_rescued.push(id);
@@ -1259,6 +1266,9 @@ impl TideScheduler {
             }
         }
         self.cache.set_protected(&protect);
+        if self.model_cfg.is_loop_core_layer(layer.0 as usize) {
+            self.cache.add_step_protected(&protect);
+        }
 
         for &id in &protect {
             let entry = self.cache.entry(id);
@@ -1325,8 +1335,6 @@ impl TideScheduler {
                 let rem_budget = zone_cap.saturating_sub(self.rescues_by_zone[zone]);
                 let take = max_per_layer.min(rem_budget);
                 for (id, max_share, _sum_share) in miss_stats.into_iter().take(take) {
-                    self.rescues_this_token += 1;
-                    self.rescues_by_zone[zone] += 1;
                     self.event_share = max_share;
                     let mut rescued_ok = false;
                     if self.cache.should_promote_instead_of_scratch(id) {
@@ -1337,8 +1345,7 @@ impl TideScheduler {
                             rescued.push(id);
                             rescued_ok = true;
                         }
-                    } else {
-                        let op = self.cache.stage_scratch_rescue(id);
+                    } else if let Some(op) = self.cache.stage_scratch_rescue(id) {
                         self.record_transfer_telemetry(&op, true);
                         sync_transfers.push(op);
                         rescued.push(id);
@@ -1349,6 +1356,8 @@ impl TideScheduler {
                         *self.pending_async_vram.entry(id).or_insert(0.0) += max_share;
                     }
                     if rescued_ok {
+                        self.rescues_this_token += 1;
+                        self.rescues_by_zone[zone] += 1;
                         self.step_rescued.push(id);
                     }
                     if rescued_ok && !self.rescue_tracker.step_is_prefill {
@@ -2098,6 +2107,70 @@ mod tests {
         let (_, _, rescued) = sched.plan_verify_layer_dispatch(PhysicalLayerId(21), &rows_ids, &rows_ws);
         assert_eq!(rescued.len(), 4);
         assert!(rescued.contains(&eid(21, 10)));
+    }
+
+    #[test]
+    fn test_scratch_rescue_never_unloads_protected_in_use_expert() {
+        let model_cfg = Inkling2Config::default();
+        let mut tide_cfg = TideConfig::default();
+        tide_cfg.rescue_policy = RescuePolicy::Threshold(0.10);
+        let mut sched = TideScheduler::new(model_cfg, tide_cfg, 16 * GIB, 16 * GIB);
+        // Tiny 2-slot MXFP8 scratch ring + 1 resident slot (expert 0).
+        sched.cache.configure_scratch_rings(16, 1, 2, 2);
+        let _ = sched.plan_pre_prefill(None);
+        sched.cache.publish_all_pending();
+        // Pre-populate both scratch slots with experts 20:10 and 20:11 (still in VRAM).
+        assert!(sched.cache.stage_scratch_rescue(eid(20, 10)).is_some());
+        assert!(sched.cache.stage_scratch_rescue(eid(20, 11)).is_some());
+        sched.cache.publish_all_pending();
+        sched.cache.clear_protected();
+
+        sched.set_auto_gate(AutoGate { enabled: true, ..AutoGate::default() });
+        sched.rescue_zone_budgets = Some([8, 8, 8]);
+        sched.begin_verify_step_kind(2, true);
+        // Row 0 (lane 0) routes to scratch experts 10 & 11 (in VRAM); Row 1 (lane 1) misses 12 & 13.
+        // Because BOTH scratch slots are in use by Row 0, rescuing 12 or 13 MUST NOT unload 10 or 11!
+        let rows_ids = [
+            [10, 11, 0, 0, 0, 0, 0, 0],
+            [12, 13, 0, 0, 0, 0, 0, 0],
+        ];
+        let rows_ws = [
+            [0.40, 0.40, 0.05, 0.05, 0.025, 0.025, 0.025, 0.025],
+            [0.40, 0.40, 0.05, 0.05, 0.025, 0.025, 0.025, 0.025],
+        ];
+        let (ops, _, rescued) = sched.plan_verify_layer_dispatch(PhysicalLayerId(20), &rows_ids, &rows_ws);
+        assert!(ops.is_empty(), "must not overwrite protected scratch slots: {ops:?}");
+        assert!(rescued.is_empty());
+        assert!(sched.cache.is_vram_hit(eid(20, 10)), "in-use scratch expert 10 was unloaded!");
+        assert!(sched.cache.is_vram_hit(eid(20, 11)), "in-use scratch expert 11 was unloaded!");
+    }
+
+    #[test]
+    fn test_eviction_prefers_inactive_expert_over_active_lane_expert() {
+        let model_cfg = Inkling2Config::default();
+        let tide_cfg = TideConfig::default();
+        let mut sched = TideScheduler::new(model_cfg, tide_cfg, 16 * GIB, 16 * GIB);
+        // 2 MXFP8 resident slots: experts 20:0 and 20:1.
+        sched.cache.configure_scratch_rings(16, 2, 4, 4);
+        sched.cache.promote_to_vram(eid(20, 0), false, true);
+        sched.cache.promote_to_vram(eid(20, 1), false, true);
+        sched.cache.publish_all_pending();
+
+        // Give expert 20:1 slightly higher heat from a finished lane 1, while active lane 0 uses 20:0.
+        sched.cache.set_current_lane(1);
+        sched.cache.set_lane_active(1, false);
+        sched.cache.touch_expert(eid(20, 1), 2.0);
+        sched.cache.set_current_lane(0);
+        sched.cache.set_lane_active(0, true);
+        sched.cache.touch_expert(eid(20, 0), 0.5);
+
+        // Promoting 20:2 must evict inactive expert 20:1, keeping active lane 0's expert 20:0 in VRAM!
+        let op = sched.cache.promote_to_vram(eid(20, 2), false, true).expect("promote 20:2");
+        assert!(
+            matches!(op, TransferOp::DiskToVramDirect { evicted_from_vram: Some(v), .. } | TransferOp::RamToVram { evicted_from_vram: Some(v), .. } if v == eid(20, 1)),
+            "expected inactive expert 20:1 to be evicted before active-lane expert 20:0, got {op:?}"
+        );
+        assert!(sched.cache.is_vram_hit(eid(20, 0)), "active-lane expert 20:0 must remain resident!");
     }
 
     #[test]

@@ -781,6 +781,8 @@ fn engine_worker_loop(
     let mut spec_obs_ema = 2.0f64;
     let mut spec_draft_ema = 3.0f64;
     let mut spec_vbase_ema = 16.0f64;
+    let batch_spec = std::env::var("SMALLTIDE_BATCH_SPEC").map(|v| v != "0").unwrap_or(true);
+    let mut batch_spec_rr: usize = 0;
 
     loop {
         // 1. Commands: block only when there is nothing to do.
@@ -1118,6 +1120,249 @@ fn engine_worker_loop(
             pc.invalidate(l);
         }
         let act: Vec<usize> = (0..n_lanes).filter(|&l| active[l].is_some()).collect();
+        // Multi-lane Batched Speculative Verify: run all active lanes together in one shared
+        // forward pass (up to 8 total rows, e.g. 2x4, 3x[3,3,2], 4x2), sharing every dense weight
+        // read, MoE expert read, and rescued expert across concurrent users.
+        if act.len() >= 2
+            && act.len() <= smalltide_model_inkling2::engine::MAX_BATCH_ROWS
+            && batch_decode
+            && batch_spec
+            && drafter_per_lane
+            && engine.drafter_is_dflash2()
+            && act.iter().any(|&l| {
+                let r = active[l].as_ref().unwrap();
+                drafter_pos[l] == Some(r.pos) && r.pos + 2 <= engine.lane_max_seq(l)
+            })
+        {
+            let k = act.len();
+            let mut widths = vec![1usize; k];
+            let mut budget = smalltide_model_inkling2::engine::MAX_BATCH_ROWS - k;
+            let spec_indices: Vec<usize> = (0..k)
+                .filter(|&i| {
+                    let l = act[i];
+                    let r = active[l].as_ref().unwrap();
+                    drafter_pos[l] == Some(r.pos) && r.pos + 2 <= engine.lane_max_seq(l)
+                })
+                .collect();
+            let max_w_cap = fixed_spec_width.unwrap_or(8).min(8);
+            let mut rr = batch_spec_rr % spec_indices.len().max(1);
+            batch_spec_rr = batch_spec_rr.wrapping_add(1);
+            while budget > 0 {
+                let mut progressed = false;
+                for step in 0..spec_indices.len() {
+                    if budget == 0 {
+                        break;
+                    }
+                    let i = spec_indices[(rr + step) % spec_indices.len()];
+                    let l = act[i];
+                    let r = active[l].as_ref().unwrap();
+                    let lane_cap = (engine.lane_max_seq(l) - r.pos).min(max_w_cap);
+                    if widths[i] < lane_cap {
+                        widths[i] += 1;
+                        budget -= 1;
+                        progressed = true;
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+                rr = (rr + 1) % spec_indices.len().max(1);
+            }
+            for i in 0..k {
+                let l = act[i];
+                let r_pos = active[l].as_ref().unwrap().pos;
+                while widths[i] >= 2 && !matches!(engine.kv_reserve(l, r_pos + widths[i]), Ok(true)) {
+                    widths[i] -= 1;
+                }
+            }
+            for lost in engine.take_lost_lanes() {
+                pc.invalidate(lost);
+            }
+
+            let td = Instant::now();
+            // Batch-draft all speculative lanes together in ONE shared weight read of DFlash 2 + unembed!
+            let mut draft_reqs: Vec<smalltide_model_inkling2::dflash2::DraftLaneReq> = Vec::with_capacity(k);
+            let mut draft_slot_for: Vec<Option<usize>> = vec![None; k];
+            for i in 0..k {
+                let l = act[i];
+                let req = active[l].as_ref().unwrap();
+                if widths[i] >= 2 && drafter_pos[l] == Some(req.pos) {
+                    let draft_temp = if req.sampling.temperature > 0.0
+                        && (req.sampling.repetition_penalty - 1.0).abs() < 1e-6
+                    {
+                        req.sampling.temperature
+                    } else {
+                        0.0
+                    };
+                    draft_slot_for[i] = Some(draft_reqs.len());
+                    draft_reqs.push(smalltide_model_inkling2::dflash2::DraftLaneReq {
+                        lane: l,
+                        anchor: req.next_tok,
+                        pos: req.pos,
+                        n_draft: widths[i] - 1,
+                        temperature: draft_temp,
+                    });
+                }
+            }
+            let batched_props = if draft_reqs.is_empty() {
+                Ok(Vec::new())
+            } else {
+                engine.draft_proposals_batch(&draft_reqs)
+            };
+            let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(k);
+            let mut q_dists: Vec<Vec<Option<Vec<(u32, f32)>>>> = Vec::with_capacity(k);
+            let mut slices: Vec<smalltide_model_inkling2::prefill::VerifySlice> = Vec::with_capacity(k);
+            let mut all_tokens: Vec<u32> = Vec::with_capacity(smalltide_model_inkling2::engine::MAX_BATCH_ROWS);
+            let mut ingest_flags: Vec<bool> = Vec::with_capacity(k);
+            let mut next_hist_row = 0usize;
+
+            let mut props_vec = match batched_props {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("[spec-batch] batched draft failed ({e}); falling back to width 1");
+                    None
+                }
+            };
+            for i in 0..k {
+                let l = act[i];
+                let (anchor, r_pos) = {
+                    let req = active[l].as_ref().unwrap();
+                    (req.next_tok, req.pos)
+                };
+                let mut block = vec![anchor];
+                let mut qd = Vec::new();
+                let mut w = widths[i];
+                let mut coherent = drafter_pos[l] == Some(r_pos);
+                if let Some(ds) = draft_slot_for[i] {
+                    if let Some(pv) = props_vec.as_mut() {
+                        for prop in std::mem::take(&mut pv[ds]) {
+                            block.push(prop.token);
+                            qd.push(prop.q_dist);
+                        }
+                    } else {
+                        w = 1;
+                        coherent = false;
+                        drafter_pos[l] = None;
+                    }
+                } else {
+                    w = 1;
+                }
+                let row_off = all_tokens.len();
+                let hist_off = if w >= 2 {
+                    let h0 = next_hist_row;
+                    next_hist_row += 3 + w;
+                    Some(h0)
+                } else {
+                    None
+                };
+                all_tokens.extend_from_slice(&block);
+                blocks.push(block);
+                q_dists.push(qd);
+                ingest_flags.push(coherent);
+                slices.push(smalltide_model_inkling2::prefill::VerifySlice {
+                    lane: l,
+                    pos0: r_pos,
+                    row_off,
+                    width: w,
+                    hist_off,
+                });
+            }
+            let dt_d = td.elapsed().as_secs_f64() * 1000.0;
+
+            let all_greedy = act.iter().all(|&l| {
+                let s = &active[l].as_ref().unwrap().sampling;
+                s.temperature <= 0.0 && (s.repetition_penalty - 1.0).abs() < 1e-6
+            });
+            let tv = Instant::now();
+            let vres: std::result::Result<Vec<(usize, u32)>, (&'static str, String)> =
+                match engine.verify_batch(&all_tokens, &slices, all_greedy) {
+                    Err(e) => Err(("verify_batch forward error", e.to_string())),
+                    Ok(()) => {
+                        let b_refs: Vec<&[u32]> = blocks.iter().map(Vec::as_slice).collect();
+                        let q_refs: Vec<&[Option<Vec<(u32, f32)>>]> = q_dists.iter().map(Vec::as_slice).collect();
+                        let p_refs: Vec<&SamplingParams> = act.iter().map(|&l| &active[l].as_ref().unwrap().sampling).collect();
+                        let r_refs: Vec<&[u32]> = act.iter().map(|&l| active[l].as_ref().unwrap().generated.as_slice()).collect();
+                        engine
+                            .verify_batch_sample(&slices, &b_refs, &q_refs, &p_refs, &r_refs)
+                            .map_err(|e| ("verify_batch sample error", e.to_string()))
+                    }
+                };
+            match vres {
+                Err((what, e)) => {
+                    for &l in &act {
+                        let req = active[l].take().unwrap();
+                        let _ = req.event_tx.send(StreamEvent::Error(engine_error(what, &e)));
+                        pc.invalidate(l);
+                        drafter_pos[l] = None;
+                        let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                        last_decode_tok_s = tps;
+                        last_req_probe = Some(probe);
+                    }
+                }
+                Ok(outcomes) => {
+                    let mut mask = 0u64;
+                    let mut keeps = Vec::with_capacity(k);
+                    for (si, &(c, _)) in outcomes.iter().enumerate() {
+                        let keep = c + 1;
+                        keeps.push(keep);
+                        for j in 0..keep {
+                            mask |= 1u64 << (slices[si].row_off + j);
+                        }
+                    }
+                    engine.commit_batch_row_mask(mask, all_tokens.len());
+                    if let Err(e) = engine.post_batch_tide_step() {
+                        let _ = engine_error("post verify_batch tide step", &e.to_string());
+                    }
+                    let rewind_res = engine.verify_batch_rewind(&slices, &keeps, &ingest_flags);
+                    let dt_v = tv.elapsed().as_secs_f64() * 1000.0;
+                    if let Err(e) = rewind_res {
+                        for &l in &act {
+                            let req = active[l].take().unwrap();
+                            let _ = req.event_tx.send(StreamEvent::Error(engine_error("verify_batch rewind error", &e.to_string())));
+                            pc.invalidate(l);
+                            drafter_pos[l] = None;
+                            let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                            last_decode_tok_s = tps;
+                            last_req_probe = Some(probe);
+                        }
+                    } else {
+                        for (si, &l) in act.iter().enumerate() {
+                            let (c, next_tok) = outcomes[si];
+                            let lane_max = engine.lane_max_seq(l);
+                            let req = active[l].as_mut().unwrap();
+                            req.t_steps = (req.t_steps.0 + 1, req.t_steps.1 + dt_d / k as f64, req.t_steps.2 + dt_v);
+                            pc.live[l].extend_from_slice(&blocks[si][..=c]);
+                            req.pos += c + 1;
+                            req.tap_row = slices[si].row_off + c;
+                            if ingest_flags[si] {
+                                drafter_pos[l] = Some(req.pos);
+                            }
+                            let mut done = false;
+                            for &t in &blocks[si][1..=c] {
+                                req.next_tok = t;
+                                if !req.accept(&tok, lane_max) {
+                                    done = true;
+                                    break;
+                                }
+                            }
+                            if !done {
+                                req.next_tok = next_tok;
+                                if !req.accept(&tok, lane_max) {
+                                    done = true;
+                                }
+                            }
+                            if done {
+                                let req = active[l].take().unwrap();
+                                let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                                last_decode_tok_s = tps;
+                                last_req_probe = Some(probe);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         if act.len() >= 2 && batch_decode {
             // A batched round feeds no drafter: these lanes' contexts fall behind.
             for &l in &act {

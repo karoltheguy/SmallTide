@@ -100,29 +100,35 @@ impl SeqSnapshot {
 /// Per-logical-layer FP8 KV cache + 4-channel causal short-convolution state (`k = 4`, history `3`).
 pub(crate) struct LogicalLayerState {
     pub(crate) _is_local: bool,
-    /// True when V cache is packed Q4_asym32 (global layers under K8/V4 mode).
+    /// Index `0..40` among target local sliding-window layers (`None` for the 8 global layers).
+    pub(crate) local_idx: Option<usize>,
+    /// True when V cache is packed Q4_asym32 (global layers, or all layers in unified K8/V4 pool).
     pub(crate) v_q4: bool,
     /// KV buffer length (ring size for local layers).
     pub(crate) max_seq: usize,
     /// Attention window (local layers; == max_seq for global layers).
     pub(crate) window: usize,
-    pub(crate) k_cache: DeviceBuf,  // [8, max_seq, 128] u8 FP8
-    pub(crate) k_scales: DeviceBuf, // [8, max_seq] f32
-    pub(crate) v_cache: DeviceBuf,  // [8, max_seq, 128] u8 FP8
-    pub(crate) v_scales: DeviceBuf, // [8, max_seq] f32
+    pub(crate) k_cache: DeviceBuf,  // [8, max_seq, 128] u8 FP8 (or unified pool)
+    pub(crate) k_scales: DeviceBuf, // [8, max_seq] f32 (or unified pool)
+    pub(crate) v_cache: DeviceBuf,  // [8, max_seq, 128/64] u8 (or unified pool)
+    pub(crate) v_scales: DeviceBuf, // [8, max_seq, 1/4] f32 (or unified pool)
     pub(crate) sconv_k: DeviceBuf,  // [3, 1024] f32
     pub(crate) sconv_v: DeviceBuf,  // [3, 1024] f32
     pub(crate) sconv_attn: DeviceBuf, // [3, 2304] f32
     pub(crate) sconv_mlp: DeviceBuf,  // [3, 2304] f32
-    /// Paged global layers: the lane's page table into the shared KV pool (`k_cache` etc. are
-    /// then the pool's buffers); `None`: the caches are this lane's own.
+    /// Paged layers: this layer's device page table into the unified KV pool (`k_cache` etc. are
+    /// then the pool's buffers); `None`: the caches are this lane's own unpaged buffers.
     pub(crate) page_table: Option<DeviceBuf>,
 }
 
-/// The shared global-KV pool: per global logical layer (K, K scales, V, V scales).
-#[derive(Clone)]
+/// The unified hybrid paged KV pool: 4 contiguous buffers shared across all 40 target local
+/// layers, 8 target global layers, and 5 DFlash 2 layers (`PAGE_POS = 256` positions per page).
+#[derive(Clone, Copy)]
 pub(crate) struct KvPoolBufs {
-    pub(crate) layers: Vec<(DeviceBuf, DeviceBuf, DeviceBuf, DeviceBuf)>,
+    pub(crate) k: DeviceBuf,
+    pub(crate) ks: DeviceBuf,
+    pub(crate) v: DeviceBuf,
+    pub(crate) vs: DeviceBuf,
 }
 
 /// Reusable activation scratch buffers in VRAM (~4 MiB total — zero per-token allocations!).
@@ -182,12 +188,12 @@ pub(crate) struct ActivationScratch {
 
 const ROUTE_WORDS: usize = 16;
 /// Fixed word index of the ticket sentinel in each layer's coherent route mirror row: strictly
-/// past all 8 verify rows (`0..128`) so shrinking `m` across steps can never collide with stale
+/// past all MAX_BATCH_ROWS verify rows so shrinking `m` across steps can never collide with stale
 /// expert IDs (`0..127`) written by an earlier wider verify step.
 const ROUTE_SENTINEL_OFF: usize = MAX_BATCH_ROWS * ROUTE_WORDS;
-/// Coherent host-mapped routing mirror stride: up to 8 verify rows x 16 words + 1 ticket sentinel,
-/// padded to 576 B (cache-line aligned).
-const ROUTE_MIRROR_STRIDE_WORDS: usize = 144;
+/// Coherent host-mapped routing mirror stride: up to MAX_BATCH_ROWS x 16 words + 1 ticket sentinel,
+/// padded to a 16-word (64 B) cache-line boundary.
+const ROUTE_MIRROR_STRIDE_WORDS: usize = (ROUTE_SENTINEL_OFF + 16 + 15) & !15;
 /// Cache-line stride (64 B = 16 u32s) per layer for `hipStreamWaitValue32` / spin-wait flags.
 const WAIT_FLAG_STRIDE_WORDS: usize = 16;
 /// Per-layer rescue table patch buffer stride: 1 count header + up to 255 `(idx, slot)` pairs (2 KiB).
@@ -312,12 +318,14 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     pub(crate) batch_route_log: Option<DeviceBuf>,
     /// Rows of the batched round whose routing log awaits `post_batch_tide_step`.
     batch_pending_rows: usize,
-    /// The rows forward in progress is a batched decode round (GEMV-style kernels for <= 8 rows).
+    /// Bitmask of rows in `0..batch_pending_rows` that were committed (for multi-lane `verify_batch`).
+    batch_commit_mask: u64,
+    /// The rows forward in progress is a batched decode round (GEMV-style kernels for <= 64 rows).
     pub(crate) rows_decode: bool,
     /// Lanes of the rows of the last batched round (Tide demand bookkeeping per lane).
     batch_lanes: Vec<usize>,
-    /// Speculative verify: short-conv histories `[logical][k, v, attn, mlp][3 + MAX_BATCH_ROWS][dim]`.
-    pub(crate) verify_hist: Option<DeviceBuf>,
+    /// Speculative verify: per-logical-layer short-conv histories `[k, v, attn, mlp][VERIFY_HIST_ROWS][dim]`.
+    pub(crate) verify_hist: Option<Vec<DeviceBuf>>,
     /// Per lane: device rewind table (hist, state, dim, 0) x 4 per logical layer.
     rewind_tables: Vec<Option<DeviceBuf>>,
     /// Drafter taps of the last rows forward: `[4][prefill_chunk()][H]` (layer 4 / 22 / 40 outputs,
@@ -351,8 +359,9 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     pub dev_unique_resident: u64,
 }
 
-/// Most rows (concurrent sequences) one batched decode round can carry.
-pub const MAX_BATCH_ROWS: usize = 8;
+/// Most rows (concurrent sequences / verify tokens) one batched decode or verify round can carry.
+/// Supports up to `8x8 = 64` (8 concurrent streams at full DFlash 2 width), `16x4`, `32x2`, or `64x1`.
+pub const MAX_BATCH_ROWS: usize = 64;
 
 /// A lane's sequence state while another lane is active.
 pub(crate) struct ParkedLane {
@@ -361,48 +370,50 @@ pub(crate) struct ParkedLane {
 }
 
 
-/// Allocates the shared global-KV pool of `pages` pages.
+/// Allocates the unified hybrid paged KV pool of `pages` single-layer pages (`PAGE_POS = 256` each).
 fn alloc_kv_pool<B: ComputeBackend>(backend: &B, cfg: &Inkling2Config, pages: usize, v_q4: bool) -> Result<KvPoolBufs> {
     let (n, hd) = (cfg.num_key_value_heads, cfg.head_dim);
     let pos = pages * crate::kv_pager::PAGE_POS;
     let vc_per_pos = n * if v_q4 { hd / 2 } else { hd };
     let vs_per_pos = n * if v_q4 { 16 } else { 4 };
-    let mut layers = Vec::new();
-    for il in 0..cfg.num_logical_layers() {
-        let (phys, _) = crate::map_logical_to_physical(cfg, smalltide_core::LogicalLayerId(il as u16));
-        if !cfg.is_local_layer(phys.0 as usize) {
-            layers.push((
-                backend.alloc_device(pos * n * hd)?,
-                backend.alloc_device(pos * n * 4)?,
-                backend.alloc_device(pos * vc_per_pos)?,
-                backend.alloc_device(pos * vs_per_pos)?,
-            ));
-        }
-    }
-    Ok(KvPoolBufs { layers })
+    Ok(KvPoolBufs {
+        k: backend.alloc_device(pos * n * hd)?,
+        ks: backend.alloc_device(pos * n * 4)?,
+        v: backend.alloc_device(pos * vc_per_pos)?,
+        vs: backend.alloc_device(pos * vs_per_pos)?,
+    })
 }
 
-/// One sequence's per-logical-layer KV caches (local rings + global KV of `global_max_seq`
-/// positions) and short-conv histories.
+/// One sequence's per-logical-layer KV caches (either pointing into the unified `KvPoolBufs` with
+/// per-layer device page tables, or standalone unpaged buffers) and short-conv histories.
 pub(crate) fn alloc_layer_states<B: ComputeBackend>(
     backend: &B,
     cfg: &Inkling2Config,
     global_max_seq: usize,
     stream: smalltide_core::Stream,
-    paged: Option<(&KvPoolBufs, DeviceBuf)>,
+    paged: Option<(&KvPoolBufs, &crate::kv_pager::LaneTables, usize)>,
     global_v_q4: bool,
 ) -> Result<Vec<LogicalLayerState>> {
+    let mut local_i = 0usize;
     let mut global_i = 0usize;
     let h = cfg.hidden_size;
     let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
     let num_logical = cfg.num_logical_layers();
     let mut layer_states = Vec::with_capacity(num_logical);
     for il in 0..num_logical {
-        let (phys, _) = crate::map_logical_to_physical(&cfg, smalltide_core::LogicalLayerId(il as u16));
+        let (phys, _) = crate::map_logical_to_physical(cfg, smalltide_core::LogicalLayerId(il as u16));
         let is_local = cfg.is_local_layer(phys.0 as usize);
-        let v_q4 = !is_local && global_v_q4;
+        let local_idx = if is_local {
+            let idx = local_i;
+            local_i += 1;
+            Some(idx)
+        } else {
+            None
+        };
+        let v_q4 = if paged.is_some() { global_v_q4 } else { !is_local && global_v_q4 };
         let (max_seq, window) = if is_local {
-            (cfg.local_window_size + prefill_chunk(), cfg.local_window_size)
+            let ring = paged.map_or(cfg.local_window_size + prefill_chunk(), |(_, _, r)| r);
+            (ring, cfg.local_window_size)
         } else {
             let g = global_max_seq.max(cfg.local_window_size);
             (g, g)
@@ -411,15 +422,16 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
         let sc_bytes = cfg.num_key_value_heads * max_seq * 4;
         let vc_bytes = cfg.num_key_value_heads * max_seq * if v_q4 { cfg.head_dim / 2 } else { cfg.head_dim };
         let vs_bytes = cfg.num_key_value_heads * max_seq * if v_q4 { 16 } else { 4 };
-        // Paged global layers point at the shared pool; local rings are the lane's own.
-        let pooled = match paged {
-            Some((pool, table)) if !is_local => {
-                let l = pool.layers[global_i];
+        let pooled = paged.map(|(bufs, tables, _)| {
+            let tbl = if let Some(li) = local_idx {
+                tables.local[li]
+            } else {
+                let gi = global_i;
                 global_i += 1;
-                Some((l, table))
-            }
-            _ => None,
-        };
+                tables.global[gi]
+            };
+            (bufs, tbl)
+        });
         let sconv_k = backend.alloc_device(3 * kv_dim * 4)?;
         let sconv_v = backend.alloc_device(3 * kv_dim * 4)?;
         let sconv_attn = backend.alloc_device(3 * h * 4)?;
@@ -430,13 +442,14 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
         backend.zero_f32(sconv_mlp, 3 * h, stream)?;
         layer_states.push(LogicalLayerState {
             _is_local: is_local,
+            local_idx,
             v_q4,
             max_seq,
             window,
-            k_cache: match pooled { Some((l, _)) => l.0, None => backend.alloc_device(kv_bytes)? },
-            k_scales: match pooled { Some((l, _)) => l.1, None => backend.alloc_device(sc_bytes)? },
-            v_cache: match pooled { Some((l, _)) => l.2, None => backend.alloc_device(vc_bytes)? },
-            v_scales: match pooled { Some((l, _)) => l.3, None => backend.alloc_device(vs_bytes)? },
+            k_cache: match pooled { Some((b, _)) => b.k, None => backend.alloc_device(kv_bytes)? },
+            k_scales: match pooled { Some((b, _)) => b.ks, None => backend.alloc_device(sc_bytes)? },
+            v_cache: match pooled { Some((b, _)) => b.v, None => backend.alloc_device(vc_bytes)? },
+            v_scales: match pooled { Some((b, _)) => b.vs, None => backend.alloc_device(vs_bytes)? },
             page_table: pooled.map(|(_, t)| t),
             sconv_k,
             sconv_v,
@@ -448,8 +461,9 @@ pub(crate) fn alloc_layer_states<B: ComputeBackend>(
 }
 
 impl<B: ComputeBackend> Inkling2Engine<B> {
-    /// `kv_pool_pages`: page the global KV out of a pool of that many pages (when the backend can
-    /// page memory); `None` keeps one fixed cache per lane.
+    /// `kv_pool_pages`: unified hybrid paged KV pool of that many single-layer pages (each 256
+    /// positions), shared across all 40 local layers, 8 global layers, and DFlash 2 (when attached);
+    /// `None` keeps standalone unpaged per-lane caches.
     pub fn new(
         cfg: Inkling2Config,
         dense: Inkling2DenseGpu<B>,
@@ -468,9 +482,21 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let (layer_states, kv_pool) = match kv_pool_pages {
             Some(pages) => {
                 let bufs = alloc_kv_pool(&*backend, &cfg, pages, global_v_q4)?;
-                let mut pool = crate::kv_pager::KvPool::new(pages, global_max_seq.max(cfg.local_window_size));
-                let table = pool.add_lane(&*backend)?;
-                let st = alloc_layer_states(&*backend, &cfg, global_max_seq, stream, Some((&bufs, table)), global_v_q4)?;
+                let mut pool = crate::kv_pager::KvPool::new(
+                    pages,
+                    global_max_seq.max(cfg.local_window_size),
+                    prefill_chunk(),
+                );
+                let tables = pool.add_lane(&*backend)?;
+                let ring_slots = pool.local_ring_slots();
+                let st = alloc_layer_states(
+                    &*backend,
+                    &cfg,
+                    global_max_seq,
+                    stream,
+                    Some((&bufs, &tables, ring_slots)),
+                    global_v_q4,
+                )?;
                 (st, Some((pool, bufs)))
             }
             None => (alloc_layer_states(&*backend, &cfg, global_max_seq, stream, None, global_v_q4)?, None),
@@ -566,6 +592,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             batch_logits: None,
             batch_route_log: None,
             batch_pending_rows: 0,
+            batch_commit_mask: u64::MAX,
             rows_decode: false,
             batch_lanes: Vec::new(),
             verify_hist: None,
@@ -604,30 +631,71 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         })
     }
 
-    /// Total KV cache + short-conv VRAM allocated across all 48 logical layers.
+    /// Total KV cache + short-conv VRAM allocated across all lanes (deduplicating the shared pool).
     pub fn kv_vram_bytes(&self) -> usize {
-        self.layer_states
-            .iter()
-            .map(|s| {
-                s.k_cache.size_bytes
-                    + s.k_scales.size_bytes
-                    + s.v_cache.size_bytes
-                    + s.v_scales.size_bytes
-                    + s.sconv_k.size_bytes
-                    + s.sconv_v.size_bytes
-                    + s.sconv_attn.size_bytes
-                    + s.sconv_mlp.size_bytes
-            })
-            .sum()
+        let sconv_sum = |states: &[LogicalLayerState]| -> usize {
+            states
+                .iter()
+                .map(|s| s.sconv_k.size_bytes + s.sconv_v.size_bytes + s.sconv_attn.size_bytes + s.sconv_mlp.size_bytes)
+                .sum()
+        };
+        if let Some((_, bufs)) = &self.kv_pool {
+            let pool_bytes = bufs.k.size_bytes + bufs.ks.size_bytes + bufs.v.size_bytes + bufs.vs.size_bytes;
+            let mut sconv = sconv_sum(&self.layer_states);
+            for parked in self.lane_store.iter().flatten() {
+                sconv += sconv_sum(&parked.layer_states);
+            }
+            pool_bytes + sconv
+        } else {
+            self.layer_states
+                .iter()
+                .map(|s| {
+                    s.k_cache.size_bytes
+                        + s.k_scales.size_bytes
+                        + s.v_cache.size_bytes
+                        + s.v_scales.size_bytes
+                        + s.sconv_k.size_bytes
+                        + s.sconv_v.size_bytes
+                        + s.sconv_attn.size_bytes
+                        + s.sconv_mlp.size_bytes
+                })
+                .sum()
+        }
     }
 
-    /// Device regions that define the rewindable sequence state: every local (sliding) layer's
-    /// FP8 KV ring + scales and every layer's short-conv histories. Global KV is append-only
-    /// (positions >= pos are simply overwritten later), so it is not part of a snapshot.
+    /// Bytes per position across `(k, ks, v, vs)` for one layer in the unified paged KV pool.
+    fn pool_per_pos_bytes(&self) -> (usize, usize, usize, usize) {
+        let n = self.cfg.num_key_value_heads;
+        let hd = self.cfg.head_dim;
+        let k = n * hd;
+        let ks = n * 4;
+        let v = n * if self.global_v_q4 { hd / 2 } else { hd };
+        let vs = n * if self.global_v_q4 { 16 } else { 4 };
+        (k, ks, v, vs)
+    }
+
+    /// Bytes of one single-layer physical page (`PAGE_POS = 256` positions) in the unified pool.
+    fn pool_page_bytes(&self) -> usize {
+        let (k, ks, v, vs) = self.pool_per_pos_bytes();
+        (k + ks + v + vs) * crate::kv_pager::PAGE_POS
+    }
+
+    /// Short-conv state buffers of all 48 logical layers of the active lane.
+    fn sconv_regions(&self) -> Vec<DeviceBuf> {
+        let mut v = Vec::with_capacity(self.layer_states.len() * 4);
+        for st in &self.layer_states {
+            v.extend([st.sconv_k, st.sconv_v, st.sconv_attn, st.sconv_mlp]);
+        }
+        v
+    }
+
+    /// Device regions that define the rewindable sequence state in unpaged mode (every local layer's
+    /// KV ring + scales and every layer's short-conv histories). In paged mode, only short-convs
+    /// are fixed; local/global/drafter KV are copied page-by-page from the unified pool.
     fn snapshot_regions(&self) -> Vec<DeviceBuf> {
         let mut v = Vec::new();
         for st in &self.layer_states {
-            if st._is_local {
+            if st._is_local && st.page_table.is_none() {
                 v.extend([st.k_cache, st.k_scales, st.v_cache, st.v_scales]);
             }
             v.extend([st.sconv_k, st.sconv_v, st.sconv_attn, st.sconv_mlp]);
@@ -635,8 +703,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         v
     }
 
-    /// Per global layer: `(tensor, bytes per position over all KV heads)` - the caches are
-    /// position-major, so a prefix of `pos` positions is the tensor's first `pos * bytes` bytes.
+    /// Per global layer: `(tensor, bytes per position over all KV heads)` (unpaged mode).
     fn global_kv_regions(&self) -> Vec<(DeviceBuf, usize)> {
         let hd = self.cfg.head_dim;
         let heads = self.cfg.num_key_value_heads;
@@ -652,14 +719,41 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         v
     }
 
-    /// Bytes of the fixed part of a `SeqSnapshot` (local KV rings + short-conv histories).
+    /// Bytes of the fixed part of a `SeqSnapshot` (short-conv histories + unpaged local rings).
     pub fn snapshot_bytes(&self) -> usize {
         self.snapshot_regions().iter().map(|b| b.size_bytes).sum()
     }
 
-    /// Bytes of a `SeqSnapshot` of `pos` tokens (fixed part + the global KV of the prefix,
-    /// plus the DSpark drafter's local + global KV when attached).
+    /// Bytes of a `SeqSnapshot` of `pos` tokens.
     pub fn snapshot_bytes_at(&self, pos: usize) -> usize {
+        if let Some((pool, _)) = self.kv_pool.as_ref() {
+            let sconv: usize = self.sconv_regions().iter().map(|b| b.size_bytes).sum();
+            let loc_pages = crate::kv_pager::NUM_LOCAL_LAYERS
+                * crate::kv_pager::ring_logical_pages(
+                    pos.saturating_sub(crate::kv_pager::LOCAL_WINDOW),
+                    pos,
+                    pool.local_ring_pages(),
+                )
+                .len();
+            let glob_pages = crate::kv_pager::NUM_GLOBAL_LAYERS * pos.div_ceil(crate::kv_pager::PAGE_POS);
+            let mut total = sconv + (loc_pages + glob_pages) * self.pool_page_bytes();
+            if let Some(d) = self.drafter.as_ref() {
+                if d.is_dflash2_paged() {
+                    let dr_pages = crate::kv_pager::NUM_DFLASH2_LAYERS
+                        * crate::kv_pager::ring_logical_pages(
+                            pos.saturating_sub(crate::kv_pager::DFLASH2_WINDOW),
+                            pos,
+                            pool.drafter_ring_pages(),
+                        )
+                        .len();
+                    total += dr_pages * self.pool_page_bytes();
+                } else {
+                    total += d.local_kv_regions().iter().map(|b| b.size_bytes).sum::<usize>();
+                    total += d.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>();
+                }
+            }
+            return total;
+        }
         let mut total = self.snapshot_bytes()
             + self.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>();
         if let Some(d) = self.drafter.as_ref() {
@@ -685,6 +779,84 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     ) -> Result<()> {
         let s = self.tide.compute_stream;
         let save_drafter = save_drafter && self.drafter.is_some();
+        let dflash2_paged = save_drafter && self.drafter.as_ref().is_some_and(|d| d.is_dflash2_paged());
+
+        if let Some((pool, bufs)) = self.kv_pool.as_ref() {
+            let bufs = *bufs;
+            let pages = pool.snapshot_pages(self.active_lane, pos, dflash2_paged);
+            let page_bytes = self.pool_page_bytes();
+            let sconv = self.sconv_regions();
+            let sconv_bytes: usize = sconv.iter().map(|b| b.size_bytes).sum();
+            let unpaged_drafter_bytes = if save_drafter && !dflash2_paged {
+                let d = self.drafter.as_ref().unwrap();
+                d.local_kv_regions().iter().map(|b| b.size_bytes).sum::<usize>()
+                    + d.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>()
+            } else {
+                0
+            };
+            let total = sconv_bytes + pages.total_pages() * page_bytes + unpaged_drafter_bytes;
+            let oversized = |sz: usize| sz > total.saturating_mul(2).saturating_add(64 << 20);
+            if snap.as_ref().map_or(true, |x| x.host.size_bytes < total || oversized(x.host.size_bytes)) {
+                if let Some(old) = snap.take() {
+                    self.backend.sync_stream(s)?;
+                    self.backend.free_pinned(old.host)?;
+                }
+                let alloc = (total + total / 8).max(4096);
+                *snap = Some(SeqSnapshot { pos, drafter_valid: save_drafter, host: self.backend.alloc_pinned(alloc)? });
+            }
+            let sn = snap.as_mut().unwrap();
+            sn.pos = pos;
+            sn.drafter_valid = save_drafter;
+            let mut off = 0usize;
+            for b in sconv {
+                self.backend.memcpy_d2h_async(sn.host, off, b, 0, b.size_bytes, s)?;
+                off += b.size_bytes;
+            }
+            let pp = crate::kv_pager::PAGE_POS;
+            let (kb, ksb, vb, vsb) = self.pool_per_pos_bytes();
+            let copy_page_d2h = |off: &mut usize, pg: u32| -> Result<()> {
+                let p = pg as usize * pp;
+                for (buf, per_pos) in [(bufs.k, kb), (bufs.ks, ksb), (bufs.v, vb), (bufs.vs, vsb)] {
+                    let len = pp * per_pos;
+                    self.backend.memcpy_d2h_async(sn.host, *off, buf.slice(p * per_pos, len), 0, len, s)?;
+                    *off += len;
+                }
+                Ok(())
+            };
+            for layer in &pages.local {
+                for &(_, pg) in layer {
+                    copy_page_d2h(&mut off, pg)?;
+                }
+            }
+            for layer in &pages.global {
+                for &pg in layer {
+                    copy_page_d2h(&mut off, pg)?;
+                }
+            }
+            if dflash2_paged {
+                for layer in &pages.drafter {
+                    for &(_, pg) in layer {
+                        copy_page_d2h(&mut off, pg)?;
+                    }
+                }
+            } else if save_drafter {
+                let d = self.drafter.as_ref().unwrap();
+                for b in d.local_kv_regions() {
+                    self.backend.memcpy_d2h_async(sn.host, off, b, 0, b.size_bytes, s)?;
+                    off += b.size_bytes;
+                }
+                for (buf, per_pos) in d.global_kv_regions() {
+                    if pos > 0 {
+                        let len = pos * per_pos;
+                        self.backend.memcpy_d2h_async(sn.host, off, buf.slice(0, len), 0, len, s)?;
+                        off += len;
+                    }
+                }
+            }
+            self.backend.sync_stream(s)?;
+            return Ok(());
+        }
+
         let target_total = self.snapshot_bytes()
             + self.global_kv_regions().iter().map(|r| pos * r.1).sum::<usize>();
         let drafter_total = if save_drafter {
@@ -727,7 +899,6 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 self.backend.memcpy_d2h_async(sn.host, off, b, 0, b.size_bytes, s)?;
                 off += b.size_bytes;
             }
-            // The drafter's global layer lives in the lane's pages too: the same runs.
             for (buf, per_pos) in d.global_kv_regions() {
                 for &(first, n) in &runs {
                     let len = n * per_pos;
@@ -745,11 +916,79 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// Restores a snapshot taken by `snapshot_state`; the next token to process is `snap.pos`.
     /// With `global = false` the device global KV is assumed to still hold this prefix (the live
     /// sequence starts with it) and is not copied back. When `snap.drafter_valid` is true and a
-    /// drafter is attached, its local rings and global KV are also restored (~4.2 MiB + 2.1 KB/pos).
+    /// drafter is attached, its KV state is also restored.
     pub fn restore_state(&mut self, snap: &SeqSnapshot, global: bool) -> Result<()> {
         let s = self.tide.compute_stream;
-        self.kv_release(self.active_lane, snap.pos)?;
-        self.kv_ensure(self.active_lane, snap.pos)?;
+        let lane = self.active_lane;
+        let dflash2_paged = snap.drafter_valid && self.drafter.as_ref().is_some_and(|d| d.is_dflash2_paged());
+
+        if self.kv_pool.is_some() {
+            // If `global == true`, drop everything first so fresh contiguous pages are allocated.
+            // If `global == false`, keep the existing `[0, snap.pos)` global pages intact.
+            self.kv_release(lane, if global { 0 } else { snap.pos })?;
+            self.kv_ensure_snapshot(lane, snap.pos, dflash2_paged)?;
+            let (bufs, pages) = {
+                let (pool, bufs) = self.kv_pool.as_ref().unwrap();
+                (*bufs, pool.snapshot_pages(lane, snap.pos, dflash2_paged))
+            };
+            let mut off = 0usize;
+            for b in self.sconv_regions() {
+                self.backend.memcpy_h2d_async(b, 0, snap.host, off, b.size_bytes, s)?;
+                off += b.size_bytes;
+            }
+            let pp = crate::kv_pager::PAGE_POS;
+            let (kb, ksb, vb, vsb) = self.pool_per_pos_bytes();
+            let page_bytes = self.pool_page_bytes();
+            let copy_page_h2d = |off: &mut usize, pg: u32| -> Result<()> {
+                let p = pg as usize * pp;
+                for (buf, per_pos) in [(bufs.k, kb), (bufs.ks, ksb), (bufs.v, vb), (bufs.vs, vsb)] {
+                    let len = pp * per_pos;
+                    self.backend.memcpy_h2d_async(buf.slice(p * per_pos, len), 0, snap.host, *off, len, s)?;
+                    *off += len;
+                }
+                Ok(())
+            };
+            for layer in &pages.local {
+                for &(_, pg) in layer {
+                    copy_page_h2d(&mut off, pg)?;
+                }
+            }
+            if global {
+                for layer in &pages.global {
+                    for &pg in layer {
+                        copy_page_h2d(&mut off, pg)?;
+                    }
+                }
+            } else {
+                off += pages.global.iter().map(Vec::len).sum::<usize>() * page_bytes;
+            }
+            if dflash2_paged {
+                for layer in &pages.drafter {
+                    for &(_, pg) in layer {
+                        copy_page_h2d(&mut off, pg)?;
+                    }
+                }
+            } else if snap.drafter_valid {
+                if let Some(d) = self.drafter.as_ref() {
+                    for b in d.local_kv_regions() {
+                        self.backend.memcpy_h2d_async(b, 0, snap.host, off, b.size_bytes, s)?;
+                        off += b.size_bytes;
+                    }
+                    for (buf, per_pos) in d.global_kv_regions() {
+                        if snap.pos > 0 {
+                            let len = snap.pos * per_pos;
+                            self.backend.memcpy_h2d_async(buf.slice(0, len), 0, snap.host, off, len, s)?;
+                            off += len;
+                        }
+                    }
+                }
+            }
+            self.backend.sync_stream(s)?;
+            return Ok(());
+        }
+
+        self.kv_release(lane, snap.pos)?;
+        self.kv_ensure(lane, snap.pos)?;
         let mut off = 0usize;
         for b in self.snapshot_regions() {
             self.backend.memcpy_h2d_async(b, 0, snap.host, off, b.size_bytes, s)?;
@@ -1015,9 +1254,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         for _ in 0..extra {
             let states = match self.kv_pool.as_mut() {
                 Some((pool, bufs)) => {
-                    let table = pool.add_lane(&*self.backend)?;
-                    let bufs = bufs.clone();
-                    alloc_layer_states(&*self.backend, &self.cfg, max_seq, s, Some((&bufs, table)), self.global_v_q4)?
+                    let tables = pool.add_lane(&*self.backend)?;
+                    let ring_slots = pool.local_ring_slots();
+                    let bufs = *bufs;
+                    alloc_layer_states(&*self.backend, &self.cfg, max_seq, s, Some((&bufs, &tables, ring_slots)), self.global_v_q4)?
                 }
                 None => alloc_layer_states(&*self.backend, &self.cfg, max_seq, s, None, self.global_v_q4)?,
             };
@@ -1089,8 +1329,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// (`SMALLTIDE_BATCH_RESCUE=0`: missing experts are skipped, as before). Then sample each row
     /// with `sample_batch_row` and call `post_batch_tide_step`.
     pub fn forward_batch(&mut self, rows: &[(usize, u32, usize)]) -> Result<()> {
+        let local_win = self.cfg.local_window_size;
         for &(lane, _, pos) in rows {
             self.kv_ensure(lane, pos + 1)?;
+            self.kv_ensure_local(lane, None, pos.saturating_sub(local_win), pos + 1)?;
         }
         self.map_batch_rows = rows.iter().map(|&(lane, tok, pos)| (lane, pos, tok)).collect();
         let m = rows.len();
@@ -1100,13 +1342,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 message: format!("forward_batch: {m} rows (1..={MAX_BATCH_ROWS})"),
             });
         }
-        if self.pf.is_none() {
-            self.pf = Some(crate::prefill::PrefillScratch::new(&*self.backend, &self.cfg, self.lane_max_seq.iter().copied().max().unwrap_or(0))?);
-        }
-        if self.batch_logits.is_none() {
-            self.batch_logits = Some(self.backend.alloc_device(MAX_BATCH_ROWS * self.cfg.unpadded_vocab_size * 4)?);
-            self.batch_route_log = Some(self.backend.alloc_device(self.layer_states.len() * MAX_BATCH_ROWS * 64)?);
-        }
+        self.ensure_rows_buffers()?;
         // Token boundary bookkeeping, as in forward_token / verify.
         self.consume_route_log()?;
         static BATCH_RESCUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1125,24 +1361,40 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let fwd_res = self.rows_forward(&tokens, crate::prefill::RowsMode::Decode { rows: &lp }, true);
         self.verify_rescue_active = false;
         fwd_res?;
+        for &(lane, _, pos) in rows {
+            self.kv_evict_local(lane, None, (pos + 1).saturating_sub(local_win), pos + 1);
+        }
         self.batch_pending_rows = m;
+        self.batch_commit_mask = u64::MAX;
         self.batch_lanes = rows.iter().map(|r| r.0).collect();
         Ok(())
     }
+
+    /// Number of rows per `(logical_layer, conv_kind)` in `verify_hist`: fits up to 32 concurrent
+    /// speculative slices (`sum(3 + width_i) <= 32 * 3 + MAX_BATCH_ROWS = 160`, covering `8x8`, `16x4`, `32x2`).
+    const VERIFY_HIST_ROWS: usize = 32 * 3 + MAX_BATCH_ROWS;
 
     /// History slice of logical layer `il`, short conv `kind` (0 k, 1 v, 2 attn-out, 3 mlp).
     pub(crate) fn verify_hist_slice(&self, il: usize, kind: usize) -> DeviceBuf {
         let kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
         let h = self.cfg.hidden_size;
-        let rows = 3 + MAX_BATCH_ROWS;
-        let per_layer = rows * (2 * kv + 2 * h);
+        let rows = Self::VERIFY_HIST_ROWS;
         let (off, dim) = match kind {
             0 => (0, kv),
             1 => (rows * kv, kv),
             2 => (rows * 2 * kv, h),
             _ => (rows * (2 * kv + h), h),
         };
-        self.verify_hist.expect("verify hist").slice((il * per_layer + off) * 4, rows * dim * 4)
+        self.verify_hist.as_ref().expect("verify hist")[il].slice(off * 4, rows * dim * 4)
+    }
+
+    /// Sub-slice of `verify_hist_slice(il, kind)` starting at row `row_off` for `n_rows` rows.
+    pub(crate) fn verify_hist_slice_at(&self, il: usize, kind: usize, row_off: usize, n_rows: usize) -> DeviceBuf {
+        let dim = match kind {
+            0 | 1 => self.cfg.num_key_value_heads * self.cfg.head_dim,
+            _ => self.cfg.hidden_size,
+        };
+        self.verify_hist_slice(il, kind).slice(row_off * dim * 4, n_rows * dim * 4)
     }
 
     /// Allocates the rows-batched buffers (prefill chunks, batched decode, verify) now, e.g.
@@ -1156,7 +1408,17 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.pf = Some(crate::prefill::PrefillScratch::new(&*self.backend, &self.cfg, self.lane_max_seq.iter().copied().max().unwrap_or(0))?);
         }
         if self.batch_logits.is_none() {
-            self.batch_logits = Some(self.backend.alloc_device(MAX_BATCH_ROWS * self.cfg.unpadded_vocab_size * 4)?);
+            let bl_bytes = MAX_BATCH_ROWS * self.cfg.unpadded_vocab_size * 4;
+            // Alias batch_logits (49 MiB for 64 rows) into the unused tail of `pf.moe_tmp`
+            // (18 MiB..67 MiB out of 72 MiB; moe_tmp active is 0..4.5 MiB and attn_part is 5..17.2 MiB -> 0 VRAM!).
+            let alias_off = 18usize << 20;
+            let moe_tmp = self.pf.as_ref().unwrap().moe_tmp;
+            let bl = if alias_off + bl_bytes <= moe_tmp.size_bytes {
+                moe_tmp.slice(alias_off, bl_bytes)
+            } else {
+                self.backend.alloc_device(bl_bytes)?
+            };
+            self.batch_logits = Some(bl);
             self.batch_route_log = Some(self.backend.alloc_device(self.layer_states.len() * MAX_BATCH_ROWS * 64)?);
         }
         Ok(())
@@ -1165,15 +1427,53 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// Allocates the speculative-decoding buffers (verify histories, drafter taps). Call before
     /// the expert pools are allocated (VRAM placement order).
     pub fn enable_speculative_buffers(&mut self) -> Result<()> {
+        self.ensure_rows_buffers()?;
         let kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
         let h = self.cfg.hidden_size;
         let n_log = self.layer_states.len();
         if self.verify_hist.is_none() {
-            self.verify_hist = Some(self.backend.alloc_device(n_log * (3 + MAX_BATCH_ROWS) * (2 * kv + 2 * h) * 4)?);
+            let per_layer_bytes = Self::VERIFY_HIST_ROWS * (2 * kv + 2 * h) * 4;
+            // Alias all 48 logical layers' verify_hist across the unused tails of PrefillScratch
+            // (for m <= 64, bank/blocks use 0..4.5 MiB, messages 0..2.25 MiB, in_qkv/ctrl_qkv 0..1.69 MiB)
+            // -> 0 extra VRAM even at MAX_BATCH_ROWS = 64!
+            let pf = self.pf.as_ref().unwrap();
+            let pools = [
+                (pf.bank, 5usize << 20),
+                (pf.blocks, 5usize << 20),
+                (pf.messages, 3usize << 20),
+                (pf.in_qkv, 2usize << 20),
+                (pf.ctrl_qkv, 2usize << 20),
+            ];
+            let mut layer_bufs = Vec::with_capacity(n_log);
+            let mut pi = 0usize;
+            let mut off = pools[0].1;
+            let mut all_aliased = true;
+            for _ in 0..n_log {
+                while pi < pools.len() && off + per_layer_bytes > pools[pi].0.size_bytes {
+                    pi += 1;
+                    if pi < pools.len() {
+                        off = pools[pi].1;
+                    }
+                }
+                if pi < pools.len() {
+                    layer_bufs.push(pools[pi].0.slice(off, per_layer_bytes));
+                    off += per_layer_bytes;
+                } else {
+                    all_aliased = false;
+                    break;
+                }
+            }
+            let vh = if all_aliased {
+                layer_bufs
+            } else {
+                let big = self.backend.alloc_device(n_log * per_layer_bytes)?;
+                (0..n_log).map(|il| big.slice(il * per_layer_bytes, per_layer_bytes)).collect()
+            };
+            self.verify_hist = Some(vh);
             self.taps_buf = Some(self.backend.alloc_device(4 * prefill_chunk() * h * 4)?);
             self.argmax_rows_buf = Some(self.backend.alloc_device(ARGMAX_FILTER_BUF_BYTES)?);
         }
-        self.ensure_rows_buffers()
+        Ok(())
     }
 
     /// Rescue wait mode (`SMALLTIDE_RESCUE_WAIT`: `0` = host waits, `spin` or `1` = GPU spin-wait
@@ -2017,9 +2317,132 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
     }
 
-    /// Enables elastic KV: starts at `init_pages` and dynamically borrows tail NVFP4 expert slots
-    /// to grow up to `max_pages` when a sequence needs more context, shrinking back when idle.
+    /// Tries to grow the elastic KV pool by at least `need_extra` single-layer pages (in 64-page /
+    /// ~27 MiB steps). Returns `Ok(true)` if the pool grew.
+    fn try_grow_elastic_kv(&mut self, need_extra: usize) -> Result<bool> {
+        let Some((_, max_pages, _)) = self.elastic_kv else {
+            return Ok(false);
+        };
+        let cur_pages = match self.kv_pool.as_ref() {
+            Some((pool, _)) => pool.pages_total(),
+            None => return Ok(false),
+        };
+        if cur_pages >= max_pages || need_extra == 0 {
+            return Ok(false);
+        }
+        let target = (cur_pages + need_extra).next_multiple_of(64).min(max_pages);
+        self.resize_kv_pool(target)
+    }
+
+    /// Ensures physical pages exist in the unified pool for `lane`'s local layer(s) covering `[lo, hi)`.
+    pub(crate) fn kv_ensure_local(
+        &mut self,
+        lane: usize,
+        single_layer: Option<usize>,
+        lo: usize,
+        hi: usize,
+    ) -> Result<()> {
+        if self.kv_pool.is_none() || hi <= lo {
+            return Ok(());
+        }
+        let (b, s) = (self.backend.clone(), self.tide.compute_stream);
+        let ok = {
+            let (pool, _) = self.kv_pool.as_mut().unwrap();
+            pool.ensure_local(&*b, lane, single_layer, lo, hi, s)?
+        };
+        if ok {
+            return Ok(());
+        }
+        let missing = self
+            .kv_pool
+            .as_ref()
+            .unwrap()
+            .0
+            .missing_pages(lane, 0, Some((lo, hi, single_layer)), None);
+        if self.try_grow_elastic_kv(missing)? {
+            let (pool, _) = self.kv_pool.as_mut().unwrap();
+            if pool.ensure_local(&*b, lane, single_layer, lo, hi, s)? {
+                return Ok(());
+            }
+        }
+        Err(smalltide_core::SmallTideError::Backend {
+            backend: "engine",
+            message: format!("KV pool full: lane {lane} needs local pages for [{lo}, {hi})"),
+        })
+    }
+
+    /// Evicts expired local sliding-window pages for `lane` (one layer or all 40) outside `[keep_lo, keep_hi)`.
+    pub(crate) fn kv_evict_local(
+        &mut self,
+        lane: usize,
+        single_layer: Option<usize>,
+        keep_lo: usize,
+        keep_hi: usize,
+    ) {
+        if let Some((pool, _)) = self.kv_pool.as_mut() {
+            pool.evict_local(lane, single_layer, keep_lo, keep_hi);
+        }
+    }
+
+    /// Ensures physical pages exist in the unified pool for `lane`'s DFlash 2 layers covering `[lo, hi)`.
+    pub(crate) fn kv_ensure_drafter(&mut self, lane: usize, lo: usize, hi: usize) -> Result<()> {
+        if self.kv_pool.is_none() || hi <= lo {
+            return Ok(());
+        }
+        let (b, s) = (self.backend.clone(), self.tide.compute_stream);
+        let ok = {
+            let (pool, _) = self.kv_pool.as_mut().unwrap();
+            pool.ensure_drafter(&*b, lane, None, lo, hi, s)?
+        };
+        if ok {
+            return Ok(());
+        }
+        let missing = self
+            .kv_pool
+            .as_ref()
+            .unwrap()
+            .0
+            .missing_pages(lane, 0, None, Some((lo, hi, None)));
+        if self.try_grow_elastic_kv(missing)? {
+            let (pool, _) = self.kv_pool.as_mut().unwrap();
+            if pool.ensure_drafter(&*b, lane, None, lo, hi, s)? {
+                return Ok(());
+            }
+        }
+        Err(smalltide_core::SmallTideError::Backend {
+            backend: "engine",
+            message: format!("KV pool full: lane {lane} needs drafter pages for [{lo}, {hi})"),
+        })
+    }
+
+    /// Evicts expired DFlash 2 sliding-window pages for `lane` outside `[keep_lo, keep_hi)`.
+    pub(crate) fn kv_evict_drafter(&mut self, lane: usize, keep_lo: usize, keep_hi: usize) {
+        if let Some((pool, _)) = self.kv_pool.as_mut() {
+            pool.evict_drafter(lane, None, keep_lo, keep_hi);
+        }
+    }
+
+    /// Ensures all live local, global, and (optional) DFlash 2 pages for a snapshot restore at `pos`.
+    fn kv_ensure_snapshot(&mut self, lane: usize, pos: usize, with_drafter: bool) -> Result<()> {
+        if pos == 0 || self.kv_pool.is_none() {
+            return Ok(());
+        }
+        self.kv_ensure(lane, pos)?;
+        let loc_lo = pos.saturating_sub(crate::kv_pager::LOCAL_WINDOW);
+        self.kv_ensure_local(lane, None, loc_lo, pos)?;
+        if with_drafter {
+            let dr_lo = pos.saturating_sub(crate::kv_pager::DFLASH2_WINDOW);
+            self.kv_ensure_drafter(lane, dr_lo, pos)?;
+        }
+        Ok(())
+    }
+
+    /// Enables elastic KV: starts at `init_pages` single-layer pages and dynamically borrows tail
+    /// NVFP4 expert slots to grow up to `max_pages` when needed, shrinking back when idle.
     pub fn configure_elastic_kv(&mut self, init_pages: usize, max_pages: usize) {
+        if let Some((pool, _)) = self.kv_pool.as_mut() {
+            pool.set_max_pages(max_pages);
+        }
         if self.kv_pool.is_none() || max_pages <= init_pages {
             self.elastic_kv = None;
             return;
@@ -2028,31 +2451,32 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.elastic_kv = Some((init_pages, max_pages, max_nvfp4));
     }
 
-    /// Initial (baseline) elastic KV capacity in token positions (`0` when elastic KV is off).
+    /// Approximate initial (baseline) global context positions (`0` when elastic KV is off).
     pub fn elastic_kv_initial_positions(&self) -> usize {
-        self.elastic_kv.map_or(0, |(init_p, _, _)| init_p * crate::kv_pager::PAGE_POS)
+        self.elastic_kv.map_or(0, |(init_p, _, _)| {
+            // Reserve ~256 single-layer pages for one lane's local + drafter windows.
+            (init_p.saturating_sub(256) / crate::kv_pager::NUM_GLOBAL_LAYERS) * crate::kv_pager::PAGE_POS
+        })
     }
 
-    /// Bytes per KV page across all global layers of the main model plus the drafter (if loaded).
+    /// Bytes per single-layer physical page in the unified pool.
     fn elastic_bytes_per_kv_page(&self) -> usize {
-        let main_per_pos: usize = self.global_kv_regions().iter().map(|r| r.1).sum();
-        let drafter_per_pos = self.drafter.as_ref().map_or(0, |d| d.global_kv_bytes_per_pos());
-        (main_per_pos + drafter_per_pos) * crate::kv_pager::PAGE_POS
+        self.pool_page_bytes()
     }
 
-    /// Syncs all active and parked lanes' global layer KV buffer handles after `kv_pool` reallocation.
+    /// Syncs all active and parked lanes' KV buffer handles (and paged DFlash 2 handles) after
+    /// `kv_pool` reallocation.
     fn sync_kv_pool_handles(&mut self) {
-        let Some((_, ref bufs)) = self.kv_pool else { return };
+        let Some((ref pool, ref bufs)) = self.kv_pool else { return };
+        let bufs = *bufs;
+        let drafter_ring_slots = pool.drafter_ring_slots();
         let apply = |states: &mut [LogicalLayerState]| {
-            let mut gi = 0usize;
             for st in states.iter_mut() {
-                if !st._is_local {
-                    let l = bufs.layers[gi];
-                    st.k_cache = l.0;
-                    st.k_scales = l.1;
-                    st.v_cache = l.2;
-                    st.v_scales = l.3;
-                    gi += 1;
+                if st.page_table.is_some() {
+                    st.k_cache = bufs.k;
+                    st.k_scales = bufs.ks;
+                    st.v_cache = bufs.v;
+                    st.v_scales = bufs.vs;
                 }
             }
         };
@@ -2060,10 +2484,15 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         for parked in self.lane_store.iter_mut().flatten() {
             apply(&mut parked.layer_states);
         }
+        if let Some(d) = self.drafter.as_mut() {
+            if d.is_dflash2_paged() {
+                d.bind_dflash2_kv_pool(bufs.k, bufs.ks, bufs.v, bufs.vs, self.global_v_q4, drafter_ring_slots);
+            }
+        }
     }
 
-    /// Resizes the shared paged KV pool (and drafter global KV) to `new_pages`, trading VRAM with
-    /// the NVFP4 expert pool while preserving all live KV pages via GPU D2D copies.
+    /// Resizes the unified hybrid paged KV pool to `new_pages` single-layer pages, trading VRAM
+    /// with the NVFP4 expert pool while preserving all live pages via GPU D2D copies.
     fn resize_kv_pool(&mut self, new_pages: usize) -> Result<bool> {
         let Some((_, max_pages, max_nvfp4_slots)) = self.elastic_kv else {
             return Ok(false);
@@ -2104,51 +2533,43 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         //    resident VRAM before reallocating NVFP4 last (Windows WDDM allocation-order invariant).
         let ranked_nvfp4 = self.tide.release_nvfp4_pool_for_resize()?;
 
-        // 2. Reallocate KV pool + drafter global KV, preserving live pages [0..min(old, new)) via D2D.
+        // 2. Reallocate the 4 unified KV pool buffers, preserving live pages [0..min(old, new)).
         let b = self.backend.clone();
         let s = self.tide.compute_stream;
         let new_bufs = alloc_kv_pool(&*b, &self.cfg, new_pages, self.global_v_q4)?;
         let old_bufs = {
             let (pool, bufs) = self.kv_pool.as_mut().unwrap();
-            for (old_l, new_l) in bufs.layers.iter().zip(new_bufs.layers.iter()) {
-                for (o, n) in [
-                    (old_l.0, new_l.0),
-                    (old_l.1, new_l.1),
-                    (old_l.2, new_l.2),
-                    (old_l.3, new_l.3),
-                ] {
-                    let cp = o.size_bytes.min(n.size_bytes);
-                    if cp > 0 {
-                        b.memcpy_d2d_async(n, 0, o, 0, cp, s)?;
-                    }
+            for (o, n) in [
+                (bufs.k, new_bufs.k),
+                (bufs.ks, new_bufs.ks),
+                (bufs.v, new_bufs.v),
+                (bufs.vs, new_bufs.vs),
+            ] {
+                let cp = o.size_bytes.min(n.size_bytes);
+                if cp > 0 {
+                    b.memcpy_d2d_async(n, 0, o, 0, cp, s)?;
                 }
             }
             b.sync_stream(s)?;
             pool.resize(new_pages);
             std::mem::replace(bufs, new_bufs)
         };
-        for l in &old_bufs.layers {
-            b.free_device(l.0)?;
-            b.free_device(l.1)?;
-            b.free_device(l.2)?;
-            b.free_device(l.3)?;
-        }
-        if let Some(drafter) = self.drafter.as_mut() {
-            drafter.resize_global_slots(new_pages * crate::kv_pager::PAGE_POS, s)?;
-        }
+        b.free_device(old_bufs.k)?;
+        b.free_device(old_bufs.ks)?;
+        b.free_device(old_bufs.v)?;
+        b.free_device(old_bufs.vs)?;
         self.sync_kv_pool_handles();
 
         // 3. Reallocate NVFP4 pool at the new slot count and refill hottest experts.
         self.tide.restore_nvfp4_pool_after_resize(new_n4, &ranked_nvfp4)?;
 
-        let pp = crate::kv_pager::PAGE_POS;
         eprintln!(
-            "[kv-elastic] {} KV pool: {} -> {} pages ({}K -> {}K ctx), nvfp4 slots {} -> {} ({:.0} ms)",
+            "[kv-elastic] {} unified KV pool: {} -> {} pages ({:.0} -> {:.0} MiB), nvfp4 slots {} -> {} ({:.0} ms)",
             if new_pages > old_pages { "grew" } else { "shrank" },
             old_pages,
             new_pages,
-            (old_pages * pp) / 1024,
-            (new_pages * pp) / 1024,
+            (old_pages * bytes_per_page) as f64 / (1024.0 * 1024.0),
+            (new_pages * bytes_per_page) as f64 / (1024.0 * 1024.0),
             cur_n4,
             new_n4,
             t0.elapsed().as_secs_f64() * 1000.0
@@ -2180,32 +2601,26 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
         let ok = {
             let (pool, _) = self.kv_pool.as_mut().unwrap();
-            pool.ensure(&*b, lane, end, s)?
+            pool.ensure_global(&*b, lane, end, s)?
         };
         if ok {
             return Ok(true);
         }
         // Try growing elastic KV if enabled and below max_pages.
-        if let Some((_, max_pages, _)) = self.elastic_kv {
-            let (cur_pages, still_need) = {
-                let (pool, _) = self.kv_pool.as_ref().unwrap();
-                let need_total = end.div_ceil(crate::kv_pager::PAGE_POS);
-                let have = pool.lane_pages(lane).len();
-                (pool.pages_total(), need_total.saturating_sub(have))
-            };
-            if cur_pages < max_pages && still_need > 0 {
-                // Grow in 8-page (16K-token) steps so long prompts trigger at most one resize.
-                let target = (cur_pages + still_need).next_multiple_of(8).min(max_pages);
-                if self.resize_kv_pool(target)? {
-                    let (pool, _) = self.kv_pool.as_mut().unwrap();
-                    return pool.ensure(&*b, lane, end, s);
-                }
-            }
+        let still_need = self
+            .kv_pool
+            .as_ref()
+            .unwrap()
+            .0
+            .missing_pages(lane, end, None, None);
+        if self.try_grow_elastic_kv(still_need)? {
+            let (pool, _) = self.kv_pool.as_mut().unwrap();
+            return pool.ensure_global(&*b, lane, end, s);
         }
         Ok(false)
     }
 
-    /// Returns `lane`'s global KV pages past position `keep` to the pool.
+    /// Returns `lane`'s KV pages past position `keep` to the pool (all pages when `keep == 0`).
     pub fn kv_release(&mut self, lane: usize, keep: usize) -> Result<()> {
         if let Some((pool, _)) = self.kv_pool.as_mut() {
             pool.release(lane, keep);
@@ -2213,11 +2628,13 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         Ok(())
     }
 
-    /// Marks `lane` as serving a request: its KV pages are never reclaimed.
+    /// Marks `lane` as serving a request: its KV pages are never reclaimed, and its actively
+    /// routed experts are shielded from eviction while this request is processing.
     pub fn set_lane_pinned(&mut self, lane: usize, pinned: bool) {
         if let Some((pool, _)) = self.kv_pool.as_mut() {
             pool.pinned[lane] = pinned;
         }
+        self.tide.scheduler.cache.set_lane_active(lane, pinned);
     }
 
     /// Lanes whose KV pages were reclaimed for another lane since the last call: their device
@@ -2226,19 +2643,20 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         self.kv_pool.as_mut().map(|(p, _)| p.take_lost()).unwrap_or_default()
     }
 
-    /// Paged KV: (pages in the pool, free pages, positions a page, bytes a page).
+    /// Paged KV: (single-layer pages in the pool, free pages, positions a page, bytes a page).
     pub fn kv_pool_info(&self) -> Option<(usize, usize, usize, usize)> {
-        let per_pos: usize = self.global_kv_regions().iter().map(|r| r.1).sum();
-        self.kv_pool.as_ref().map(|(p, _)| (p.pages_total(), p.pages_free(), crate::kv_pager::PAGE_POS, per_pos * crate::kv_pager::PAGE_POS))
+        let page_bytes = self.pool_page_bytes();
+        self.kv_pool
+            .as_ref()
+            .map(|(p, _)| (p.pages_total(), p.pages_free(), crate::kv_pager::PAGE_POS, page_bytes))
     }
 
-    /// The active lane's global KV of positions `[0, pos)` as (first pool position, positions)
-    /// runs: one per page when paged, one run otherwise.
+    /// The active lane's global KV of positions `[0, pos)` for global layer `0` (unpaged fallback).
     fn kv_runs(&self, pos: usize) -> Vec<(usize, usize)> {
         match self.kv_pool.as_ref() {
             Some((pool, _)) => {
                 let pp = crate::kv_pager::PAGE_POS;
-                pool.lane_pages(self.active_lane)
+                pool.lane_global_pages(self.active_lane, 0)
                     .iter()
                     .enumerate()
                     .take_while(|(j, _)| j * pp < pos)
@@ -2303,42 +2721,82 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
     }
 
-    /// Attaches the DSpark drafter: taps are captured from now on (speculative buffers allocated).
-    pub fn attach_drafter(&mut self, d: crate::drafter::Drafter<B>) -> Result<()> {
+    /// Attaches a speculative drafter (DFlash 2 or DSpark): binds paged DFlash 2 to the unified
+    /// KV pool, enables tap capture, and allocates speculative buffers.
+    pub fn attach_drafter(&mut self, mut d: crate::drafter::Drafter<B>) -> Result<()> {
+        if let Some((pool, bufs)) = self.kv_pool.as_ref() {
+            if d.is_dflash2_paged() {
+                d.bind_dflash2_kv_pool(
+                    bufs.k,
+                    bufs.ks,
+                    bufs.v,
+                    bufs.vs,
+                    self.global_v_q4,
+                    pool.drafter_ring_slots(),
+                );
+            }
+        }
         self.drafter = Some(d);
         self.capture_taps = true;
         self.sync_drafter_lane();
         self.enable_speculative_buffers()
     }
 
-    /// Points the drafter at the active lane's context: its local rings and, with the paged KV
-    /// pool, its page table (the drafter's global layer lives in the same pages as the lane's
-    /// global KV, so every lane keeps its own drafter context at no extra pool memory).
-    fn sync_drafter_lane(&mut self) {
-        let table = if self.kv_pool.is_some() {
-            self.layer_states.iter().find(|st| !st._is_local).and_then(|st| st.page_table)
-        } else {
-            None
-        };
-        let lane = self.active_lane;
+    /// Points the drafter at `lane`'s context (or the active lane via `sync_drafter_lane`).
+    fn sync_drafter_for_lane(&mut self, lane: usize) {
+        let drafter_tables = self.kv_pool.as_ref().map(|(pool, _)| pool.lane_tables(lane).drafter);
         if let Some(d) = self.drafter.as_mut() {
-            d.set_lane(lane, table);
+            d.set_lane_unified(lane, drafter_tables.as_deref(), None);
         }
     }
 
-    /// True when every lane keeps its own drafter context (the paged pool, a ring per lane):
-    /// a request on one lane then leaves the others' drafter state alone.
-    pub fn drafter_per_lane(&self) -> bool {
-        self.kv_pool.is_some() && self.drafter.as_ref().is_some_and(|d| d.lanes() >= self.lane_store.len())
+    /// Points the drafter at the active lane's context.
+    fn sync_drafter_lane(&mut self) {
+        self.sync_drafter_for_lane(self.active_lane);
     }
 
-    /// Context K/V of the drafter for the `m` rows just run at `pos0..` (no-op without drafter).
-    pub(crate) fn drafter_ingest(&mut self, pos0: usize, m: usize) -> Result<()> {
-        self.last_tap_rows = m;
-        if let (Some(d), Some(taps)) = (self.drafter.as_ref(), self.taps_buf) {
-            d.ingest(taps, prefill_chunk(), pos0, m, self.tide.compute_stream)?;
+    /// True when every lane keeps its own drafter context (either paged DFlash 2 in the unified
+    /// KV pool, or per-lane DSpark rings).
+    pub fn drafter_per_lane(&self) -> bool {
+        self.kv_pool.is_some()
+            && self
+                .drafter
+                .as_ref()
+                .is_some_and(|d| d.is_dflash2_paged() || d.lanes() >= self.lane_store.len())
+    }
+
+    /// Context K/V of the drafter for `m` rows at `taps[row_off..row_off + m]` belonging to `lane`
+    /// at positions `pos0..pos0 + m` (no-op without drafter).
+    pub(crate) fn drafter_ingest_at_row(&mut self, lane: usize, row_off: usize, pos0: usize, m: usize) -> Result<()> {
+        if m == 0 || self.drafter.is_none() || self.taps_buf.is_none() {
+            return Ok(());
+        }
+        let paged = self.drafter.as_ref().is_some_and(|d| d.is_dflash2_paged());
+        if paged {
+            let win = crate::kv_pager::DFLASH2_WINDOW;
+            self.kv_ensure_drafter(lane, pos0.saturating_sub(win), pos0 + m)?;
+        }
+        self.sync_drafter_for_lane(lane);
+        let taps = self.taps_buf.unwrap();
+        let s = self.tide.compute_stream;
+        if let Some(d) = self.drafter.as_ref() {
+            d.ingest_at_row(taps, prefill_chunk(), row_off, pos0, m, s)?;
+        }
+        if paged {
+            let win = crate::kv_pager::DFLASH2_WINDOW;
+            self.kv_evict_drafter(lane, (pos0 + m).saturating_sub(win), pos0 + m);
+        }
+        if lane != self.active_lane {
+            self.sync_drafter_lane();
         }
         Ok(())
+    }
+
+    /// Context K/V of the drafter for the `m` rows just run at `pos0..` on the active lane.
+    pub(crate) fn drafter_ingest(&mut self, pos0: usize, m: usize) -> Result<()> {
+        self.last_tap_rows = m;
+        let lane = self.active_lane;
+        self.drafter_ingest_at_row(lane, 0, pos0, m)
     }
 
     /// Drafts `n` tokens after `anchor` (at position `p`); `tap_row`: row of position `p - 1` in
@@ -2372,6 +2830,46 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let s = self.tide.compute_stream;
         let d = self.drafter.as_mut().expect("drafter attached");
         d.draft_proposals(&self.dense, anchor, p, taps, prefill_chunk(), tap_row, n, temperature, &mut self.rng_state, s)
+    }
+
+    /// Batched multi-lane DFlash 2 drafting: runs `reqs` (`1..=8` concurrent lanes) in ONE shared
+    /// weight-read pass over DFlash 2's 5 layers and `unembed_fp8`, using the idle `pf.blocks` and
+    /// `batch_logits` scratch buffers (0 extra VRAM).
+    pub fn draft_proposals_batch(
+        &mut self,
+        reqs: &[crate::dflash2::DraftLaneReq],
+    ) -> Result<Vec<Vec<crate::drafter::DraftProposal>>> {
+        if reqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_rows_buffers()?;
+        let lane_tables: Vec<Option<Vec<DeviceBuf>>> = reqs
+            .iter()
+            .map(|r| self.kv_pool.as_ref().map(|(pool, _)| pool.lane_tables(r.lane).drafter))
+            .collect();
+        let mut rngs: Vec<u64> = reqs
+            .iter()
+            .map(|r| {
+                if r.lane == self.active_lane {
+                    self.rng_state
+                } else {
+                    self.lane_store[r.lane].as_ref().expect("parked lane").rng_state
+                }
+            })
+            .collect();
+        let scratch_pool = self.pf.as_ref().unwrap().blocks;
+        let logits_buf = self.batch_logits.expect("batch logits");
+        let s = self.tide.compute_stream;
+        let d = self.drafter.as_mut().expect("drafter attached");
+        let res = d.draft_proposals_batch(&self.dense, reqs, &lane_tables, &mut rngs, scratch_pool, logits_buf, s)?;
+        for (i, r) in reqs.iter().enumerate() {
+            if r.lane == self.active_lane {
+                self.rng_state = rngs[i];
+            } else {
+                self.lane_store[r.lane].as_mut().expect("parked lane").rng_state = rngs[i];
+            }
+        }
+        Ok(res)
     }
 
     /// Speculative verify (greedy): skips monotonic final logit softcap; follow with `rows_argmax`
@@ -2420,7 +2918,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// `temperature > 0` or `repetition_penalty != 1.0` so final logit softcapping is applied.
     pub fn verify_for_sampling(&mut self, tokens: &[u32], pos0: usize, greedy: bool) -> Result<()> {
         let m = tokens.len();
-        self.kv_ensure(self.active_lane, pos0 + m)?;
+        let lane = self.active_lane;
+        let local_win = self.cfg.local_window_size;
+        self.kv_ensure(lane, pos0 + m)?;
+        self.kv_ensure_local(lane, None, pos0.saturating_sub(local_win), pos0 + m)?;
         if m == 0 || m > MAX_BATCH_ROWS {
             return Err(smalltide_core::SmallTideError::Backend { backend: "engine", message: format!("verify: {m} rows") });
         }
@@ -2442,13 +2943,274 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let fwd_res = self.rows_forward(tokens, crate::prefill::RowsMode::Verify { pos0, greedy }, true);
         self.verify_rescue_active = false;
         fwd_res?;
-        // Defer drafter context KV ingest until `verify_rewind`, so `rows_argmax` / `verify_sample`
-        // doesn't wait behind it and rejected rows are never ingested.
-        self.verify_ingest_pos0 = self.capture_taps.then_some(pos0);
+        // Defer drafter context KV ingest & local window eviction until `verify_rewind`, so
+        // `rows_argmax` / `verify_sample` doesn't wait behind it and rejected rows are never ingested.
+        self.verify_ingest_pos0 = Some(pos0);
         self.batch_pending_rows = m;
+        self.batch_commit_mask = u64::MAX;
         self.batch_rows_run = m;
         self.batch_lanes = vec![self.active_lane; m];
         Ok(())
+    }
+
+    /// True if the attached drafter is DFlash 2 (uses its own paged sliding-window context KV
+    /// rather than `taps_buf` during drafting, so concurrent prefills never clobber draft state).
+    pub fn drafter_is_dflash2(&self) -> bool {
+        self.drafter.as_ref().is_some_and(|d| d.kind_name() == "dflash2")
+    }
+
+    /// Multi-lane batched speculative verify: runs up to `MAX_BATCH_ROWS = 8` total tokens
+    /// partitioned across multiple concurrent lanes (`slices`) in ONE shared forward pass.
+    /// Weight reads (dense projections, MoE experts, rescued experts, lm_head) are shared once
+    /// across all concurrent lanes; KV caches and short-conv histories are maintained per slice.
+    pub fn verify_batch(
+        &mut self,
+        tokens: &[u32],
+        slices: &[crate::prefill::VerifySlice],
+        greedy: bool,
+    ) -> Result<()> {
+        let m = tokens.len();
+        if m == 0 || m > MAX_BATCH_ROWS || slices.is_empty() {
+            return Err(smalltide_core::SmallTideError::Backend {
+                backend: "engine",
+                message: format!("verify_batch: {m} rows across {} slices", slices.len()),
+            });
+        }
+        let local_win = self.cfg.local_window_size;
+        for sl in slices {
+            self.kv_ensure(sl.lane, sl.pos0 + sl.width)?;
+            self.kv_ensure_local(sl.lane, None, sl.pos0.saturating_sub(local_win), sl.pos0 + sl.width)?;
+        }
+        if self.verify_hist.is_none() {
+            self.enable_speculative_buffers()?;
+        }
+        self.ensure_rows_buffers()?;
+        self.consume_route_log()?;
+        let use_verify_rescue = self.begin_rows_rescue(m, true)?;
+        if !use_verify_rescue {
+            self.run_deferred_tide_step()?;
+            let published = self.tide.poll_pending()?;
+            self.tide.scheduler.telemetry.stage1_async_published += published as u64;
+            self.verify_rescued.clear();
+            self.tide.scheduler.clear_step_rescued();
+        }
+        self.verify_rescue_active = use_verify_rescue;
+        let mut map_rows = Vec::with_capacity(m);
+        let mut lanes = Vec::with_capacity(m);
+        for sl in slices {
+            for i in 0..sl.width {
+                let r = sl.row_off + i;
+                map_rows.push((sl.lane, sl.pos0 + i, tokens[r]));
+                lanes.push(sl.lane);
+            }
+        }
+        self.map_batch_rows = map_rows;
+        let fwd_res = self.rows_forward(
+            tokens,
+            crate::prefill::RowsMode::VerifyBatch { slices, greedy },
+            true,
+        );
+        self.verify_rescue_active = false;
+        fwd_res?;
+        self.verify_ingest_pos0 = None;
+        self.batch_pending_rows = m;
+        self.batch_commit_mask = u64::MAX;
+        self.batch_rows_run = m;
+        self.batch_lanes = lanes;
+        Ok(())
+    }
+
+    fn lane_rng_mut(&mut self, lane: usize) -> &mut u64 {
+        if lane == self.active_lane {
+            &mut self.rng_state
+        } else {
+            &mut self.lane_store[lane].as_mut().expect("parked lane").rng_state
+        }
+    }
+
+    /// Exact lossless speculative rejection sampling for every slice of the last `verify_batch`,
+    /// using at most ONE GPU argmax or compact logits-filter readback across all concurrent lanes.
+    pub fn verify_batch_sample(
+        &mut self,
+        slices: &[crate::prefill::VerifySlice],
+        blocks: &[&[u32]],
+        q_dists: &[&[Option<Vec<(u32, f32)>>]],
+        params: &[&SamplingParams],
+        recents: &[&[u32]],
+    ) -> Result<Vec<(usize, u32)>> {
+        let total_m: usize = slices.iter().map(|sl| sl.width).sum();
+        let all_greedy = params
+            .iter()
+            .all(|p| p.temperature <= 0.0 && (p.repetition_penalty - 1.0).abs() < 1e-6);
+        if all_greedy {
+            let am = self.rows_argmax(total_m)?;
+            let mut out = Vec::with_capacity(slices.len());
+            for (si, sl) in slices.iter().enumerate() {
+                let block = blocks[si];
+                let n = sl.width.saturating_sub(1);
+                let mut c = 0usize;
+                while c < n && block[c + 1] == am[sl.row_off + c] {
+                    c += 1;
+                }
+                out.push((c, am[sl.row_off + c]));
+            }
+            return Ok(out);
+        }
+
+        let vocab = self.cfg.unpadded_vocab_size;
+        let s = self.tide.compute_stream;
+        let bl = self.batch_logits.expect("batch logits");
+        let all_no_rep = params.iter().all(|p| (p.repetition_penalty - 1.0).abs() < 1e-6);
+        let max_temp = params.iter().map(|p| p.temperature).fold(0.0f32, f32::max);
+
+        if all_no_rep && max_temp > 0.0 {
+            if self.argmax_rows_buf.is_none() {
+                self.argmax_rows_buf = Some(self.backend.alloc_device(ARGMAX_FILTER_BUF_BYTES)?);
+            }
+            let buf = self.argmax_rows_buf.unwrap();
+            let row_max = buf.slice(MAX_BATCH_ROWS * 4, MAX_BATCH_ROWS * 4);
+            let scratch = buf.slice(MAX_BATCH_ROWS * 8, MAX_BATCH_ROWS * 32 * 4);
+            let d2h_base = MAX_BATCH_ROWS * 40 * 4;
+            let counts = buf.slice(d2h_base, MAX_BATCH_ROWS * 4);
+            let out_idx = buf.slice(d2h_base + MAX_BATCH_ROWS * 4, MAX_BATCH_ROWS * FILTER_CAP * 4);
+            let out_val = buf.slice(
+                d2h_base + MAX_BATCH_ROWS * 4 + MAX_BATCH_ROWS * FILTER_CAP * 4,
+                MAX_BATCH_ROWS * FILTER_CAP * 4,
+            );
+            let margin = 20.0 * max_temp;
+            self.backend.logits_filter_rows(
+                out_idx, out_val, counts, row_max, scratch, bl, total_m, vocab, margin, FILTER_CAP, s,
+            )?;
+            let d2h_bytes = (MAX_BATCH_ROWS + 2 * MAX_BATCH_ROWS * FILTER_CAP) * 4;
+            let mut raw = vec![0u8; d2h_bytes];
+            self.backend.memcpy_d2h_sync(&mut raw, buf.slice(d2h_base, d2h_bytes), 0, s)?;
+
+            let word = |w: usize| u32::from_le_bytes(raw[w * 4..(w + 1) * 4].try_into().unwrap());
+            let idx_base = MAX_BATCH_ROWS;
+            let val_base = MAX_BATCH_ROWS + MAX_BATCH_ROWS * FILTER_CAP;
+
+            let backend = self.backend.clone();
+            let row_probs = |r: usize, p: &SamplingParams| -> Result<Vec<(u32, f32)>> {
+                let cnt = word(r) as usize;
+                if p.temperature <= 0.0 {
+                    // Greedy slice mixed with stochastic slices: find argmax in filtered candidates.
+                    if cnt > 0 && cnt <= FILTER_CAP {
+                        let mut best_id = word(idx_base + r * FILTER_CAP);
+                        let mut best_v = f32::from_bits(word(val_base + r * FILTER_CAP));
+                        for j in 1..cnt {
+                            let id = word(idx_base + r * FILTER_CAP + j);
+                            let v = f32::from_bits(word(val_base + r * FILTER_CAP + j));
+                            if v > best_v {
+                                best_v = v;
+                                best_id = id;
+                            }
+                        }
+                        return Ok(vec![(best_id, 1.0)]);
+                    }
+                } else if cnt > 0 && cnt <= FILTER_CAP {
+                    let inv_t = 1.0 / p.temperature;
+                    let mut cands = Vec::with_capacity(cnt);
+                    for j in 0..cnt {
+                        let id = word(idx_base + r * FILTER_CAP + j);
+                        let v = f32::from_bits(word(val_base + r * FILTER_CAP + j));
+                        cands.push((id, v * inv_t));
+                    }
+                    return Ok(finalize_probs(cands, p.top_k.clamp(1, vocab), p.top_p));
+                }
+                let mut row = vec![0.0f32; vocab];
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut u8, vocab * 4)
+                };
+                backend.memcpy_d2h_sync(bytes, bl.slice(r * vocab * 4, vocab * 4), 0, s)?;
+                Ok(row_target_probs(&mut row, p, &[], &[]))
+            };
+
+            let mut out = Vec::with_capacity(slices.len());
+            for (si, sl) in slices.iter().enumerate() {
+                let block = blocks[si];
+                let qd = q_dists[si];
+                let p = params[si];
+                let n = sl.width.saturating_sub(1);
+                let rng = self.lane_rng_mut(sl.lane);
+                let mut accepted = None;
+                for c in 0..n {
+                    let mut probs = row_probs(sl.row_off + c, p)?;
+                    let draft = block[c + 1];
+                    if p.temperature <= 0.0 {
+                        let top = probs.first().map(|&(id, _)| id).unwrap_or(0);
+                        if draft == top {
+                            continue;
+                        }
+                        accepted = Some((c, top));
+                        break;
+                    }
+                    let p_d = probs.iter().find(|&&(id, _)| id == draft).map(|&(_, pr)| pr).unwrap_or(0.0);
+                    if let Some(q_vec) = qd.get(c).and_then(|o| o.as_ref()) {
+                        let q_d = q_vec.iter().find(|&&(id, _)| id == draft).map(|&(_, q)| q).unwrap_or(1.0);
+                        if next_rand_f32(rng) * q_d < p_d {
+                            continue;
+                        }
+                        let mut res_sum = 0.0f32;
+                        for (id, pr) in probs.iter_mut() {
+                            let q_i = q_vec.iter().find(|&&(qid, _)| qid == *id).map(|&(_, q)| q).unwrap_or(0.0);
+                            *pr = (*pr - q_i).max(0.0);
+                            res_sum += *pr;
+                        }
+                        if res_sum > 1e-12 {
+                            probs.retain(|&(_, pr)| pr > 0.0);
+                            accepted = Some((c, sample_from_probs(&probs, rng)));
+                            break;
+                        }
+                        let fallback = row_probs(sl.row_off + c, p)?;
+                        accepted = Some((c, sample_from_probs(&fallback, rng)));
+                        break;
+                    } else {
+                        if next_rand_f32(rng) < p_d {
+                            continue;
+                        }
+                        probs.retain(|&(id, _)| id != draft);
+                        let tok = if probs.is_empty() { draft } else { sample_from_probs(&probs, rng) };
+                        accepted = Some((c, tok));
+                        break;
+                    }
+                }
+                if let Some(res) = accepted {
+                    out.push(res);
+                } else {
+                    let probs = row_probs(sl.row_off + n, p)?;
+                    let tok = if p.temperature <= 0.0 {
+                        probs.first().map(|&(id, _)| id).unwrap_or(0)
+                    } else {
+                        sample_from_probs(&probs, rng)
+                    };
+                    out.push((n, tok));
+                }
+            }
+            return Ok(out);
+        }
+
+        // General fallback (repetition_penalty != 1.0): one full D2H for `total_m` rows.
+        let mut all_logits = vec![0.0f32; total_m * vocab];
+        let raw_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(all_logits.as_mut_ptr() as *mut u8, total_m * vocab * 4)
+        };
+        self.backend.memcpy_d2h_sync(raw_bytes, bl.slice(0, total_m * vocab * 4), 0, s)?;
+        let mut out = Vec::with_capacity(slices.len());
+        for (si, sl) in slices.iter().enumerate() {
+            let start = sl.row_off * vocab;
+            let end = (sl.row_off + sl.width) * vocab;
+            let rng = self.lane_rng_mut(sl.lane);
+            out.push(verify_sample_rows_with_q(
+                &mut all_logits[start..end],
+                vocab,
+                blocks[si],
+                q_dists[si],
+                params[si],
+                recents[si],
+                rng,
+            ));
+        }
+        Ok(out)
     }
 
     /// Greedy next token of each of the last `m` verify / batch rows (one readback).
@@ -2612,6 +3374,49 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// `verify_rewind` queues `drafter_ingest` and `sconv_rewind`.
     pub fn commit_batch_rows(&mut self, keep: usize) {
         self.batch_pending_rows = self.batch_pending_rows.min(keep);
+        self.batch_commit_mask = u64::MAX;
+    }
+
+    /// Limits pending batch routing bookkeeping to the exact bitmask of committed rows across a
+    /// multi-lane `verify_batch` pass.
+    pub fn commit_batch_row_mask(&mut self, mask: u64, total_rows: usize) {
+        self.batch_pending_rows = self.batch_pending_rows.min(total_rows);
+        self.batch_commit_mask = mask;
+    }
+
+    fn ensure_rewind_table(&mut self, lane: usize) -> Result<DeviceBuf> {
+        while self.rewind_tables.len() <= lane {
+            self.rewind_tables.push(None);
+        }
+        if let Some(dev) = self.rewind_tables[lane] {
+            return Ok(dev);
+        }
+        let n_log = self.layer_states.len();
+        let kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        let h = self.cfg.hidden_size;
+        let mut words: Vec<u64> = Vec::with_capacity(n_log * 16);
+        for il in 0..n_log {
+            let st = self.lane_layer_state(lane, il);
+            let (sk, sv, sa, sm) = (st.sconv_k, st.sconv_v, st.sconv_attn, st.sconv_mlp);
+            for (kind, state, dim) in [(0, sk, kv), (1, sv, kv), (2, sa, h), (3, sm, h)] {
+                words.push(self.backend.device_address(self.verify_hist_slice(il, kind))?);
+                words.push(self.backend.device_address(state)?);
+                words.push(dim as u64);
+                words.push(0);
+            }
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let dev = self.backend.alloc_device(bytes.len())?;
+        let host = self.backend.alloc_pinned(bytes.len())?;
+        unsafe {
+            self.backend.pinned_as_mut_slice(host)?[..bytes.len()].copy_from_slice(&bytes);
+        }
+        let s = self.tide.compute_stream;
+        self.backend.memcpy_h2d_async(dev, 0, host, 0, bytes.len(), s)?;
+        self.backend.sync_stream(s)?;
+        self.backend.free_pinned(host)?;
+        self.rewind_tables[lane] = Some(dev);
+        Ok(dev)
     }
 
     /// After a verify of `m` rows of which `keep` are committed: ingests ONLY the `keep`
@@ -2621,43 +3426,49 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         // Only committed rows count for Tide (heat / demand); no-op if `commit_batch_rows` ran already.
         self.batch_pending_rows = self.batch_pending_rows.min(keep);
         if let Some(pos0) = self.verify_ingest_pos0.take() {
-            self.drafter_ingest(pos0, keep)?;
+            let committed_end = pos0 + keep;
+            let local_win = self.cfg.local_window_size;
+            self.kv_evict_local(self.active_lane, None, committed_end.saturating_sub(local_win), committed_end);
+            if self.capture_taps {
+                self.drafter_ingest(pos0, keep)?;
+            }
         }
         if keep >= m {
             return Ok(());
         }
         let lane = self.active_lane;
-        while self.rewind_tables.len() <= lane {
-            self.rewind_tables.push(None);
-        }
+        let table = self.ensure_rewind_table(lane)?;
         let n_log = self.layer_states.len();
-        if self.rewind_tables[lane].is_none() {
-            let kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
-            let h = self.cfg.hidden_size;
-            let mut words: Vec<u64> = Vec::with_capacity(n_log * 16);
-            for il in 0..n_log {
-                let st = &self.layer_states[il];
-                for (kind, state, dim) in [(0, st.sconv_k, kv), (1, st.sconv_v, kv), (2, st.sconv_attn, h), (3, st.sconv_mlp, h)] {
-                    words.push(self.backend.device_address(self.verify_hist_slice(il, kind))?);
-                    words.push(self.backend.device_address(state)?);
-                    words.push(dim as u64);
-                    words.push(0);
-                }
-            }
-            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            let dev = self.backend.alloc_device(bytes.len())?;
-            let host = self.backend.alloc_pinned(bytes.len())?;
-            unsafe {
-                self.backend.pinned_as_mut_slice(host)?[..bytes.len()].copy_from_slice(&bytes);
-            }
-            let s = self.tide.compute_stream;
-            self.backend.memcpy_h2d_async(dev, 0, host, 0, bytes.len(), s)?;
-            self.backend.sync_stream(s)?;
-            self.backend.free_pinned(host)?;
-            self.rewind_tables[lane] = Some(dev);
-        }
         let h = self.cfg.hidden_size;
-        self.backend.sconv_rewind(self.rewind_tables[lane].unwrap(), n_log * 4, h, keep, self.tide.compute_stream)
+        self.backend.sconv_rewind(table, n_log * 4, h, keep, self.tide.compute_stream)
+    }
+
+    /// After a multi-lane `verify_batch`: for each slice, evicts expired local KV pages, ingests
+    /// ONLY its `keep_i` committed rows into that lane's drafter context (when `ingest_drafter[i]`
+    /// is true), and rewinds that lane's short-convs if `keep_i < slice.width`.
+    pub fn verify_batch_rewind(
+        &mut self,
+        slices: &[crate::prefill::VerifySlice],
+        keeps: &[usize],
+        ingest_drafter: &[bool],
+    ) -> Result<()> {
+        let local_win = self.cfg.local_window_size;
+        let n_log = self.layer_states.len();
+        let h = self.cfg.hidden_size;
+        for (si, sl) in slices.iter().enumerate() {
+            let keep = keeps[si];
+            let committed_end = sl.pos0 + keep;
+            self.kv_evict_local(sl.lane, None, committed_end.saturating_sub(local_win), committed_end);
+            if self.capture_taps && ingest_drafter[si] && keep > 0 {
+                self.drafter_ingest_at_row(sl.lane, sl.row_off, sl.pos0, keep)?;
+            }
+            if keep < sl.width {
+                let hoff = sl.hist_off.expect("verify_batch_rewind: slice with keep < width needs hist_off");
+                let table = self.ensure_rewind_table(sl.lane)?;
+                self.backend.sconv_rewind(table, n_log * 4, h, hoff + keep, self.tide.compute_stream)?;
+            }
+        }
+        Ok(())
     }
 
     /// Samples row `i` of the last `forward_batch` with `lane`'s RNG.
@@ -2673,6 +3484,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// into the next forward like after a single-row token.
     pub fn post_batch_tide_step(&mut self) -> Result<()> {
         let m = std::mem::take(&mut self.batch_pending_rows);
+        let mask = std::mem::replace(&mut self.batch_commit_mask, u64::MAX);
         if m == 0 {
             return Ok(());
         }
@@ -2687,6 +3499,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let rows = std::mem::take(&mut self.map_batch_rows);
             for (r, &(lane, pos, tok)) in rows.iter().enumerate().take(m) {
+                if (mask & (1u64 << r)) == 0 {
+                    continue;
+                }
                 let picks = self.route_picks(&words, n_log, r * 16, MAX_BATCH_ROWS * 16);
                 self.routes.push(lane, pos, tok, 8, picks);
             }
@@ -2705,9 +3520,18 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.dev_unique_resident += seen.len() as u64;
         }
         let rescued = std::mem::take(&mut self.verify_rescued);
+        let mut committed = 0u64;
+        for r in 0..m {
+            if (mask & (1u64 << r)) != 0 {
+                committed += 1;
+            }
+        }
         for il in 0..n_log {
             let (phys, _) = crate::map_logical_to_physical(&self.cfg, smalltide_core::LogicalLayerId(il as u16));
             for r in 0..m {
+                if (mask & (1u64 << r)) == 0 {
+                    continue;
+                }
                 let lane = self.batch_lanes.get(r).copied().unwrap_or(self.active_lane);
                 self.tide.scheduler.cache.set_current_lane(lane);
                 let base = (il * MAX_BATCH_ROWS + r) * 16;
@@ -2721,7 +3545,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
         }
         self.tide.scheduler.cache.set_current_lane(self.active_lane);
-        self.tokens_decoded += m as u64;
+        self.tokens_decoded += committed;
         self.tide_step_pending = true;
         Ok(())
     }
@@ -3440,7 +4264,10 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let h = self.cfg.hidden_size;
         let h_bytes = h * 4;
         let eps = self.cfg.rms_norm_eps;
-        self.kv_ensure(self.active_lane, pos + 1)?;
+        let lane = self.active_lane;
+        let local_win = self.cfg.local_window_size;
+        self.kv_ensure(lane, pos + 1)?;
+        self.kv_ensure_local(lane, None, pos.saturating_sub(local_win), pos + 1)?;
 
         // Token boundary: fold the previous token's routing log into heat, then publish any async
         // promotions whose DMA has landed (non-blocking query; table upload is stream-ordered).
@@ -3595,6 +4422,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             let il = coda_logical_base + (ip - end);
             self.forward_layer(il, ip, pos, is_prefill, &mut num_blocks, None)?;
         }
+
+        // Evict any expired local sliding-window pages back to the shared pool (stream-ordered).
+        self.kv_evict_local(lane, None, (pos + 1).saturating_sub(local_win), pos + 1);
 
         // Async routing-log readback (consumed at the next token boundary).
         // Routing log is read back at the next token boundary (stream idle by then).

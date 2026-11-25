@@ -116,6 +116,9 @@ pub struct TideCache {
     /// Flat indices that must not be evicted right now (e.g. the current layer's top-k during a
     /// sync rescue), so a rescue can never evict an expert the very same kernel is about to read.
     protected: Vec<usize>,
+    /// Flat indices of Loop-Core experts used earlier in the current multi-pass step so Pass 0/1
+    /// evictions prefer other victims before touching an expert Pass 1/2 is likely to reuse.
+    step_protected: Vec<usize>,
 
     /// Transient Scratch Rescue Ring state (base slot index & ring cursor per class).
     scratch_base_nvfp4: u32,
@@ -147,6 +150,9 @@ pub struct TideCache {
     /// Per-lane demand of the request in flight on that lane (conversation memory for
     /// prompt-aware loading); `current_lane` receives the touches.
     lane_demand: Vec<Vec<f32>>,
+    /// Which lanes currently have an actively processing request (used to avoid unloading experts
+    /// that another concurrent processing request is actively using).
+    active_lanes: Vec<bool>,
     current_lane: usize,
     /// Hysteresis factor for resident swaps (rescue promotion, prefill swaps, post-prefill rebalance).
     pub swap_hysteresis: f64,
@@ -185,6 +191,7 @@ impl TideCache {
             gpu_slot_table: vec![SlotIndex::MISSING.0; total],
             dirty_gpu_indices: HashSet::new(),
             protected: Vec::new(),
+            step_protected: Vec::new(),
             scratch_base_nvfp4: 4096,
             scratch_base_mxfp8: 4096,
             max_vram_slots_nvfp4: None,
@@ -203,6 +210,7 @@ impl TideCache {
             prior_rate: vec![0.0; total],
             prior_heat_equiv: 0.0,
             lane_demand: vec![vec![0.0; total]],
+            active_lanes: vec![false],
             current_lane: 0,
             swap_hysteresis: SWAP_HYSTERESIS,
         }
@@ -214,7 +222,46 @@ impl TideCache {
         while self.lane_demand.len() <= lane {
             self.lane_demand.push(vec![0.0; total]);
         }
+        while self.active_lanes.len() <= lane {
+            self.active_lanes.push(false);
+        }
         self.current_lane = lane;
+    }
+
+    /// Marks whether `lane` currently has an actively processing request.
+    pub fn set_lane_active(&mut self, lane: usize, active: bool) {
+        let total = self.entries.len();
+        while self.lane_demand.len() <= lane {
+            self.lane_demand.push(vec![0.0; total]);
+        }
+        while self.active_lanes.len() <= lane {
+            self.active_lanes.push(false);
+        }
+        self.active_lanes[lane] = active;
+    }
+
+    /// True if any currently active processing lane has routed to `idx` in its ongoing request.
+    #[inline]
+    fn used_by_active_lanes(&self, idx: usize) -> bool {
+        self.active_lanes
+            .iter()
+            .enumerate()
+            .any(|(l, &act)| act && self.lane_demand.get(l).is_some_and(|d| d[idx] > 0.0))
+    }
+
+    /// Records experts used earlier in this step (e.g. Loop Core Pass 0/1) so subsequent evictions
+    /// in the same step prefer unloading experts not needed by later passes.
+    pub fn add_step_protected(&mut self, ids: &[ExpertId]) {
+        for &id in ids {
+            let idx = self.flat_index(id);
+            if !self.step_protected.contains(&idx) {
+                self.step_protected.push(idx);
+            }
+        }
+    }
+
+    pub fn clear_step_protected(&mut self) {
+        self.step_protected.clear();
     }
 
     /// `lane`'s demand since the last call (and resets it).
@@ -278,8 +325,10 @@ impl TideCache {
     }
 
     /// Lowest-value evictable resident of `cls` (not pinned, pending, protected or scratch).
+    /// Prefers unloading experts NOT used by any currently active processing lane (or current
+    /// multi-pass Loop Core step) before ever touching an expert used by an ongoing request.
     fn coldest_in_class(&self, cls: ExpertClass) -> Option<(usize, f64)> {
-        let mut best: Option<(usize, f64)> = None;
+        let mut best: Option<(usize, u8, f64)> = None;
         for (i, e) in self.entries.iter().enumerate() {
             if e.vram_slot.is_missing() || e.is_scratch_slot || e.vram_pinned || e.vram_pending {
                 continue;
@@ -291,13 +340,20 @@ impl TideCache {
             if self.expert_class(eid) != cls {
                 continue;
             }
+            let tier: u8 = if self.step_protected.contains(&i) {
+                2
+            } else if self.used_by_active_lanes(i) {
+                1
+            } else {
+                0
+            };
             let age = self.step.saturating_sub(e.last_touch_step) as f64;
             let v = self.value(eid) - age * 1e-7;
-            if best.map_or(true, |(_, bv)| v < bv) {
-                best = Some((i, v));
+            if best.map_or(true, |(_, bt, bv)| tier < bt || (tier == bt && v < bv)) {
+                best = Some((i, tier, v));
             }
         }
-        best
+        best.map(|(i, _, v)| (i, v))
     }
 
     /// True if `id` would get a resident slot without evicting anything, or is worth more than the
@@ -468,38 +524,49 @@ impl TideCache {
     }
 
     /// Stages a cold 1-off sync miss into the transient Scratch Rescue Ring without evicting
-    /// any resident VRAM expert (skipping any ring slot occupied by a `protected` expert).
-    pub fn stage_scratch_rescue(&mut self, id: ExpertId) -> TransferOp {
+    /// any resident VRAM expert. Never overwrites a slot occupied by a `protected` expert (an
+    /// expert currently needed by any ongoing request in this layer): returns `None` if every
+    /// ring slot is protected so in-use experts are always used before being unloaded.
+    pub fn stage_scratch_rescue(&mut self, id: ExpertId) -> Option<TransferOp> {
         let cls = self.expert_class(id);
         let ring_size = match cls {
             ExpertClass::Nvfp4 => self.scratch_ring_nvfp4,
             ExpertClass::Mxfp8 => self.scratch_ring_mxfp8,
         } as usize;
+        // Pick the best unprotected slot starting at cursor:
+        // tier 0 = empty slot, tier 1 = unprotected & not step_protected, tier 2 = unprotected.
+        let pick_slot = |cursor: usize, occupants: &[Option<ExpertId>]| -> Option<usize> {
+            let mut best: Option<(usize, u8)> = None;
+            for step in 0..ring_size {
+                let r = (cursor + step) % ring_size;
+                match occupants[r] {
+                    None => return Some(r),
+                    Some(occ) => {
+                        let o_idx = self.flat_index(occ);
+                        if self.protected.contains(&o_idx) {
+                            continue;
+                        }
+                        let tier = if self.step_protected.contains(&o_idx) { 2 } else { 1 };
+                        if best.map_or(true, |(_, bt)| tier < bt) {
+                            best = Some((r, tier));
+                            if tier == 1 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            best.map(|(r, _)| r)
+        };
         let (base, prev_occupant, ring_idx) = match cls {
             ExpertClass::Nvfp4 => {
-                let mut r = (self.scratch_cursor_nvfp4 as usize) % ring_size;
-                for _ in 0..ring_size {
-                    let is_prot = self.scratch_occupants_nvfp4[r]
-                        .is_some_and(|occ| self.protected.contains(&self.flat_index(occ)));
-                    if !is_prot {
-                        break;
-                    }
-                    r = (r + 1) % ring_size;
-                }
+                let r = pick_slot(self.scratch_cursor_nvfp4 as usize % ring_size, &self.scratch_occupants_nvfp4)?;
                 self.scratch_cursor_nvfp4 = ((r + 1) % ring_size) as u32;
                 let prev = self.scratch_occupants_nvfp4[r].replace(id);
                 (self.scratch_base_nvfp4, prev, r)
             }
             ExpertClass::Mxfp8 => {
-                let mut r = (self.scratch_cursor_mxfp8 as usize) % ring_size;
-                for _ in 0..ring_size {
-                    let is_prot = self.scratch_occupants_mxfp8[r]
-                        .is_some_and(|occ| self.protected.contains(&self.flat_index(occ)));
-                    if !is_prot {
-                        break;
-                    }
-                    r = (r + 1) % ring_size;
-                }
+                let r = pick_slot(self.scratch_cursor_mxfp8 as usize % ring_size, &self.scratch_occupants_mxfp8)?;
                 self.scratch_cursor_mxfp8 = ((r + 1) % ring_size) as u32;
                 let prev = self.scratch_occupants_mxfp8[r].replace(id);
                 (self.scratch_base_mxfp8, prev, r)
@@ -534,11 +601,11 @@ impl TideCache {
         } else {
             None
         };
-        TransferOp::ScratchRescue {
+        Some(TransferOp::ScratchRescue {
             expert: id,
             src_ram_slot: src_ram,
             scratch_vram_slot: scratch_slot,
-        }
+        })
     }
 
     #[inline]
@@ -663,6 +730,7 @@ impl TideCache {
         prefer_class: Option<ExpertClass>,
     ) -> Option<ExpertId> {
         let mut best_idx: Option<usize> = None;
+        let mut best_tier = u8::MAX;
         let mut best_score = f64::INFINITY;
 
         for (idx, e) in self.entries.iter().enumerate() {
@@ -676,6 +744,13 @@ impl TideCache {
                 continue;
             }
             let id = self.expert_from_flat(idx);
+            let tier: u8 = if self.step_protected.contains(&idx) {
+                2
+            } else if self.used_by_active_lanes(idx) {
+                1
+            } else {
+                0
+            };
             // Lower score = colder victim. Loop Core gets natural multiplier protection.
             // Prefer matching slot class ONLY as a tiny tie-breaker (never evict a hot
             // same-class expert over a cold other-class expert!).
@@ -685,7 +760,8 @@ impl TideCache {
                 _ => 0.0,
             };
             let score = self.value(id) - (age * 1e-7) + class_tiebreak;
-            if score < best_score {
+            if tier < best_tier || (tier == best_tier && score < best_score) {
+                best_tier = tier;
                 best_score = score;
                 best_idx = Some(idx);
             }
@@ -1016,15 +1092,12 @@ impl TideCache {
         }
     }
 
-    /// Unmaps every transient Scratch Rescue occupant (their slots are about to be reused, e.g.
-    /// by batched prefill). The caller must upload the table before overwriting the slots.
-    pub fn clear_scratch_ring(&mut self) {
-        let occ: Vec<ExpertId> = self
-            .scratch_occupants_nvfp4
-            .iter_mut()
-            .chain(self.scratch_occupants_mxfp8.iter_mut())
-            .filter_map(|o| o.take())
-            .collect();
+    /// Unmaps every transient Scratch Rescue occupant of `cls` (about to be reused by prefill).
+    pub fn clear_scratch_ring_class(&mut self, cls: ExpertClass) {
+        let occ: Vec<ExpertId> = match cls {
+            ExpertClass::Nvfp4 => self.scratch_occupants_nvfp4.iter_mut().filter_map(|o| o.take()).collect(),
+            ExpertClass::Mxfp8 => self.scratch_occupants_mxfp8.iter_mut().filter_map(|o| o.take()).collect(),
+        };
         for id in occ {
             let idx = self.flat_index(id);
             if self.entries[idx].is_scratch_slot {
@@ -1035,6 +1108,13 @@ impl TideCache {
                 self.dirty_gpu_indices.insert(idx);
             }
         }
+    }
+
+    /// Unmaps every transient Scratch Rescue occupant (their slots are about to be reused, e.g.
+    /// by batched prefill). The caller must upload the table before overwriting the slots.
+    pub fn clear_scratch_ring(&mut self) {
+        self.clear_scratch_ring_class(ExpertClass::Nvfp4);
+        self.clear_scratch_ring_class(ExpertClass::Mxfp8);
     }
 
     /// First Scratch Rescue slot index and ring size of a class.

@@ -192,7 +192,7 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 
 | Setting | Default | What it controls |
 | --- | --- | --- |
-| `SMALLTIDE_MAX_CTX` / `SMALLTIDE_KV_TOKENS` | `262144` | Context length & unified paged KV pool ceiling across all lanes (full native 256K with `k8v4`). |
+| `SMALLTIDE_MAX_CTX` / `SMALLTIDE_KV_TOKENS` | `262144` *(headless)* / `131072` *(monitor)* | Context length & unified paged KV pool ceiling across all lanes (`256K` headless, `128K` on display GPU so desktop VRAM doesn't starve experts). |
 | `SMALLTIDE_KV_INITIAL_TOKENS` / `SMALLTIDE_KV_IDLE_SHRINK_SECS` | `32768` / `300` | Elastic KV starting size in VRAM and idle timeout (seconds, `0` = off) before offloading expanded lanes to RAM prefix cache and shrinking back to baseline. |
 | `SMALLTIDE_KV_FMT` | `k8v4` | Global KV format: `k8v4` (FP8 keys + Q4 values, saves ~944 MiB @ 256K) or `fp8` (full FP8 K/V). |
 | `SMALLTIDE_DENSE_FMT` | `fp8` | Dense weight precision (attention projections, loop controllers, `unembed`): `fp8` (~1.10 GiB VRAM; recommended on 16 GB) or `bf16` (~2.15 GiB, exact native checkpoint weights for 32 GB R9700 / parity evals). |
@@ -226,7 +226,7 @@ Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K 
 
 | | Monitor on the RX 9070 XT | Monitor on the motherboard |
 | --- | --- | --- |
-| Resident experts (4 lanes, elastic 32K→256K KV, drafter on) | about 1,750–1,900 of 3,072 | about 2,350–2,550 of 3,072 |
+| Resident experts (4 lanes, elastic KV from 32K, drafter on) | about 1,750–1,900 of 3,072 *(up to 128K)* | about 2,350–2,550 of 3,072 *(up to 256K)* |
 | Routing weight they cover | about 91–94% | about 98–99% |
 | Desktop apps and the model | compete for VRAM: when the desktop's share grows, Windows moves part of the model to system RAM and decode drops to a quarter of its speed until the server is restarted | separate: the desktop uses system RAM through the integrated graphics |
 | A rescue that stalls for more than about 2 s | Windows resets the graphics driver (`hipError_t=719`), the server exits | no driver reset was seen (nothing else asks for the card) |
@@ -243,7 +243,7 @@ Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K 
 
 **Keeping the monitor on the RX 9070 XT (avoiding glitches and interference)**
 
-1. Copy `.env.monitor.example` to `.env.monitor` (`copy .env.monitor.example .env.monitor`) and launch with `.\smalltide.cmd serve .env.monitor`. It uses elastic 256K KV starting at 32K (`SMALLTIDE_KV_INITIAL_TOKENS=32768`), `SMALLTIDE_PREFILL_CHUNK=256`, and `SMALLTIDE_ATTN_VTILES=local` to reclaim VRAM for resident experts while leaving headroom for the desktop. (Use `.env.headless.example` → `.env.headless` when the monitor is on the motherboard.)
+1. Copy `.env.monitor.example` to `.env.monitor` (`copy .env.monitor.example .env.monitor`) and launch with `.\smalltide.cmd serve .env.monitor`. It uses elastic 128K KV starting at 32K (`SMALLTIDE_KV_INITIAL_TOKENS=32768`), `SMALLTIDE_PREFILL_CHUNK=256`, and `SMALLTIDE_ATTN_VTILES=local` to reclaim VRAM for resident experts while leaving headroom for the desktop. (Use `.env.headless.example` → `.env.headless` for full elastic 256K when the monitor is on the motherboard.)
 2. **Move your browser / chat client to integrated graphics** if your CPU has an iGPU. Running Edge/Chromium on the 9070 XT alongside HIP compute can cause AMD D3D11/MPO speckled tile glitches inside browser windows and lowers decode tok/s because every streamed token repaints on the same GPU:
    - Open **Windows Settings → System → Display → Graphics**.
    - Select your browser or chat app. If it is not in the list, click **Add desktop app** (or **Browse**) and pick its `.exe` — for Microsoft Edge, `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`.

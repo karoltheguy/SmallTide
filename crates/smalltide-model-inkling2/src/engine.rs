@@ -2317,8 +2317,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         }
     }
 
-    /// Tries to grow the elastic KV pool by at least `need_extra` single-layer pages (in 64-page /
-    /// ~27 MiB steps). Returns `Ok(true)` if the pool grew.
+    /// Tries to grow the elastic KV pool by at least `need_extra` single-layer pages (in 512-page /
+    /// ~212 MiB steps so multi-agent sessions resize at most 1-2 times instead of thrashing every 64 pages).
+    /// Returns `Ok(true)` if the pool grew.
     fn try_grow_elastic_kv(&mut self, need_extra: usize) -> Result<bool> {
         let Some((_, max_pages, _)) = self.elastic_kv else {
             return Ok(false);
@@ -2330,7 +2331,9 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         if cur_pages >= max_pages || need_extra == 0 {
             return Ok(false);
         }
-        let target = (cur_pages + need_extra).next_multiple_of(64).min(max_pages);
+        const GROW_STEP: usize = 512;
+        let min_target = (cur_pages + need_extra).max(cur_pages + GROW_STEP);
+        let target = min_target.next_multiple_of(256).min(max_pages);
         self.resize_kv_pool(target)
     }
 
@@ -2533,31 +2536,64 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         //    resident VRAM before reallocating NVFP4 last (Windows WDDM allocation-order invariant).
         let ranked_nvfp4 = self.tide.release_nvfp4_pool_for_resize()?;
 
-        // 2. Reallocate the 4 unified KV pool buffers, preserving live pages [0..min(old, new)).
+        // 2. Stage live KV pages [0..min(old, new)) into temporary host memory and FREE `old_bufs`
+        //    BEFORE allocating `new_bufs` so old + new KV buffers never coexist in VRAM (avoids
+        //    Windows WDDM spilling ~0.5 GiB of resident VRAM into system RAM on each resize).
         let b = self.backend.clone();
         let s = self.tide.compute_stream;
-        let new_bufs = alloc_kv_pool(&*b, &self.cfg, new_pages, self.global_v_q4)?;
-        let old_bufs = {
-            let (pool, bufs) = self.kv_pool.as_mut().unwrap();
-            for (o, n) in [
-                (bufs.k, new_bufs.k),
-                (bufs.ks, new_bufs.ks),
-                (bufs.v, new_bufs.v),
-                (bufs.vs, new_bufs.vs),
-            ] {
-                let cp = o.size_bytes.min(n.size_bytes);
-                if cp > 0 {
-                    b.memcpy_d2d_async(n, 0, o, 0, cp, s)?;
-                }
+        let old_bufs = self.kv_pool.as_ref().unwrap().1;
+        let keep_pages = old_pages.min(new_pages);
+        let pp = crate::kv_pager::PAGE_POS;
+        let (kb, ksb, vb, vsb) = self.pool_per_pos_bytes();
+        let keep_lens = [
+            keep_pages * pp * kb,
+            keep_pages * pp * ksb,
+            keep_pages * pp * vb,
+            keep_pages * pp * vsb,
+        ];
+        let old_arr = [old_bufs.k, old_bufs.ks, old_bufs.v, old_bufs.vs];
+        let mut saved: [Vec<u8>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for i in 0..4 {
+            let cp = keep_lens[i].min(old_arr[i].size_bytes);
+            if cp > 0 {
+                saved[i].resize(cp, 0u8);
+                b.memcpy_d2h_sync(&mut saved[i], old_arr[i].slice(0, cp), 0, s)?;
             }
-            b.sync_stream(s)?;
-            pool.resize(new_pages);
-            std::mem::replace(bufs, new_bufs)
-        };
+        }
         b.free_device(old_bufs.k)?;
         b.free_device(old_bufs.ks)?;
         b.free_device(old_bufs.v)?;
         b.free_device(old_bufs.vs)?;
+        let new_bufs = alloc_kv_pool(&*b, &self.cfg, new_pages, self.global_v_q4)?;
+        let new_arr = [new_bufs.k, new_bufs.ks, new_bufs.v, new_bufs.vs];
+        let max_chunk = saved.iter().map(Vec::len).max().unwrap_or(0).min(16usize << 20);
+        if max_chunk > 0 {
+            let stage = b.alloc_pinned(max_chunk)?;
+            let copy_res: Result<()> = (|| {
+                for i in 0..4 {
+                    let data = &saved[i];
+                    let mut off = 0usize;
+                    while off < data.len() {
+                        let take = (data.len() - off).min(max_chunk);
+                        unsafe {
+                            b.pinned_as_mut_slice(stage)?[..take].copy_from_slice(&data[off..off + take]);
+                        }
+                        b.memcpy_h2d_async(new_arr[i], off, stage, 0, take, s)?;
+                        b.sync_stream(s)?;
+                        off += take;
+                    }
+                }
+                Ok(())
+            })();
+            let _ = b.free_pinned(stage);
+            copy_res?;
+        }
+        drop(saved);
+        {
+            let (pool, bufs) = self.kv_pool.as_mut().unwrap();
+            pool.resize(new_pages);
+            *bufs = new_bufs;
+        }
         self.sync_kv_pool_handles();
 
         // 3. Reallocate NVFP4 pool at the new slot count and refill hottest experts.

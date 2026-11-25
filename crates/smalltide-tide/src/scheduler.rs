@@ -1002,7 +1002,9 @@ impl TideScheduler {
     }
 
     /// Effective per-zone rescue budgets `[prelude, loop_core, coda]` for `verify_rows` (1 for
-    /// single-token decode, 2..=8 for speculative verify).
+    /// single-token decode, 2..=8 for single-stream speculative verify, >8 for multi-stream
+    /// batched verify where each 8-row stream gets one full stream budget so concurrent requests
+    /// keep the same quality floor as single-stream).
     pub fn effective_zone_budgets(&self, verify_rows: usize) -> [usize; 3] {
         let base = match self.rescue_zone_budgets {
             Some(z) => z,
@@ -1021,11 +1023,25 @@ impl TideScheduler {
         if verify_rows <= 1 {
             return base;
         }
-        let vr = verify_rows.min(16);
+        if verify_rows <= 8 {
+            return [
+                if base[0] > 0 { base[0] + verify_rows / 4 } else { 0 },
+                if base[1] > 0 { base[1] + verify_rows / 4 } else { 0 },
+                if base[2] > 0 { base[2] + verify_rows / 2 } else { 0 },
+            ];
+        }
+        // Gentle +25% budget per extra 8-row stream (1.25x for 2, 1.50x for 3, 1.75x for 4):
+        // matches MoE expert sharing across streams without letting rescues balloon to 40%+ of decode.
+        let streams = verify_rows.div_ceil(8).min(8);
+        let one_stream = [
+            if base[0] > 0 { base[0] + 2 } else { 0 },
+            if base[1] > 0 { base[1] + 2 } else { 0 },
+            if base[2] > 0 { base[2] + 4 } else { 0 },
+        ];
         [
-            if base[0] > 0 { base[0] + vr / 4 } else { 0 },
-            if base[1] > 0 { base[1] + vr / 4 } else { 0 },
-            if base[2] > 0 { base[2] + vr / 2 } else { 0 },
+            one_stream[0] * (3 + streams) / 4,
+            one_stream[1] * (3 + streams) / 4,
+            one_stream[2] * (3 + streams) / 4,
         ]
     }
 

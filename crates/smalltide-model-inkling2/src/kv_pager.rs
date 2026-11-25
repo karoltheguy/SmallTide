@@ -356,34 +356,45 @@ impl KvPool {
         need
     }
 
-    /// Ensures all 8 global layers of `lane` have pages covering `[0, end)`.
-    pub fn ensure_global<B: ComputeBackend>(&mut self, b: &B, lane: usize, end: usize, stream: Stream) -> Result<bool> {
-        let need = end.div_ceil(PAGE_POS);
+    /// Allocates missing global KV pages for all 8 global layers of `lane` up to `need` pages/layer.
+    /// Returns `(complete, changed)`.
+    fn ensure_global_slots(&mut self, lane: usize, need: usize) -> (bool, bool) {
         if need > self.max_global_pages {
-            return Ok(false);
+            return (false, false);
         }
-        let had = self.lanes[lane].global_slots[0].len();
+        // Check the minimum across ALL global layers (not just layer 0!): if an earlier call ran
+        // out of free pages mid-way through gi=0..8 and triggered an elastic KV grow, layer 0 may
+        // already have `need` pages while layers 1..7 are still short.
+        let had = self.lanes[lane]
+            .global_slots
+            .iter()
+            .map(Vec::len)
+            .min()
+            .unwrap_or(0);
         if had >= need {
-            return Ok(true);
+            return (true, false);
         }
-        // Check/allocate layer by layer; if out of pages, leave already-allocated pages uploaded cleanly.
         let mut changed = false;
         for gi in 0..NUM_GLOBAL_LAYERS {
             while self.lanes[lane].global_slots[gi].len() < need {
                 let Some(p) = self.alloc_page(lane) else {
-                    if changed {
-                        self.upload_global(b, lane, stream)?;
-                    }
-                    return Ok(false);
+                    return (false, changed);
                 };
                 self.lanes[lane].global_slots[gi].push(p);
                 changed = true;
             }
         }
+        (true, changed)
+    }
+
+    /// Ensures all 8 global layers of `lane` have pages covering `[0, end)`.
+    pub fn ensure_global<B: ComputeBackend>(&mut self, b: &B, lane: usize, end: usize, stream: Stream) -> Result<bool> {
+        let need = end.div_ceil(PAGE_POS);
+        let (ok, changed) = self.ensure_global_slots(lane, need);
         if changed {
             self.upload_global(b, lane, stream)?;
         }
-        Ok(true)
+        Ok(ok)
     }
 
     fn upload_global<B: ComputeBackend>(&mut self, b: &B, lane: usize, stream: Stream) -> Result<()> {
@@ -779,5 +790,38 @@ mod tests {
         assert_eq!(p.pages_total(), 64);
         assert_eq!(p.pages_free(), 32);
         assert!(p.free.iter().all(|&x| x < 64));
+    }
+
+    #[test]
+    fn ensure_global_partial_then_grow_allocates_all_layers() {
+        let mut p = KvPool::new(100, 32_768, 1024);
+        p.set_max_pages(512);
+        p.lanes.push(dummy_lane(p.local_ring_pages, p.drafter_ring_pages));
+        p.pinned.push(true);
+        p.lost.push(false);
+
+        // Request 34 pages/layer x 8 global layers = 272 pages when only 100 are free:
+        // fills global layers 0, 1 (34 each) and partially fills layer 2 (32), leaving layers 3..7 empty.
+        let (ok1, changed1) = p.ensure_global_slots(0, 34);
+        assert!(!ok1);
+        assert!(changed1);
+        assert_eq!(p.lanes[0].global_slots[0].len(), 34);
+        assert_eq!(p.lanes[0].global_slots[3].len(), 0);
+        let missing = p.missing_pages(0, 34 * PAGE_POS, None, None);
+        assert_eq!(missing, 272 - 100);
+
+        // Grow elastic KV pool and retry: MUST allocate remaining pages for layers 2..7!
+        p.resize(512);
+        let (ok2, changed2) = p.ensure_global_slots(0, 34);
+        assert!(ok2);
+        assert!(changed2);
+        let mut seen = std::collections::HashSet::new();
+        for gi in 0..NUM_GLOBAL_LAYERS {
+            assert_eq!(p.lanes[0].global_slots[gi].len(), 34, "global layer {gi} incomplete");
+            for &pg in &p.lanes[0].global_slots[gi] {
+                assert!(seen.insert(pg), "duplicate physical page {pg}");
+            }
+        }
+        assert_eq!(seen.len(), 272);
     }
 }

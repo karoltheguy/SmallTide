@@ -873,6 +873,7 @@ fn engine_worker_loop(
                             "live_tokens": pc.live.iter().map(|l| l.len()).collect::<Vec<_>>(),
                             "snapshot_mib": engine.snapshot_bytes() as f64 / (1024.0 * 1024.0),
                         },
+                        "drafter": engine.drafter.as_ref().map(|d| d.kind_name()),
                         "kv_max_ctx": max_lane_ctx,
                         "kv_vram_gib": engine.kv_vram_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
                         "vram_free_gib": vram_info.as_ref().map(|d| d.free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
@@ -1184,8 +1185,15 @@ fn engine_worker_loop(
                     engine.select_lane(l);
                     let req = active[l].as_mut().unwrap();
                     let n_draft = fixed_spec_width.map(|w| w.min(max_w) - 1).unwrap_or(max_w - 1);
+                    let draft_temp = if req.sampling.temperature > 0.0
+                        && (req.sampling.repetition_penalty - 1.0).abs() < 1e-6
+                    {
+                        req.sampling.temperature
+                    } else {
+                        0.0
+                    };
                     let td = Instant::now();
-                    let step_res = engine.draft_with_margins(req.next_tok, req.pos, req.tap_row, n_draft);
+                    let step_res = engine.draft_proposals(req.next_tok, req.pos, req.tap_row, n_draft, draft_temp);
                     let dt_d = td.elapsed().as_secs_f64() * 1000.0;
                     let mut done = false;
                     match step_res {
@@ -1195,12 +1203,12 @@ fn engine_worker_loop(
                             drafter_pos[l] = None;
                             done = true;
                         }
-                        Ok(draft_pairs) => {
+                        Ok(draft_props) => {
                             spec_draft_ema = 0.8 * spec_draft_ema + 0.2 * dt_d;
-                            let calib = (spec_obs_ema / spec_pred_ema.max(0.5)).clamp(0.25, 1.05);
+                            let calib = (spec_obs_ema / spec_pred_ema.max(0.5)).clamp(0.25, 1.80);
                             let mut probs = [0.0f64; 7];
-                            for (k, &(_, mg)) in draft_pairs.iter().enumerate() {
-                                probs[k] = (1.0 / (1.0 + (-(mg as f64)).exp()) * calib).clamp(0.05, 0.98);
+                            for (k, prop) in draft_props.iter().enumerate() {
+                                probs[k] = (1.0 / (1.0 + (-(prop.margin as f64)).exp()) * calib).clamp(0.05, 0.98);
                             }
                             let spec_width = fixed_spec_width.map(|w| w.min(max_w)).unwrap_or_else(|| {
                                 let (mut best_w, mut best_rate, mut surv, mut exp_toks) = (2usize, 0.0f64, 1.0f64, 1.0f64);
@@ -1219,8 +1227,10 @@ fn engine_worker_loop(
                             let n = spec_width - 1;
                             let mut block = Vec::with_capacity(spec_width);
                             block.push(req.next_tok);
-                            for &(t, _) in &draft_pairs[..n] {
-                                block.push(t);
+                            let mut q_dists = Vec::with_capacity(n);
+                            for prop in &draft_props[..n] {
+                                block.push(prop.token);
+                                q_dists.push(prop.q_dist.clone());
                             }
                             let greedy = req.sampling.temperature <= 0.0
                                 && (req.sampling.repetition_penalty - 1.0).abs() < 1e-6;
@@ -1229,7 +1239,7 @@ fn engine_worker_loop(
                                 match engine.verify_for_sampling(&block, req.pos, greedy) {
                                     Err(e) => Err(("verify forward error", e.to_string())),
                                     Ok(()) => engine
-                                        .verify_sample(&block, &req.sampling, &req.generated)
+                                        .verify_sample_with_q(&block, &q_dists, &req.sampling, &req.generated)
                                         .map_err(|e| ("verify sample error", e.to_string())),
                                 };
                             match vres {
@@ -1259,7 +1269,7 @@ fn engine_worker_loop(
                                         spec_vbase_ema = 0.85 * spec_vbase_ema + 0.15 * (dt_v - 2.3 * n as f64).clamp(10.0, 30.0);
                                         let eval_n = (c + 1).min(n);
                                         let pred_sum: f64 = (0..eval_n)
-                                            .map(|k| 1.0 / (1.0 + (-(draft_pairs[k].1 as f64)).exp()))
+                                            .map(|k| 1.0 / (1.0 + (-(draft_props[k].margin as f64)).exp()))
                                             .sum();
                                         spec_pred_ema = 0.85 * spec_pred_ema + pred_sum;
                                         spec_obs_ema = 0.85 * spec_obs_ema + c as f64;

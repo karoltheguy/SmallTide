@@ -6,24 +6,25 @@
 
 *The live expert map (`http://127.0.0.1:8000/expert-map`) during a decode: each token's route through the 48 layers, the experts that are on the card, and the ones rescued or loaded in the background.*
 
-Inkling-2-Mini's routed experts (~14.7 GB across 3,072 NVFP4 & MXFP8 experts) plus dense weights, KV cache, and drafter (~6+ GB) exceed a 16 GB consumer GPU. SmallTide brings [TideLM](https://github.com/raspy135/tideLM)-style adaptive expert residency and custom RDNA 4 HIP kernels to Windows: it keeps the highest-value experts resident in dedicated GDDR6 VRAM, promotes hot misses asynchronously from host RAM/NVMe, rescues high-weight misses inline on the GPU, and accelerates both greedy and sampled generation with Inkling-2-Mini's 3-layer DSpark speculative drafter.
+Inkling-2-Mini's routed experts (~14.7 GB across 3,072 NVFP4 & MXFP8 experts) plus dense weights, KV cache, and drafter (~6+ GB) exceed a 16 GB consumer GPU. SmallTide brings [TideLM](https://github.com/raspy135/tideLM)-style adaptive expert residency and custom RDNA 4 HIP kernels to Windows: it keeps the highest-value experts resident in dedicated GDDR6 VRAM, promotes hot misses asynchronously from host RAM/NVMe, rescues high-weight misses inline on the GPU, and accelerates both greedy and sampled generation with lossless [DFlash 2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) or built-in DSpark speculative decoding.
 
 Pre-built Windows releases embed the compiled `.hsaco` GPU kernels (`gfx1201` and `gfx1200`) inside a single `smalltide-cli.exe` — **no Rust toolchain, no ROCm SDK, and no Python environment required** to install and serve.
 
 ## Measured Performance (RX 9070 XT 16 GB, Windows 11)
 
-Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, thinking off, speculative decoding on, AMD Adrenalin 26.10.44 driver, the settings of `.env.headless.example`, and the monitor on the motherboard output so the card holds nothing but the model (see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard)). *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
+Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 1 run each), temperature 0.6, speculative decoding on, AMD Adrenalin 26.10.44 driver, the settings of `.env.headless.example`, and the monitor on the motherboard output so the card holds nothing but the model (see [Monitor on the card or on the motherboard](#monitor-on-the-card-or-on-the-motherboard)). *Decode* is generation speed; *TTFT* is the time to the first token (it includes reading the prompt).
 
-| Workload | Prompt / output | Decode | TTFT |
-| --- | ---: | ---: | ---: |
-| `prose` (essay) | 58 / 1,024 | **75.6 tok/s** | 216 ms |
-| `code` (LRU cache module + tests) | 74 / 1,024 | **89.3 tok/s** | 250 ms |
-| `edit` (refactor a 1.4K-token file) | 1,425 / 1,024 | **80.4 tok/s** | 0.98 s |
-| `random` (8K-token random prompt) | 8,256 / 1,024 | **95.0 tok/s** | 3.98 s |
-| `angry-birds` (one-shot HTML game) | 76 / 8,192 | **75.7 tok/s** | 342 ms |
-| `mario` (one-shot HTML game) | 66 / 8,192 | **93.8 tok/s** | 355 ms |
+| Workload | Prompt / output | Decode (DFlash 2) | Decode (DSpark) | TTFT |
+| --- | ---: | ---: | ---: | ---: |
+| `prose` (essay, thinking off) | 58 / 1,024 | **87.0 tok/s** *(peak 90.9)* | 75.6 tok/s | 246 ms |
+| `code` (LRU cache + tests, thinking off) | 74 / 1,024 | **91.0 tok/s** *(peak 93.8)* | 89.3 tok/s | 254 ms |
+| `edit` (refactor 1.4K-token file, thinking off) | 1,425 / 1,024 | **109.1 tok/s** *(peak 110.3)* | 80.4 tok/s | 0.88 s |
+| `code --thinking` (reasoning on) | 76 / 1,024 | **115.2 tok/s** *(peak 124.3)* | — | 259 ms |
+| `random` (8K-token random prompt, thinking off) | 8,256 / 1,024 | 68.8 tok/s | **95.0 tok/s** | 4.00 s |
+| `angry-birds` (one-shot HTML game, thinking off) | 76 / 8,192 | **114.4 tok/s** | 75.7 tok/s | 384 ms |
+| `mario` (one-shot HTML game, thinking off) | 66 / 6,173 *(stop)* | **126.2 tok/s** | 93.8 tok/s | 428 ms |
 
-*`random` uses a prompt of random tokens, a worst case for the engine: the three runs hit 95, 114, 89 tok/s (0.50% skipped routing weight). Decode speed depends on draft acceptance and how many experts a run copies in: the three runs of `edit` were 72, 80, 83 tok/s (0.48% skipped routing weight) and `prose` / `code` held 98.9%–99.1% VRAM hit rate (0.35%–0.58% skipped weight).*
+*DFlash 2 (`incoai/Inkling-2-Mini-DFlash2`, `SMALLTIDE_DRAFTER=auto`) runs 5 sliding-window layers in FP8 (~428 MiB VRAM, 0 global KV) with host-RAM selector codebooks and lossless top-16 stochastic rejection sampling, reaching 4.5–4.8 tokens/step on `edit` and `code --thinking`. On synthetic 8K `random` prompts, DSpark's global attention layer still wins; switch anytime via `SMALLTIDE_DRAFTER=dspark` or `dflash2`. `prose` / `code` held 99.0%–99.1% VRAM hit rate (0.30%–0.49% skipped routing weight).*
 
 Reading a prompt (prefill) runs at about 1,750 tokens a second on a cold 11,658-token prompt and about 1,450 on a 58,000-token one.
 
@@ -81,7 +82,7 @@ The RX 9070 GRE and the Radeon AI PRO R9700 are `gfx1201` as well and load the s
 .\smalltide.cmd setup
 ```
 
-`setup` creates `.env.headless`, `.env.monitor`, and `.env` from the `.example` templates, verifies your GPU, its kernels & the HIP driver (`probe`), downloads [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) via built-in `curl.exe` (resumable, ~21 GB; set `$env:HF_TOKEN` only if you want higher Hugging Face rate limits), and packs all 3,072 routed experts into 4 KB-aligned `experts.stide` (~15 s).
+`setup` creates `.env.headless`, `.env.monitor`, and `.env` from the `.example` templates, verifies your GPU, its kernels & the HIP driver (`probe`), downloads [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (~21 GB) and [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) (~944 MB) via built-in `curl.exe` (resumable; set `$env:HF_TOKEN` only if you want higher Hugging Face rate limits), and packs all 3,072 routed experts into 4 KB-aligned `experts.stide` (~15 s).
 
 4. **Start the server** with the config matching your display setup (do not edit or run `.example` files directly — copy them first if not created by `setup`):
 
@@ -155,7 +156,7 @@ Send images as content parts of a user (or tool) message, in the OpenAI format w
 1. **Loop-aware adaptive residency (TideLM).** Inkling-2-Mini runs 24 physical MoE layers as 48 logical layers: 6 Prelude layers, 12 Loop Core layers executed **3 times per token**, and 6 Coda layers. SmallTide tracks every router pick into persistent routing priors (`<MODEL_DIR>/tide_priors.json`), automatically seeded on first boot from `profiles/inkling2-mini-priors.json` (aggregate routing shares only, zero user text). Value-per-byte placement prioritizes the 3× Loop Core first (~98%+ hit rate in VRAM), filling the rest of dedicated VRAM with the hottest Prelude NVFP4 and Coda MXFP8 experts.
 2. **Windows DXGI residency-aware sizing.** On Windows WDDM, `hipMemGetInfo` reports shared system RAM as free VRAM, causing oversized allocations to silently drop ~10× in bandwidth over PCIe. With `SMALLTIDE_POOL_BUDGET=resident` (default), SmallTide queries DXGI's local residency budget and probes copy bandwidth across every 256 MiB window at startup (`fit_pools_to_resident`) so 100% of active expert slots stay on dedicated GDDR6.
 3. **2-Stage Miss Handling + Fused GPU Spin-Wait Rescue.** Non-VRAM experts live warm in host RAM (`SMALLTIDE_RAM_GB=16`: every expert that is not on the card plus the ones most likely to leave it; a stray one is read back in the background) backed by 4 KB-aligned Win32 `FILE_FLAG_NO_BUFFERING` NVMe reads (`experts.stide`). Misses above each zone's gate, up to per-zone budgets of `33/30/35` per step, are copied over PCIe on a dedicated DMA stream and synchronized on-GPU by a fused HIP spin-wait + route-patch kernel (`SMALLTIDE_RESCUE_WAIT=spin`), while the rest are skipped and renormalized. The gates start at `0.07` and are adjusted while decoding so each zone spends about 80% of its budget (`SMALLTIDE_RESCUE_AUTO_GATE=1`). Hot misses promote asynchronously in the background.
-4. **Lossless DSpark Speculative Decoding.** Inkling-2-Mini's 3-layer DSpark drafter (`mtp.safetensors`, ~418 MiB VRAM at 49K ctx) drafts up to 7 tokens per step with confidence-gated adaptive depth. Verification uses GPU-side top-k/top-p filtering (`smalltide_logits_filter_rows`) and exact stochastic rejection sampling, accelerating both `temperature = 0` and `temperature > 0` without altering the target distribution.
+4. **Lossless DFlash 2 & DSpark Speculative Decoding.** SmallTide supports both [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) (5 sliding-window layers with 2-tap grouped dynamic convolutions and a pairwise candidate path selector, ~428 MiB VRAM in FP8 with zero global KV and host-RAM codebooks) and Inkling-2-Mini's built-in 3-layer DSpark drafter (`mtp.safetensors`). Both draft up to 7 tokens per step with confidence-gated adaptive depth. Verification uses GPU-side top-k/top-p filtering (`smalltide_logits_filter_rows`) and exact lossless rejection sampling (including sparse top-16 proposal distributions `q` for DFlash 2 at `temperature > 0`), accelerating both greedy and stochastic sampling without altering the target distribution.
 5. **Paged K8/V4 Global KV & Prefix Caching.** Global-attention KV (8 target layers + 1 drafter layer) is paged from a shared `SMALLTIDE_KV_TOKENS` pool across lanes with asymmetric **`k8v4`** quantization (`SMALLTIDE_KV_FMT=k8v4`: FP8 E4M3 keys for exact attention scores + per-32-group asymmetric INT4 values, saving ~472 MiB at 128K for +115 more resident experts). Multi-turn conversations restore prefix snapshots (including drafter KV state) from pinned host RAM without re-prefilling.
 
 ---
@@ -177,7 +178,8 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 | `SMALLTIDE_ATTN_VTILES` | `all` | Prefill attention reads value vectors decoded once per layer pass. `all` spends 268 MiB of VRAM at 128K context (about 55 resident experts) and reads a 58K-token prompt a third faster; `local` spends 4 MiB; `0` is off. |
 | `SMALLTIDE_BATCH_RESCUE` | `1` | Two requests at once are decoded as one batch; `1` rescues missing experts for the batch like a draft-verify pass, `0` skips them (faster, lower fidelity). |
 | `SMALLTIDE_IDLE_HEARTBEAT_MS` | `1000` | Idle GPU heartbeat; keep it on when no monitor is plugged into the card (see below). `0` turns it off. |
-| `SMALLTIDE_SPEC` | `1` | Enable (`1`) or disable (`0`) DSpark speculative decoding. |
+| `SMALLTIDE_SPEC` | `1` | Enable (`1`) or disable (`0`) speculative decoding. |
+| `SMALLTIDE_DRAFTER` | `auto` | Drafter backend: `auto` (DFlash 2 if `models/Inkling-2-Mini-DFlash2` is present, else DSpark), `dflash2`, or `dspark`. Set `SMALLTIDE_DFLASH2_DIR` to use a custom DFlash 2 checkpoint path. |
 | `SMALLTIDE_VISION` / `SMALLTIDE_VISION_MAX_TOKENS` | `1` / `1536` | Image input on (`1`) or off (`0`), and the most tokens one image takes (larger images are scaled down). |
 | `SMALLTIDE_RAM_PINNED_GB` | `0` | Experimental. This much of the RAM tier in page-locked memory: those experts upload to the card without a copy into the staging buffer (`2`: about 3% faster decode on a 12K-token prompt). Capped at 3; with 5 the server lost the GPU context, see [LIMITATIONS.md](LIMITATIONS.md). |
 | `SMALLTIDE_RAM_GB` | `16` | Host RAM tier for non-VRAM experts. It has to hold every expert that is not on the card (about 4.8 MiB each) with room to spare; `16` holds all 3,072. Set `10` when the monitor is on the motherboard (see below). |

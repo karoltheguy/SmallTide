@@ -201,7 +201,7 @@ fn main() {
     println!(
         "[bench-drafter] loaded mtp.safetensors in {:.2}s | drafter VRAM = {:.1} MiB (max_seq={max_seq}, real_lm_head={use_real})",
         t_boot.elapsed().as_secs_f64(),
-        drafter.vram_bytes as f64 / (1024.0 * 1024.0),
+        drafter.vram_bytes() as f64 / (1024.0 * 1024.0),
     );
 
     // Deterministic taps [4][chunk][D]

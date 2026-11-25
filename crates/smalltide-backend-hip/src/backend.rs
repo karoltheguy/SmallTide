@@ -396,7 +396,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, rescue_write_route, rescue_apply_patch, rescue_wait_and_patch, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_x16, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, gemv_multi_wmma, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, dspark_argmax_final_margin, argmax_rows_part, argmax_rows_reduce, attn_prefill_wmma_split, attn_prefill_wmma_reduce, attn_prefill_wmma_vt, kv_v_tiles_f16, dspark_quant_fold_fp8, dspark_logits_argmax_fp8, dspark_rnn_step, dspark_ctx_store_fp8, dspark_attn_fp8_split, dspark_attn_reduce, dspark_embed_prep, add_rmsnorm_rows, dspark_qk_norm_rope, moe_w2_rows, vit_gemm_bf16, vit_epilogue, vit_ln, vit_rope, vit_attn)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, rescue_write_route, rescue_apply_patch, rescue_wait_and_patch, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_x16, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, gemv_multi_wmma, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, dspark_argmax_final_margin, argmax_rows_part, argmax_rows_reduce, attn_prefill_wmma_split, attn_prefill_wmma_reduce, attn_prefill_wmma_vt, kv_v_tiles_f16, dspark_quant_fold_fp8, dspark_logits_argmax_fp8, dspark_rnn_step, dspark_ctx_store_fp8, dspark_attn_fp8_split, dspark_attn_reduce, dspark_embed_prep, add_rmsnorm_rows, dspark_qk_norm_rope, moe_w2_rows, dflash2_attn_fp8_split, dflash2_conv_prepare, dflash2_conv_finish_add_rmsnorm, topk16_rows_part, topk16_rows_reduce, vit_gemm_bf16, vit_epilogue, vit_ln, vit_rope, vit_attn)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -2557,6 +2557,61 @@ impl ComputeBackend for HipBackend {
         let (mut nq, mut nk, mut p0, mut lt, mut e) = (hq as u32, hk as u32, pos0 as u32, theta.log2(), eps);
         let mut args = [p(&mut qp), p(&mut kp), p(&mut qwp), p(&mut kwp), p(&mut nq), p(&mut nk), p(&mut p0), p(&mut lt), p(&mut e)];
         self.launch(self.kernels.dspark_qk_norm_rope, (nq + nk, rows as u32, 1), 64, &mut args, stream, "launch(dspark_qk_norm_rope)")
+    }
+
+    fn dflash2_attn_fp8(&self, out: DeviceBuf, part_o: DeviceBuf, part_m: DeviceBuf, part_l: DeviceBuf,
+        q: DeviceBuf, kb: DeviceBuf, vb: DeviceBuf, kc: DeviceBuf, ks: DeviceBuf,
+        vc: DeviceBuf, vs: DeviceBuf, rows: usize, pp: usize, window: usize, ring: usize,
+        nh: usize, nkv: usize, nblk: usize, scale: f32, stream: Stream) -> Result<()> {
+        let lo = pp.saturating_sub(window.saturating_sub(1));
+        let nctx = pp.saturating_sub(lo);
+        let num_splits = nctx.div_ceil(128).clamp(1, 16) as u32;
+        let (mut o, mut po, mut pm, mut pl) = (self.dev_ptr(out)?, self.dev_ptr(part_o)?, self.dev_ptr(part_m)?, self.dev_ptr(part_l)?);
+        let (mut qq, mut a, mut b, mut c, mut cs, mut d, mut ds) = (self.dev_ptr(q)?, self.dev_ptr(kb)?, self.dev_ptr(vb)?,
+            self.dev_ptr(kc)?, self.dev_ptr(ks)?, self.dev_ptr(vc)?, self.dev_ptr(vs)?);
+        let (mut pv, mut lv, mut wv, mut rg, mut n1, mut n2, mut nb, mut ns, mut sc) =
+            (pp as u32, lo as u32, window as u32, ring as u32, nh as u32, nkv as u32, nblk as u32, num_splits, scale);
+        let mut args = [p(&mut o), p(&mut po), p(&mut pm), p(&mut pl), p(&mut qq), p(&mut a), p(&mut b),
+            p(&mut c), p(&mut cs), p(&mut d), p(&mut ds), p(&mut pv), p(&mut lv), p(&mut wv), p(&mut rg),
+            p(&mut n1), p(&mut n2), p(&mut nb), p(&mut ns), p(&mut sc)];
+        self.launch(self.kernels.dflash2_attn_fp8_split, (n2, ns, 1), 256, &mut args, stream, "launch(dflash2_attn_fp8_split)")?;
+        if num_splits > 1 {
+            let (mut o2, mut po2, mut pm2, mut pl2, mut n1b, mut ns2) = (o, po, pm, pl, nh as u32, num_splits);
+            let mut rargs = [p(&mut o2), p(&mut po2), p(&mut pm2), p(&mut pl2), p(&mut n1b), p(&mut ns2)];
+            self.launch(self.kernels.dspark_attn_reduce, (n1b, rows as u32, 1), 32, &mut rargs, stream, "launch(dspark_attn_reduce)")?;
+        }
+        Ok(())
+    }
+
+    fn dflash2_conv_prepare(&self, out: DeviceBuf, x: DeviceBuf, coeff: DeviceBuf, base: DeviceBuf,
+        rows: usize, d: usize, group_size: usize, stream: Stream) -> Result<()> {
+        let (mut o, mut xx, mut cc, mut bb) = (self.dev_ptr(out)?, self.dev_ptr(x)?, self.dev_ptr(coeff)?, self.dev_ptr(base)?);
+        let (mut dd, mut gs) = (d as u32, group_size as u32);
+        let mut args = [p(&mut o), p(&mut xx), p(&mut cc), p(&mut bb), p(&mut dd), p(&mut gs)];
+        self.launch(self.kernels.dflash2_conv_prepare, (rows as u32, 1, 1), 256, &mut args, stream, "launch(dflash2_conv_prepare)")
+    }
+
+    fn dflash2_conv_finish_add_rmsnorm(&self, res: DeviceBuf, xn: DeviceBuf, tmp: DeviceBuf,
+        coeff: DeviceBuf, base: DeviceBuf, w: DeviceBuf, rows: usize, d: usize,
+        group_size: usize, eps: f32, stream: Stream) -> Result<()> {
+        let (mut r, mut x, mut t, mut cc, mut bb, mut ww) = (self.dev_ptr(res)?, self.dev_ptr(xn)?,
+            self.dev_ptr(tmp)?, self.dev_ptr(coeff)?, self.dev_ptr(base)?, self.dev_ptr(w)?);
+        let (mut dd, mut gs, mut e) = (d as u32, group_size as u32, eps);
+        let mut args = [p(&mut r), p(&mut x), p(&mut t), p(&mut cc), p(&mut bb), p(&mut ww), p(&mut dd), p(&mut gs), p(&mut e)];
+        self.launch(self.kernels.dflash2_conv_finish_add_rmsnorm, (rows as u32, 1, 1), 1024, &mut args, stream, "launch(dflash2_conv_finish_add_rmsnorm)")
+    }
+
+    fn topk16_rows(&self, out_val: DeviceBuf, out_idx: DeviceBuf,
+        part_val: DeviceBuf, part_idx: DeviceBuf, x: DeviceBuf,
+        rows: usize, n: usize, stream: Stream) -> Result<()> {
+        let num_blocks = n.div_ceil(4096).max(1) as u32;
+        let (mut pv, mut pi, mut xx) = (self.dev_ptr(part_val)?, self.dev_ptr(part_idx)?, self.dev_ptr(x)?);
+        let (mut nn, mut nb) = (n as u32, num_blocks);
+        let mut args1 = [p(&mut pv), p(&mut pi), p(&mut xx), p(&mut nn), p(&mut nb)];
+        self.launch(self.kernels.topk16_rows_part, (num_blocks, rows as u32, 1), 256, &mut args1, stream, "launch(topk16_rows_part)")?;
+        let (mut ov, mut oi, mut pv2, mut pi2, mut nb2) = (self.dev_ptr(out_val)?, self.dev_ptr(out_idx)?, pv, pi, num_blocks);
+        let mut args2 = [p(&mut ov), p(&mut oi), p(&mut pv2), p(&mut pi2), p(&mut nb2)];
+        self.launch(self.kernels.topk16_rows_reduce, (rows as u32, 1, 1), 256, &mut args2, stream, "launch(topk16_rows_reduce)")
     }
 
     fn device_address(&self, buf: DeviceBuf) -> Result<u64> {

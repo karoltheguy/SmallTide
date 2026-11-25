@@ -281,6 +281,11 @@ pub struct CoreKernels {
     pub add_rmsnorm_rows: HipFunction,
     pub dspark_qk_norm_rope: HipFunction,
     pub moe_w2_rows: HipFunction,
+    pub dflash2_attn_fp8_split: HipFunction,
+    pub dflash2_conv_prepare: HipFunction,
+    pub dflash2_conv_finish_add_rmsnorm: HipFunction,
+    pub topk16_rows_part: HipFunction,
+    pub topk16_rows_reduce: HipFunction,
 }
 
 pub struct HipRuntime {
@@ -656,6 +661,11 @@ impl HipRuntime {
             add_rmsnorm_rows: get_fn("smalltide_add_rmsnorm_rows")?,
             dspark_qk_norm_rope: get_fn("smalltide_dspark_qk_norm_rope")?,
             moe_w2_rows: get_fn("smalltide_moe_w2_rows")?,
+            dflash2_attn_fp8_split: get_fn("smalltide_dflash2_attn_fp8_split")?,
+            dflash2_conv_prepare: get_fn("smalltide_dflash2_conv_prepare")?,
+            dflash2_conv_finish_add_rmsnorm: get_fn("smalltide_dflash2_conv_finish_add_rmsnorm")?,
+            topk16_rows_part: get_fn("smalltide_topk16_rows_part")?,
+            topk16_rows_reduce: get_fn("smalltide_topk16_rows_reduce")?,
         })
     }
 

@@ -878,6 +878,38 @@ pub trait ComputeBackend: Send + Sync {
         Err(crate::SmallTideError::Unsupported("dspark_qk_norm_rope".into()))
     }
 
+    /// DFlash 2 grouped Split-K FP8 sliding-window attention (`rows == nblk == 8`, `nh == 4 * nkv`).
+    #[allow(clippy::too_many_arguments)]
+    fn dflash2_attn_fp8(&self, _out: DeviceBuf, _part_o: DeviceBuf, _part_m: DeviceBuf, _part_l: DeviceBuf,
+        _q: DeviceBuf, _kb: DeviceBuf, _vb: DeviceBuf, _kc: DeviceBuf, _ks: DeviceBuf,
+        _vc: DeviceBuf, _vs: DeviceBuf, _rows: usize, _p: usize, _window: usize, _ring: usize,
+        _nh: usize, _nkv: usize, _nblk: usize, _scale: f32, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("dflash2_attn_fp8".into()))
+    }
+
+    /// DFlash 2 grouped 2-tap dynamic causal convolution (prepare / side 0).
+    #[allow(clippy::too_many_arguments)]
+    fn dflash2_conv_prepare(&self, _out: DeviceBuf, _x: DeviceBuf, _coeff: DeviceBuf, _base: DeviceBuf,
+        _rows: usize, _d: usize, _group_size: usize, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("dflash2_conv_prepare".into()))
+    }
+
+    /// DFlash 2 fused grouped 2-tap dynamic conv (finish / side 1) + residual add + RMSNorm.
+    #[allow(clippy::too_many_arguments)]
+    fn dflash2_conv_finish_add_rmsnorm(&self, _res: DeviceBuf, _xn: DeviceBuf, _tmp: DeviceBuf,
+        _coeff: DeviceBuf, _base: DeviceBuf, _w: DeviceBuf, _rows: usize, _d: usize,
+        _group_size: usize, _eps: f32, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("dflash2_conv_finish_add_rmsnorm".into()))
+    }
+
+    /// Exact top-16 `(value, index)` per row over `x [rows, n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn topk16_rows(&self, _out_val: DeviceBuf, _out_idx: DeviceBuf,
+        _part_val: DeviceBuf, _part_idx: DeviceBuf, _x: DeviceBuf,
+        _rows: usize, _n: usize, _stream: Stream) -> Result<()> {
+        Err(crate::SmallTideError::Unsupported("topk16_rows".into()))
+    }
+
     /// Device address of `buf` (for pointer tables consumed by kernels).
     fn device_address(&self, buf: DeviceBuf) -> Result<u64>;
 

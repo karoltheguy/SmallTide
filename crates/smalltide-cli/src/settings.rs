@@ -174,8 +174,12 @@ pub struct Settings {
     pub priors_update: bool,
     pub prior_weight: f32,
     pub priors_newest_share: f32,
-    /// Load the DSpark drafter (`mtp.safetensors`) for speculative decoding (greedy requests).
+    /// Load the speculative drafter (`dspark` or `dflash2`).
     pub spec: bool,
+    /// Drafter backend selection: `auto` (DFlash 2 if present, else DSpark), `dspark`, or `dflash2`.
+    pub drafter_kind: String,
+    /// Optional explicit directory containing `incoai/Inkling-2-Mini-DFlash2` (`model.safetensors`).
+    pub dflash2_dir: Option<PathBuf>,
     /// Concurrent sequences served by `serve` (lane 0 has `max_ctx`, the others `lane_ctx`).
     pub lanes: usize,
     pub lane_ctx: usize,
@@ -228,6 +232,13 @@ impl Settings {
             prior_weight: parse("SMALLTIDE_PRIOR_WEIGHT", 0.35f32, "a number >= 0"),
             priors_newest_share: parse("SMALLTIDE_PRIORS_NEWEST", 0.1f32, "a number in [0, 0.5)"),
             spec: parse::<u8>("SMALLTIDE_SPEC", 0, "0 or 1") != 0,
+            drafter_kind: match var("SMALLTIDE_DRAFTER").as_deref().unwrap_or("auto") {
+                "auto" => "auto".to_string(),
+                "dspark" => "dspark".to_string(),
+                "dflash2" | "dflash" => "dflash2".to_string(),
+                other => bad("SMALLTIDE_DRAFTER", other, "auto | dspark | dflash2"),
+            },
+            dflash2_dir: var("SMALLTIDE_DFLASH2_DIR").map(PathBuf::from),
             model_dir,
             max_ctx: parse("SMALLTIDE_MAX_CTX", 16_384, "a token count"),
             rescue_policy,
@@ -322,15 +333,70 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     };
     // The drafter goes before the VRAM measurement so the pool budget accounts for it.
     let drafter = if s.spec {
-        let path = dir.join("mtp.safetensors");
+        let find_dflash2 = || -> Option<PathBuf> {
+            let mut candidates = Vec::new();
+            if let Some(d) = s.dflash2_dir.as_ref() {
+                candidates.push(d.join("model.safetensors"));
+                candidates.push(d.clone());
+            } else {
+                candidates.push(dir.join("dflash2").join("model.safetensors"));
+                if let Some(parent) = dir.parent() {
+                    candidates.push(parent.join("Inkling-2-Mini-DFlash2").join("model.safetensors"));
+                }
+            }
+            candidates.into_iter().find(|p| p.is_file())
+        };
         let t = Instant::now();
-        let d = smalltide_model_inkling2::drafter::Drafter::load(backend.clone(), &path, &dense_gpu, cfg.unpadded_vocab_size, s.max_ctx,
-            smalltide_model_inkling2::engine::prefill_chunk(), s.kv_v_q4,
-            // Every lane keeps its own drafter context: local rings a lane, and the global layer
-            // in the same pages of the shared KV pool as the lane's global KV.
-            lanes.max(1), kv_pool_pages.map_or(s.max_ctx, |p| p * page)).expect("load drafter (mtp.safetensors)");
-        println!("[spec] DSpark drafter loaded ({:.0} MiB VRAM, kv={}, {:.1}s)", d.vram_bytes as f64 / (1u64 << 20) as f64,
-            if s.kv_v_q4 { "k8v4" } else { "fp8" }, t.elapsed().as_secs_f64());
+        let dflash2_path = if s.drafter_kind == "dspark" { None } else { find_dflash2() };
+        if s.drafter_kind == "dflash2" && dflash2_path.is_none() {
+            eprintln!(
+                "error: SMALLTIDE_DRAFTER=dflash2 requested, but model.safetensors was not found.\n\
+                 Download incoai/Inkling-2-Mini-DFlash2 to models/Inkling-2-Mini-DFlash2 or set SMALLTIDE_DFLASH2_DIR."
+            );
+            std::process::exit(1);
+        }
+        let d = if let Some(path) = dflash2_path {
+            let d = smalltide_model_inkling2::drafter::Drafter::load_dflash2(
+                backend.clone(),
+                &path,
+                &dense_gpu,
+                cfg.unpadded_vocab_size,
+                s.max_ctx,
+                smalltide_model_inkling2::engine::prefill_chunk(),
+                lanes.max(1),
+            )
+            .expect("load DFlash2 drafter (model.safetensors)");
+            println!(
+                "[spec] DFlash2 drafter loaded ({:.0} MiB VRAM, window=2048, 0 global KV, {:.1}s) from {}",
+                d.vram_bytes() as f64 / (1u64 << 20) as f64,
+                t.elapsed().as_secs_f64(),
+                path.display()
+            );
+            d
+        } else {
+            let path = dir.join("mtp.safetensors");
+            let d = smalltide_model_inkling2::drafter::Drafter::load(
+                backend.clone(),
+                &path,
+                &dense_gpu,
+                cfg.unpadded_vocab_size,
+                s.max_ctx,
+                smalltide_model_inkling2::engine::prefill_chunk(),
+                s.kv_v_q4,
+                // Every lane keeps its own drafter context: local rings a lane, and the global layer
+                // in the same pages of the shared KV pool as the lane's global KV.
+                lanes.max(1),
+                kv_pool_pages.map_or(s.max_ctx, |p| p * page),
+            )
+            .expect("load drafter (mtp.safetensors)");
+            println!(
+                "[spec] DSpark drafter loaded ({:.0} MiB VRAM, kv={}, {:.1}s)",
+                d.vram_bytes() as f64 / (1u64 << 20) as f64,
+                if s.kv_v_q4 { "k8v4" } else { "fp8" },
+                t.elapsed().as_secs_f64()
+            );
+            d
+        };
         Some(d)
     } else {
         None

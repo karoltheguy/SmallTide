@@ -2948,3 +2948,338 @@ extern "C" __global__ void smalltide_moe_post_sconv_rows(
     }
     state[c] = s0; state[hidden + c] = s1; state[2u * hidden + c] = s2;
 }
+
+// ===========================================================================
+// DFlash 2 drafter kernels (5-layer sliding-window GQA-4 + 2-tap grouped conv + exact Top-16)
+// ===========================================================================
+
+// Grouped Split-K FP8 sliding-window attention for DFlash 2 (GQA = 4, nh = 32, nkv = 8, nblk = 8).
+// Exact per-row sliding window visibility: row `r` at position `P + r` attends to context `pos < P`
+// iff `(P + r) < pos + window` (i.e. `query_pos - key_pos < window`), plus all `nblk` block rows.
+//   Grid: (nkv, num_splits, 1), Block: (256, 1, 1)
+extern "C" __global__ void smalltide_dflash2_attn_fp8_split(
+    float* __restrict__ out, float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l,
+    const float* __restrict__ q, const float* __restrict__ kb, const float* __restrict__ vb,
+    const uint8_t* __restrict__ kc, const float* __restrict__ ks,
+    const uint8_t* __restrict__ vc, const float* __restrict__ vs,
+    uint32_t P, uint32_t lo, uint32_t window, uint32_t ring, uint32_t nh, uint32_t nkv, uint32_t nblk,
+    uint32_t num_splits, float scale
+) {
+    uint32_t kvh = blockIdx.x, sp = blockIdx.y;
+    uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    uint32_t r = warp; // 8 warps = 8 block rows
+    uint32_t qh0 = kvh * 4u;
+    uint32_t kvd = nkv * 128u;
+    uint32_t q_pos = P + r;
+
+    float4 qv[4];
+    float m[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+    float l[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float4 o[4] = {
+        make_float4(0, 0, 0, 0), make_float4(0, 0, 0, 0),
+        make_float4(0, 0, 0, 0), make_float4(0, 0, 0, 0)
+    };
+    #pragma unroll
+    for (uint32_t g = 0u; g < 4u; ++g) {
+        qv[g] = reinterpret_cast<const float4*>(q + (static_cast<size_t>(r) * nh + qh0 + g) * 128u)[lane];
+    }
+
+    uint32_t nctx = (P > lo) ? (P - lo) : 0u;
+    uint32_t per = (nctx + num_splits - 1u) / num_splits;
+    uint32_t c_start = sp * per;
+    uint32_t c_end = min(nctx, c_start + per);
+
+    __shared__ uint32_t s_k8[16][32];
+    __shared__ uint32_t s_v8[16][32];
+    __shared__ float s_ks[16], s_vs[16];
+
+    uint32_t lt = threadIdx.x >> 4;
+    uint32_t lw = threadIdx.x & 15u;
+    for (uint32_t j0 = c_start; j0 < c_end; j0 += 16u) {
+        uint32_t tlen = min(16u, c_end - j0);
+        if (lt < tlen) {
+            uint32_t pos = lo + j0 + lt;
+            uint32_t slot = (ring != 0u) ? (pos % ring) : pos;
+            size_t head_idx = static_cast<size_t>(slot) * nkv + kvh;
+            uint2 kw = reinterpret_cast<const uint2*>(kc + head_idx * 128u)[lw];
+            s_k8[lt][lw * 2u + 0u] = kw.x; s_k8[lt][lw * 2u + 1u] = kw.y;
+            uint2 vw = reinterpret_cast<const uint2*>(vc + head_idx * 128u)[lw];
+            s_v8[lt][lw * 2u + 0u] = vw.x; s_v8[lt][lw * 2u + 1u] = vw.y;
+            if (lw == 0u) {
+                s_ks[lt] = ks[head_idx] * scale;
+                s_vs[lt] = vs[head_idx];
+            }
+        }
+        __syncthreads();
+        for (uint32_t t = 0u; t < tlen; ++t) {
+            uint32_t pos = lo + j0 + t;
+            if (pos + window <= q_pos) continue;
+            float4 kv4 = decode_fp8x4(s_k8[t][lane]);
+            float4 vv4 = decode_fp8x4(s_v8[t][lane]);
+            float ksc = s_ks[t], vsc = s_vs[t];
+            #pragma unroll
+            for (uint32_t g = 0u; g < 4u; ++g) {
+                float sc = wave32_sum(qv[g].x * kv4.x + qv[g].y * kv4.y + qv[g].z * kv4.z + qv[g].w * kv4.w) * ksc;
+                float mn = fmaxf(m[g], sc);
+                float al = __expf(m[g] - mn), pr = __expf(sc - mn);
+                l[g] = l[g] * al + pr;
+                m[g] = mn;
+                float pv = pr * vsc;
+                o[g].x = fmaf(vv4.x, pv, o[g].x * al); o[g].y = fmaf(vv4.y, pv, o[g].y * al);
+                o[g].z = fmaf(vv4.z, pv, o[g].z * al); o[g].w = fmaf(vv4.w, pv, o[g].w * al);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (sp == num_splits - 1u) {
+        for (uint32_t br = 0u; br < nblk; ++br) {
+            float4 kv4 = reinterpret_cast<const float4*>(kb + static_cast<size_t>(br) * kvd + kvh * 128u)[lane];
+            float4 vv4 = reinterpret_cast<const float4*>(vb + static_cast<size_t>(br) * kvd + kvh * 128u)[lane];
+            #pragma unroll
+            for (uint32_t g = 0u; g < 4u; ++g) {
+                float sc = wave32_sum(qv[g].x * kv4.x + qv[g].y * kv4.y + qv[g].z * kv4.z + qv[g].w * kv4.w) * scale;
+                float mn = fmaxf(m[g], sc);
+                float al = __expf(m[g] - mn), pr = __expf(sc - mn);
+                l[g] = l[g] * al + pr;
+                m[g] = mn;
+                o[g].x = fmaf(vv4.x, pr, o[g].x * al); o[g].y = fmaf(vv4.y, pr, o[g].y * al);
+                o[g].z = fmaf(vv4.z, pr, o[g].z * al); o[g].w = fmaf(vv4.w, pr, o[g].w * al);
+            }
+        }
+    }
+
+    if (num_splits == 1u) {
+        #pragma unroll
+        for (uint32_t g = 0u; g < 4u; ++g) {
+            float inv = (l[g] > 0.0f) ? (1.0f / l[g]) : 0.0f;
+            reinterpret_cast<float4*>(out + (static_cast<size_t>(r) * nh + qh0 + g) * 128u)[lane] =
+                make_float4(o[g].x * inv, o[g].y * inv, o[g].z * inv, o[g].w * inv);
+        }
+    } else {
+        #pragma unroll
+        for (uint32_t g = 0u; g < 4u; ++g) {
+            size_t pidx = (static_cast<size_t>(r) * nh + qh0 + g) * num_splits + sp;
+            if (lane == 0u) { part_m[pidx] = m[g]; part_l[pidx] = l[g]; }
+            reinterpret_cast<float4*>(part_o + pidx * 128u)[lane] = o[g];
+        }
+    }
+}
+
+// DFlash 2 grouped 2-tap dynamic causal convolution (prepare / side 0).
+//   coeff: [rows, 2, 2, G], base: [2, 2, D] (side 0 = base[0..2*D]).
+//   Grid: (rows, 1, 1), Block: (256, 1, 1)
+extern "C" __global__ void smalltide_dflash2_conv_prepare(
+    float* __restrict__ out, const float* __restrict__ x, const float* __restrict__ coeff,
+    const float* __restrict__ base, uint32_t D, uint32_t group_size
+) {
+    uint32_t r = blockIdx.x;
+    uint32_t G = D / group_size;
+    const float* c_row = coeff + static_cast<size_t>(r) * 4u * G;
+    const float* x_cur = x + static_cast<size_t>(r) * D;
+    const float* x_prev = (r > 0u) ? (x + static_cast<size_t>(r - 1u) * D) : nullptr;
+    float* o_row = out + static_cast<size_t>(r) * D;
+    for (uint32_t d = threadIdx.x; d < D; d += blockDim.x) {
+        uint32_t g = d / group_size;
+        float k0 = base[d] + c_row[g];
+        float v = k0 * x_cur[d];
+        if (r > 0u) {
+            float k1 = base[D + d] + c_row[G + g];
+            v = fmaf(k1, x_prev[d], v);
+        }
+        o_row[d] = v;
+    }
+}
+
+// DFlash 2 fused grouped 2-tap dynamic conv (finish / side 1) + residual add + RMSNorm.
+//   res += conv_side1(tmp, coeff, base); xn = RMSNorm(res, w, eps).
+//   Grid: (rows, 1, 1), Block: (1024, 1, 1) (D <= 3072)
+extern "C" __global__ void smalltide_dflash2_conv_finish_add_rmsnorm(
+    float* __restrict__ res, float* __restrict__ xn, const float* __restrict__ tmp,
+    const float* __restrict__ coeff, const float* __restrict__ base, const float* __restrict__ w,
+    uint32_t D, uint32_t group_size, float eps
+) {
+    __shared__ float red[32];
+    uint32_t r = blockIdx.x, t = threadIdx.x;
+    uint32_t G = D / group_size;
+    const float* c_row = coeff + static_cast<size_t>(r) * 4u * G;
+    const float* t_cur = tmp + static_cast<size_t>(r) * D;
+    const float* t_prev = (r > 0u) ? (tmp + static_cast<size_t>(r - 1u) * D) : nullptr;
+    float v[3];
+    float sq = 0.0f;
+    #pragma unroll
+    for (uint32_t e = 0u; e < 3u; ++e) {
+        uint32_t d = t + e * blockDim.x;
+        if (d < D) {
+            uint32_t g = d / group_size;
+            float k0 = base[2u * D + d] + c_row[2u * G + g];
+            float cv = k0 * t_cur[d];
+            if (r > 0u) {
+                float k1 = base[3u * D + d] + c_row[3u * G + g];
+                cv = fmaf(k1, t_prev[d], cv);
+            }
+            size_t idx = static_cast<size_t>(r) * D + d;
+            float s = res[idx] + cv;
+            res[idx] = s;
+            v[e] = s;
+            sq = fmaf(s, s, sq);
+        } else {
+            v[e] = 0.0f;
+        }
+    }
+    sq = wave32_sum(sq);
+    if ((t & 31u) == 0u) red[t >> 5] = sq;
+    __syncthreads();
+    if (t < 32u) {
+        float s = wave32_sum(red[t]);
+        if (t == 0u) red[0] = s;
+    }
+    __syncthreads();
+    float inv = rsqrtf(red[0] / static_cast<float>(D) + eps);
+    #pragma unroll
+    for (uint32_t e = 0u; e < 3u; ++e) {
+        uint32_t d = t + e * blockDim.x;
+        if (d < D) xn[static_cast<size_t>(r) * D + d] = v[e] * inv * w[d];
+    }
+}
+
+__device__ __forceinline__ bool topk_better(float v1, uint32_t i1, float v2, uint32_t i2) {
+    return (v1 > v2) || (v1 == v2 && i1 < i2);
+}
+
+// Exact GPU Top-16 per row, Pass 1: 1 block per 4096 columns (16 coalesced floats per thread).
+//   Grid: (num_blocks, rows, 1), Block: (256, 1, 1) where num_blocks = ceil(n / 4096).
+extern "C" __global__ void smalltide_topk16_rows_part(
+    float* __restrict__ part_val, uint32_t* __restrict__ part_idx,
+    const float* __restrict__ x, uint32_t n, uint32_t num_blocks
+) {
+    __shared__ float sv[8];
+    __shared__ uint32_t si[8];
+    uint32_t bx = blockIdx.x, row = blockIdx.y, t = threadIdx.x;
+    uint32_t lane = t & 31u, wid = t >> 5;
+    const float* xr = x + static_cast<size_t>(row) * n;
+    uint32_t base_col = bx * 4096u;
+
+    float v[16];
+    uint32_t id[16];
+    #pragma unroll
+    for (uint32_t e = 0u; e < 16u; ++e) {
+        uint32_t col = base_col + e * 256u + t;
+        if (col < n) {
+            v[e] = xr[col];
+            id[e] = col;
+        } else {
+            v[e] = -1e38f;
+            id[e] = 0xFFFFFFFFu;
+        }
+    }
+
+    size_t out_base = (static_cast<size_t>(row) * num_blocks + bx) * 16u;
+    for (uint32_t k = 0u; k < 16u; ++k) {
+        float bv = -1e38f;
+        uint32_t bi = 0xFFFFFFFFu;
+        #pragma unroll
+        for (uint32_t e = 0u; e < 16u; ++e) {
+            if (topk_better(v[e], id[e], bv, bi)) { bv = v[e]; bi = id[e]; }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_xor(bv, off, 32);
+            uint32_t oi = __shfl_xor(bi, off, 32);
+            if (topk_better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0u) { sv[wid] = bv; si[wid] = bi; }
+        __syncthreads();
+        if (wid == 0u) {
+            bv = (lane < 8u) ? sv[lane] : -1e38f;
+            bi = (lane < 8u) ? si[lane] : 0xFFFFFFFFu;
+            #pragma unroll
+            for (int off = 4; off > 0; off >>= 1) {
+                float ov = __shfl_xor(bv, off, 32);
+                uint32_t oi = __shfl_xor(bi, off, 32);
+                if (topk_better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+            }
+            if (lane == 0u) {
+                sv[0] = bv; si[0] = bi;
+                part_val[out_base + k] = bv;
+                part_idx[out_base + k] = bi;
+            }
+        }
+        __syncthreads();
+        uint32_t win = si[0];
+        #pragma unroll
+        for (uint32_t e = 0u; e < 16u; ++e) {
+            if (id[e] == win) { v[e] = -1e38f; id[e] = 0xFFFFFFFFu; }
+        }
+        __syncthreads();
+    }
+}
+
+// Exact GPU Top-16 per row, Pass 2: reduces `num_blocks * 16` (<= 2048) candidates to sorted top-16.
+//   Grid: (rows, 1, 1), Block: (256, 1, 1)
+extern "C" __global__ void smalltide_topk16_rows_reduce(
+    float* __restrict__ out_val, uint32_t* __restrict__ out_idx,
+    const float* __restrict__ part_val, const uint32_t* __restrict__ part_idx,
+    uint32_t num_blocks
+) {
+    __shared__ float sv[8];
+    __shared__ uint32_t si[8];
+    uint32_t row = blockIdx.x, t = threadIdx.x;
+    uint32_t lane = t & 31u, wid = t >> 5;
+    uint32_t total = num_blocks * 16u;
+    size_t in_base = static_cast<size_t>(row) * total;
+
+    float v[8];
+    uint32_t id[8];
+    #pragma unroll
+    for (uint32_t e = 0u; e < 8u; ++e) {
+        uint32_t j = e * 256u + t;
+        if (j < total) {
+            v[e] = part_val[in_base + j];
+            id[e] = part_idx[in_base + j];
+        } else {
+            v[e] = -1e38f;
+            id[e] = 0xFFFFFFFFu;
+        }
+    }
+
+    size_t out_base = static_cast<size_t>(row) * 16u;
+    for (uint32_t k = 0u; k < 16u; ++k) {
+        float bv = -1e38f;
+        uint32_t bi = 0xFFFFFFFFu;
+        #pragma unroll
+        for (uint32_t e = 0u; e < 8u; ++e) {
+            if (topk_better(v[e], id[e], bv, bi)) { bv = v[e]; bi = id[e]; }
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_xor(bv, off, 32);
+            uint32_t oi = __shfl_xor(bi, off, 32);
+            if (topk_better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0u) { sv[wid] = bv; si[wid] = bi; }
+        __syncthreads();
+        if (wid == 0u) {
+            bv = (lane < 8u) ? sv[lane] : -1e38f;
+            bi = (lane < 8u) ? si[lane] : 0xFFFFFFFFu;
+            #pragma unroll
+            for (int off = 4; off > 0; off >>= 1) {
+                float ov = __shfl_xor(bv, off, 32);
+                uint32_t oi = __shfl_xor(bi, off, 32);
+                if (topk_better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+            }
+            if (lane == 0u) {
+                sv[0] = bv; si[0] = bi;
+                out_val[out_base + k] = bv;
+                out_idx[out_base + k] = bi;
+            }
+        }
+        __syncthreads();
+        uint32_t win = si[0];
+        #pragma unroll
+        for (uint32_t e = 0u; e < 8u; ++e) {
+            if (id[e] == win) { v[e] = -1e38f; id[e] = 0xFFFFFFFFu; }
+        }
+        __syncthreads();
+    }
+}

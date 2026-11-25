@@ -7,6 +7,7 @@
 //!
 //! Implemented in Phase 2 (exact forward pass) and Phase 4 (dspark integration).
 
+pub mod dflash2;
 pub mod drafter;
 pub mod engine;
 pub mod kv_pager;

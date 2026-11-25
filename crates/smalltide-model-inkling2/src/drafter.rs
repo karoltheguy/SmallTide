@@ -94,7 +94,7 @@ struct Scratch {
     pinned: PinnedBuf,    // [D] f32 (single anchor row)
 }
 
-pub struct Drafter<B: ComputeBackend> {
+pub struct DSparkDrafter<B: ComputeBackend> {
     backend: Arc<B>,
     layers: Vec<DrafterLayer>,
     norm_w: DeviceBuf,
@@ -135,7 +135,7 @@ fn bf16r(x: f32) -> f32 {
     f32::from_bits(r & 0xFFFF_0000)
 }
 
-fn quantize_f32_rows_to_fp8(src: &[f32], n_rows: usize, k_cols: usize) -> Fp8MatrixHost {
+pub(crate) fn quantize_f32_rows_to_fp8(src: &[f32], n_rows: usize, k_cols: usize) -> Fp8MatrixHost {
     let mut data = vec![0u8; n_rows * k_cols];
     let mut row_scales = vec![1.0f32; n_rows];
     for r in 0..n_rows {
@@ -151,7 +151,7 @@ fn quantize_f32_rows_to_fp8(src: &[f32], n_rows: usize, k_cols: usize) -> Fp8Mat
     Fp8MatrixHost { n_rows, k_cols, data, row_scales }
 }
 
-impl<B: ComputeBackend> Drafter<B> {
+impl<B: ComputeBackend> DSparkDrafter<B> {
     /// Loads `mtp.safetensors` (dense projections quantized to FP8 per row), keeps `w1` in
     /// host-mapped pinned memory, splits `rnn_proj` into dynamic/static blocks, uses FP8 context
     /// KV, and folds `U @ hidden_out` into padded FP8 E4M3FN.
@@ -559,7 +559,7 @@ impl<B: ComputeBackend> Drafter<B> {
     }
 }
 
-impl<B: ComputeBackend> Drop for Drafter<B> {
+impl<B: ComputeBackend> Drop for DSparkDrafter<B> {
     fn drop(&mut self) {
         let b = self.backend.as_ref();
         for ly in &self.layers {
@@ -601,5 +601,179 @@ impl<B: ComputeBackend> Drop for Drafter<B> {
             let _ = b.free_device(buf);
         }
         let _ = b.free_pinned(sc.pinned);
+    }
+}
+
+/// One speculative draft token proposal with confidence margin and optional sparse draft
+/// probability distribution `q` (for lossless stochastic rejection sampling at `temperature > 0`).
+#[derive(Clone, Debug)]
+pub struct DraftProposal {
+    pub token: u32,
+    pub margin: f32,
+    /// When `Some`, `(candidate_id, q_prob)` over the top-K candidates drawn by the drafter;
+    /// when `None`, deterministic proposal `q(token) = 1`.
+    pub q_dist: Option<Vec<(u32, f32)>>,
+}
+
+/// Unified speculative drafter: either Inkling-2-Mini's native DSpark (`mtp.safetensors`) or
+/// Inco AI's DFlash 2 (`incoai/Inkling-2-Mini-DFlash2` `model.safetensors`).
+pub enum Drafter<B: ComputeBackend> {
+    DSpark(DSparkDrafter<B>),
+    DFlash2(crate::dflash2::DFlash2Drafter<B>),
+}
+
+impl<B: ComputeBackend> Drafter<B> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        backend: Arc<B>,
+        path: &Path,
+        dense: &Inkling2DenseGpu<B>,
+        vocab: usize,
+        max_seq: usize,
+        chunk: usize,
+        global_v_q4: bool,
+        lanes: usize,
+        global_slots: usize,
+    ) -> Result<Self> {
+        Ok(Self::DSpark(DSparkDrafter::load(
+            backend, path, dense, vocab, max_seq, chunk, global_v_q4, lanes, global_slots,
+        )?))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_dflash2(
+        backend: Arc<B>,
+        path: &Path,
+        dense: &Inkling2DenseGpu<B>,
+        vocab: usize,
+        max_seq: usize,
+        chunk: usize,
+        lanes: usize,
+    ) -> Result<Self> {
+        Ok(Self::DFlash2(crate::dflash2::DFlash2Drafter::load(
+            backend, path, dense, vocab, max_seq, chunk, lanes,
+        )?))
+    }
+
+    pub fn vram_bytes(&self) -> usize {
+        match self {
+            Self::DSpark(d) => d.vram_bytes,
+            Self::DFlash2(d) => d.vram_bytes,
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::DSpark(_) => "dspark",
+            Self::DFlash2(_) => "dflash2",
+        }
+    }
+
+    pub fn set_lane(&mut self, lane: usize, page_table: Option<DeviceBuf>) {
+        match self {
+            Self::DSpark(d) => d.set_lane(lane, page_table),
+            Self::DFlash2(d) => d.set_lane(lane, page_table),
+        }
+    }
+
+    pub fn lanes(&self) -> usize {
+        match self {
+            Self::DSpark(d) => d.lanes(),
+            Self::DFlash2(d) => d.lanes(),
+        }
+    }
+
+    pub fn global_kv_bytes_per_pos(&self) -> usize {
+        match self {
+            Self::DSpark(d) => d.global_kv_bytes_per_pos(),
+            Self::DFlash2(_) => 0,
+        }
+    }
+
+    pub fn resize_global_slots(&mut self, new_slots: usize, s: Stream) -> Result<()> {
+        match self {
+            Self::DSpark(d) => d.resize_global_slots(new_slots, s),
+            Self::DFlash2(_) => Ok(()),
+        }
+    }
+
+    pub fn ingest(&self, taps: DeviceBuf, tap_stride: usize, pos0: usize, m: usize, s: Stream) -> Result<()> {
+        match self {
+            Self::DSpark(d) => d.ingest(taps, tap_stride, pos0, m, s),
+            Self::DFlash2(d) => d.ingest(taps, tap_stride, pos0, m, s),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft(
+        &mut self,
+        dense: &Inkling2DenseGpu<B>,
+        anchor: u32,
+        p: usize,
+        taps: DeviceBuf,
+        tap_stride: usize,
+        tap_row: usize,
+        n: usize,
+        s: Stream,
+    ) -> Result<Vec<u32>> {
+        Ok(self.draft_with_margins(dense, anchor, p, taps, tap_stride, tap_row, n, s)?.into_iter().map(|(t, _)| t).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft_with_margins(
+        &mut self,
+        dense: &Inkling2DenseGpu<B>,
+        anchor: u32,
+        p: usize,
+        taps: DeviceBuf,
+        tap_stride: usize,
+        tap_row: usize,
+        n: usize,
+        s: Stream,
+    ) -> Result<Vec<(u32, f32)>> {
+        match self {
+            Self::DSpark(d) => d.draft_with_margins(dense, anchor, p, taps, tap_stride, tap_row, n, s),
+            Self::DFlash2(d) => d.draft_with_margins(dense, anchor, p, taps, tap_stride, tap_row, n, s),
+        }
+    }
+
+    /// Drafts `n` tokens with optional stochastic sampling (`temperature > 0` for DFlash 2) and
+    /// sparse proposal distributions `q` for lossless speculative rejection sampling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft_proposals(
+        &mut self,
+        dense: &Inkling2DenseGpu<B>,
+        anchor: u32,
+        p: usize,
+        taps: DeviceBuf,
+        tap_stride: usize,
+        tap_row: usize,
+        n: usize,
+        temperature: f32,
+        rng: &mut u64,
+        s: Stream,
+    ) -> Result<Vec<DraftProposal>> {
+        match self {
+            Self::DSpark(d) => Ok(d
+                .draft_with_margins(dense, anchor, p, taps, tap_stride, tap_row, n, s)?
+                .into_iter()
+                .map(|(token, margin)| DraftProposal { token, margin, q_dist: None })
+                .collect()),
+            Self::DFlash2(d) => d.draft_proposals(dense, anchor, p, n, temperature, rng, s),
+        }
+    }
+
+    pub fn local_kv_regions(&self) -> Vec<DeviceBuf> {
+        match self {
+            Self::DSpark(d) => d.local_kv_regions(),
+            Self::DFlash2(d) => d.local_kv_regions(),
+        }
+    }
+
+    pub fn global_kv_regions(&self) -> Vec<(DeviceBuf, usize)> {
+        match self {
+            Self::DSpark(d) => d.global_kv_regions(),
+            Self::DFlash2(_) => Vec::new(),
+        }
     }
 }

@@ -2358,6 +2358,22 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         d.draft_with_margins(&self.dense, anchor, p, taps, prefill_chunk(), tap_row, n, s)
     }
 
+    /// Drafts `n` proposals with optional stochastic top-K sampling (`temperature > 0`) for
+    /// lossless speculative rejection sampling (`verify_sample_with_q`).
+    pub fn draft_proposals(
+        &mut self,
+        anchor: u32,
+        p: usize,
+        tap_row: usize,
+        n: usize,
+        temperature: f32,
+    ) -> Result<Vec<crate::drafter::DraftProposal>> {
+        let taps = self.taps_buf.expect("taps buffer");
+        let s = self.tide.compute_stream;
+        let d = self.drafter.as_mut().expect("drafter attached");
+        d.draft_proposals(&self.dense, anchor, p, taps, prefill_chunk(), tap_row, n, temperature, &mut self.rng_state, s)
+    }
+
     /// Speculative verify (greedy): skips monotonic final logit softcap; follow with `rows_argmax`
     /// and `verify_rewind`.
     /// Arms the GPU-side rescue checks for a multi-row pass of `m` rows - a draft-verify block
@@ -2468,6 +2484,19 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         params: &SamplingParams,
         recent_tokens: &[u32],
     ) -> Result<(usize, u32)> {
+        self.verify_sample_with_q(block, &[], params, recent_tokens)
+    }
+
+    /// Like `verify_sample`, supporting per-position sparse draft distributions `q_dists[c]`
+    /// (for DFlash 2 stochastic top-K proposals: accept with `min(1, p(d)/q(d))`, residual
+    /// `max(0, p - q)`). Positions where `q_dists.get(c)` is `None` use deterministic `q(d) = 1`.
+    pub fn verify_sample_with_q(
+        &mut self,
+        block: &[u32],
+        q_dists: &[Option<Vec<(u32, f32)>>],
+        params: &SamplingParams,
+        recent_tokens: &[u32],
+    ) -> Result<(usize, u32)> {
         let m = block.len();
         let n = m.saturating_sub(1);
         let no_rep = (params.repetition_penalty - 1.0).abs() < 1e-6;
@@ -2536,14 +2565,33 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 let mut probs = row_probs(c)?;
                 let draft = block[c + 1];
                 let p_d = probs.iter().find(|&&(id, _)| id == draft).map(|&(_, p)| p).unwrap_or(0.0);
-                if next_rand_f32(&mut self.rng_state) < p_d {
-                    continue;
+                if let Some(q_vec) = q_dists.get(c).and_then(|o| o.as_ref()) {
+                    let q_d = q_vec.iter().find(|&&(id, _)| id == draft).map(|&(_, q)| q).unwrap_or(1.0);
+                    if next_rand_f32(&mut self.rng_state) * q_d < p_d {
+                        continue;
+                    }
+                    let mut res_sum = 0.0f32;
+                    for (id, p) in probs.iter_mut() {
+                        let q_i = q_vec.iter().find(|&&(qid, _)| qid == *id).map(|&(_, q)| q).unwrap_or(0.0);
+                        *p = (*p - q_i).max(0.0);
+                        res_sum += *p;
+                    }
+                    if res_sum > 1e-12 {
+                        probs.retain(|&(_, p)| p > 0.0);
+                        return Ok((c, sample_from_probs(&probs, &mut self.rng_state)));
+                    }
+                    let fallback = row_probs(c)?;
+                    return Ok((c, sample_from_probs(&fallback, &mut self.rng_state)));
+                } else {
+                    if next_rand_f32(&mut self.rng_state) < p_d {
+                        continue;
+                    }
+                    probs.retain(|&(id, _)| id != draft);
+                    if probs.is_empty() {
+                        return Ok((c, draft));
+                    }
+                    return Ok((c, sample_from_probs(&probs, &mut self.rng_state)));
                 }
-                probs.retain(|&(id, _)| id != draft);
-                if probs.is_empty() {
-                    return Ok((c, draft));
-                }
-                return Ok((c, sample_from_probs(&probs, &mut self.rng_state)));
             }
             let probs = row_probs(n)?;
             return Ok((n, sample_from_probs(&probs, &mut self.rng_state)));
@@ -2555,7 +2603,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         };
         self.backend.memcpy_d2h_sync(raw_bytes, bl.slice(0, m * vocab * 4), 0, s)?;
 
-        Ok(verify_sample_rows(&mut all_logits, vocab, block, params, recent_tokens, &mut self.rng_state))
+        Ok(verify_sample_rows_with_q(&mut all_logits, vocab, block, q_dists, params, recent_tokens, &mut self.rng_state))
     }
 
     /// Limits pending batch routing bookkeeping to the `keep` committed rows of a speculative
@@ -3907,10 +3955,23 @@ fn sample_from_probs(probs: &[(u32, f32)], rng: &mut u64) -> u32 {
 
 /// Exact lossless speculative verification over `block.len()` flat logit rows (`[m][vocab]`).
 /// Returns `(accepted_drafts, next_token)`.
+#[cfg(test)]
 pub(crate) fn verify_sample_rows(
     all_logits: &mut [f32],
     vocab: usize,
     block: &[u32],
+    params: &SamplingParams,
+    recent_tokens: &[u32],
+    rng: &mut u64,
+) -> (usize, u32) {
+    verify_sample_rows_with_q(all_logits, vocab, block, &[], params, recent_tokens, rng)
+}
+
+pub(crate) fn verify_sample_rows_with_q(
+    all_logits: &mut [f32],
+    vocab: usize,
+    block: &[u32],
+    q_dists: &[Option<Vec<(u32, f32)>>],
     params: &SamplingParams,
     recent_tokens: &[u32],
     rng: &mut u64,
@@ -3929,6 +3990,24 @@ pub(crate) fn verify_sample_rows(
             return (c, best);
         }
         let p_d = probs.iter().find(|&&(id, _)| id == draft).map(|&(_, p)| p).unwrap_or(0.0);
+        if let Some(q_vec) = q_dists.get(c).and_then(|o| o.as_ref()) {
+            let q_d = q_vec.iter().find(|&&(id, _)| id == draft).map(|&(_, q)| q).unwrap_or(1.0);
+            if next_rand_f32(rng) * q_d < p_d {
+                continue;
+            }
+            let fallback = probs.clone();
+            let mut res_sum = 0.0f32;
+            for (id, p) in probs.iter_mut() {
+                let q_i = q_vec.iter().find(|&&(qid, _)| qid == *id).map(|&(_, q)| q).unwrap_or(0.0);
+                *p = (*p - q_i).max(0.0);
+                res_sum += *p;
+            }
+            if res_sum > 1e-12 {
+                probs.retain(|&(_, p)| p > 0.0);
+                return (c, sample_from_probs(&probs, rng));
+            }
+            return (c, sample_from_probs(&fallback, rng));
+        }
         let u = next_rand_f32(rng);
         if u < p_d {
             continue;
@@ -3991,6 +4070,55 @@ mod tests {
                     "draft={draft} tok={i}: empirical={empirical:.4} vs expected={expected:.4}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn verify_sample_with_q_exact_target_distribution() {
+        // Verify that stochastic speculative rejection sampling with a sparse top-K draft
+        // distribution `q` (accept with `min(1, p/q)`, residual `max(0, p - q)`) reproduces the
+        // exact target probability distribution `p(y)` while boosting acceptance rate over q(d)=1.
+        let base_logits = [2.0f32, 1.5, 1.0, 0.2, -1.0, -3.0];
+        let vocab = base_logits.len();
+        let params = SamplingParams {
+            temperature: 0.7,
+            top_p: 0.95,
+            top_k: 4,
+            repetition_penalty: 1.0,
+            seed: 42,
+        };
+        let mut ref_logits = base_logits;
+        let target_probs = row_target_probs(&mut ref_logits, &params, &[], &[]);
+
+        // Mismatched top-3 draft distribution (even includes token 4 outside target top_k=4).
+        let q_vec = vec![(0u32, 0.40f32), (1u32, 0.35), (2u32, 0.15), (4u32, 0.10)];
+        let q_dists = vec![Some(q_vec.clone())];
+        let mut rng = 0xCAFE_BABE_1234_5679u64;
+        let mut counts = vec![0usize; vocab];
+        let mut accepted = 0usize;
+        let trials = 80_000usize;
+        let mut buf = vec![0.0f32; 2 * vocab];
+        for _ in 0..trials {
+            let draft = sample_from_probs(&q_vec, &mut rng);
+            buf[..vocab].copy_from_slice(&base_logits);
+            buf[vocab..].copy_from_slice(&base_logits);
+            let (acc, next_tok) = verify_sample_rows_with_q(&mut buf, vocab, &[99, draft], &q_dists, &params, &[], &mut rng);
+            if acc == 1 {
+                accepted += 1;
+            }
+            let emitted = if acc == 1 { draft } else { next_tok };
+            counts[emitted as usize] += 1;
+        }
+        // Acceptance rate should be ~sum min(p, q) (~0.83), far higher than max(p) (~0.52).
+        let acc_rate = accepted as f32 / trials as f32;
+        assert!(acc_rate > 0.75, "expected high stochastic acceptance rate, got {acc_rate:.4}");
+        for i in 0..vocab {
+            let expected = target_probs.iter().find(|&&(id, _)| id == i as u32).map(|&(_, p)| p).unwrap_or(0.0);
+            let empirical = counts[i] as f32 / trials as f32;
+            assert!(
+                (empirical - expected).abs() < 0.01,
+                "tok={i}: empirical={empirical:.4} vs expected={expected:.4}"
+            );
         }
     }
 }

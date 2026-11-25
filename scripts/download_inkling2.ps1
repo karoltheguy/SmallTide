@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$OutDir = ""
+    [string]$OutDir = "",
+    [switch]$SkipDFlash2
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,3 +57,24 @@ foreach ($f in $files) {
 }
 
 Write-Host "[Download] All Inkling-2-Mini files completed!"
+
+if (-not $SkipDFlash2) {
+    $dflash2Dir = if ($env:SMALLTIDE_DFLASH2_DIR) {
+        if ([System.IO.Path]::IsPathRooted($env:SMALLTIDE_DFLASH2_DIR)) { $env:SMALLTIDE_DFLASH2_DIR } else { Join-Path $repoRoot $env:SMALLTIDE_DFLASH2_DIR }
+    } else {
+        Join-Path (Split-Path -Parent $OutDir) "Inkling-2-Mini-DFlash2"
+    }
+    New-Item -ItemType Directory -Force -Path $dflash2Dir | Out-Null
+    $dflash2Base = "https://huggingface.co/incoai/Inkling-2-Mini-DFlash2/resolve/main"
+    Write-Host ""
+    Write-Host "[Download] DFlash 2 drafter: https://huggingface.co/incoai/Inkling-2-Mini-DFlash2 (~944 MB, resumable) -> $dflash2Dir"
+    foreach ($f in @("config.json", "model.safetensors")) {
+        $out = Join-Path $dflash2Dir $f
+        Write-Host "[Download] $f -> $out"
+        & $curlCmd.Source -fL -C - --retry 3 --retry-delay 2 @headers "$dflash2Base/$f" -o $out
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "[Download] Could not download DFlash 2 ($f, exit $LASTEXITCODE); SmallTide will fall back to built-in DSpark (mtp.safetensors)."
+            break
+        }
+    }
+}

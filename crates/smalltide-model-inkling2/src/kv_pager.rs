@@ -661,24 +661,21 @@ impl KvPool {
         v
     }
 
+    /// True if `lane` currently holds any physical page `>= limit`.
+    pub fn lane_has_pages_above(&self, lane: usize, limit: usize) -> bool {
+        let limit = limit as u32;
+        let l = &self.lanes[lane];
+        l.local_slots.iter().any(|v| v.iter().flatten().any(|&p| p >= limit))
+            || l.global_slots.iter().any(|v| v.iter().any(|&p| p >= limit))
+            || l.drafter_slots.iter().any(|v| v.iter().flatten().any(|&p| p >= limit))
+    }
+
     /// True if the pool is larger than `target_pages` and no lane currently holds any page `>= target_pages`.
     pub fn can_shrink_to(&self, target_pages: usize) -> bool {
         if self.n_pages <= target_pages {
             return false;
         }
-        let limit = target_pages as u32;
-        for l in &self.lanes {
-            if l.local_slots.iter().any(|v| v.iter().flatten().any(|&p| p >= limit)) {
-                return false;
-            }
-            if l.global_slots.iter().any(|v| v.iter().any(|&p| p >= limit)) {
-                return false;
-            }
-            if l.drafter_slots.iter().any(|v| v.iter().flatten().any(|&p| p >= limit)) {
-                return false;
-            }
-        }
-        true
+        (0..self.lanes.len()).all(|lane| !self.lane_has_pages_above(lane, target_pages))
     }
 
     /// Resizes the pool's physical page count to `new_n_pages` (capped at `max_pages`).
@@ -823,5 +820,32 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 272);
+    }
+
+    #[test]
+    fn lane_has_pages_above_identifies_only_blocking_lanes() {
+        let mut p = KvPool::new(64, 32_768, 1024);
+        p.set_max_pages(256);
+        for _ in 0..2 {
+            p.lanes.push(dummy_lane(p.local_ring_pages, p.drafter_ring_pages));
+            p.pinned.push(false);
+            p.lost.push(false);
+        }
+        // Lane 0: 4 global pages/layer = 32 low pages (0..32).
+        assert!(p.ensure_global_slots(0, 4).0);
+        // Lane 1: grow to 128 and take 6 global pages/layer = 48 pages (32..80 -> crosses 64).
+        p.resize(128);
+        assert!(p.ensure_global_slots(1, 6).0);
+        assert!(!p.lane_has_pages_above(0, 64));
+        assert!(p.lane_has_pages_above(1, 64));
+        assert!(!p.can_shrink_to(64));
+
+        // Releasing only the blocking lane (lane 1) lets the pool shrink while lane 0 stays intact.
+        p.release(1, 0);
+        assert!(!p.lane_has_pages_above(1, 64));
+        assert!(p.can_shrink_to(64));
+        p.resize(64);
+        assert_eq!(p.pages_total(), 64);
+        assert_eq!(p.lanes[0].total_pages(), 32);
     }
 }

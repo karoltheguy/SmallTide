@@ -1370,15 +1370,17 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         Ok(())
     }
 
-    /// Number of rows per `(logical_layer, conv_kind)` in `verify_hist`: fits up to 32 concurrent
-    /// speculative slices (`sum(3 + width_i) <= 32 * 3 + MAX_BATCH_ROWS = 160`, covering `8x8`, `16x4`, `32x2`).
-    const VERIFY_HIST_ROWS: usize = 32 * 3 + MAX_BATCH_ROWS;
+    /// Number of rows per `(logical_layer, conv_kind)` in `verify_hist`: fits `num_lanes`
+    /// concurrent speculative slices (`sum(3 + width_i) <= min(num_lanes, 32) * 3 + MAX_BATCH_ROWS`).
+    fn verify_hist_rows(&self) -> usize {
+        self.num_lanes().clamp(1, 32) * 3 + MAX_BATCH_ROWS
+    }
 
     /// History slice of logical layer `il`, short conv `kind` (0 k, 1 v, 2 attn-out, 3 mlp).
     pub(crate) fn verify_hist_slice(&self, il: usize, kind: usize) -> DeviceBuf {
         let kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
         let h = self.cfg.hidden_size;
-        let rows = Self::VERIFY_HIST_ROWS;
+        let rows = self.verify_hist_rows();
         let (off, dim) = match kind {
             0 => (0, kv),
             1 => (rows * kv, kv),
@@ -1432,7 +1434,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let h = self.cfg.hidden_size;
         let n_log = self.layer_states.len();
         if self.verify_hist.is_none() {
-            let per_layer_bytes = Self::VERIFY_HIST_ROWS * (2 * kv + 2 * h) * 4;
+            let per_layer_bytes = self.verify_hist_rows() * (2 * kv + 2 * h) * 4;
             // Alias all 48 logical layers' verify_hist across the unused tails of PrefillScratch
             // (for m <= 64, bank/blocks use 0..4.5 MiB, messages 0..2.25 MiB, in_qkv/ctrl_qkv 0..1.69 MiB)
             // -> 0 extra VRAM even at MAX_BATCH_ROWS = 64!
@@ -2611,6 +2613,30 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             t0.elapsed().as_secs_f64() * 1000.0
         );
         Ok(true)
+    }
+
+    /// True if elastic KV is enabled and currently expanded past its baseline `init_pages`.
+    pub fn kv_is_expanded(&self) -> bool {
+        let Some((init_pages, _, _)) = self.elastic_kv else {
+            return false;
+        };
+        self.kv_pool.as_ref().is_some_and(|(p, _)| p.pages_total() > init_pages)
+    }
+
+    /// Lanes currently holding any KV page above the elastic baseline `init_pages` (preventing shrink).
+    pub fn kv_lanes_blocking_shrink(&self) -> Vec<usize> {
+        let Some((init_pages, _, _)) = self.elastic_kv else {
+            return Vec::new();
+        };
+        let Some((ref pool, _)) = self.kv_pool else {
+            return Vec::new();
+        };
+        if pool.pages_total() <= init_pages {
+            return Vec::new();
+        }
+        (0..self.num_lanes())
+            .filter(|&l| pool.lane_has_pages_above(l, init_pages))
+            .collect()
     }
 
     /// Shrinks the elastic KV pool back to its initial size if all currently allocated pages across

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const SERVED_MODEL_NAME: &str = "inkling-2-mini";
 
@@ -783,12 +783,98 @@ fn engine_worker_loop(
     let mut spec_vbase_ema = 16.0f64;
     let batch_spec = std::env::var("SMALLTIDE_BATCH_SPEC").map(|v| v != "0").unwrap_or(true);
     let mut batch_spec_rr: usize = 0;
+    // Idle-only elastic KV shrink: when the engine has been completely idle for this many seconds
+    // while the elastic KV pool is expanded above its baseline, snapshot any blocking lanes into
+    // the RAM prefix cache first, release their VRAM pages, and shrink the KV pool back so borrowed
+    // NVFP4 expert slots return to VRAM. 0 disables automatic idle shrinking.
+    let idle_shrink_secs: u64 = std::env::var("SMALLTIDE_KV_IDLE_SHRINK_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(300);
+    let mut idle_since: Option<Instant> = None;
+    let mut lane_cacheable: Vec<bool> = vec![true; n_lanes];
+    let mut lane_last_used: Vec<u64> = vec![0; n_lanes];
+    let mut lane_use_tick: u64 = 0;
 
     loop {
         // 1. Commands: block only when there is nothing to do.
         let idle = queue.is_empty() && active.iter().all(|a| a.is_none());
         let mut cmds = Vec::new();
-        if idle {
+        if !idle {
+            idle_since = None;
+        } else if idle_shrink_secs > 0 && engine.kv_is_expanded() {
+            let since = *idle_since.get_or_insert_with(Instant::now);
+            let wait = Duration::from_secs(idle_shrink_secs).saturating_sub(since.elapsed());
+            let timed_out = if wait.is_zero() {
+                true
+            } else {
+                match cmd_rx.recv_timeout(wait) {
+                    Ok(c) => {
+                        cmds.push(c);
+                        false
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => true,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            };
+            if timed_out {
+                while let Ok(c) = cmd_rx.try_recv() {
+                    cmds.push(c);
+                }
+                let has_work = cmds.iter().any(|c| matches!(c, EngineCommand::Generate { .. }));
+                if !has_work {
+                    let mut blocking = engine.kv_lanes_blocking_shrink();
+                    // Snapshot oldest-used lanes first so the most recent conversation survives
+                    // if the RAM prefix cache evicts to stay within its token/snapshot budget.
+                    blocking.sort_by_key(|&l| lane_last_used[l]);
+                    let mut released_any = false;
+                    for l in blocking {
+                        let pos = pc.live[l].len();
+                        let mut saved_or_ok = pos <= 1 || !lane_cacheable[l] || pc.has_snapshot_of(&pc.live[l]);
+                        if !saved_or_ok {
+                            engine.select_lane(l);
+                            let coherent = drafter_pos[l] == Some(pos);
+                            let mut slot = pc.take_payload(pos);
+                            let _ = engine.free_snapshots(pc.drain_pool());
+                            match engine.snapshot_state_opt(pos, &mut slot, coherent) {
+                                Ok(()) => {
+                                    let toks = pc.live[l].clone();
+                                    pc.insert_as(l, pos, slot.unwrap(), crate::prefix_cache::SnapKind::Turn);
+                                    if let Some(ref d) = lane_demand[l] {
+                                        pc.set_demand(&toks, d);
+                                    }
+                                    let _ = engine.free_snapshots(pc.drain_pool());
+                                    println!("[kv-elastic] idle shrink: offloaded lane {l} ({pos} tokens) to RAM prefix cache");
+                                    saved_or_ok = true;
+                                }
+                                Err(e) => {
+                                    if let Some(sn) = slot {
+                                        let _ = engine.free_snapshot(sn);
+                                    }
+                                    eprintln!("[kv-elastic] idle shrink: snapshot of lane {l} ({pos} tokens) failed: {e}");
+                                }
+                            }
+                        }
+                        if saved_or_ok {
+                            let _ = engine.kv_release(l, 0);
+                            pc.invalidate(l);
+                            drafter_pos[l] = None;
+                            released_any = true;
+                        }
+                    }
+                    if released_any || engine.kv_lanes_blocking_shrink().is_empty() {
+                        if let Err(e) = engine.maybe_shrink_kv_pool() {
+                            eprintln!("[kv-elastic] idle shrink failed: {e}");
+                        }
+                    }
+                    idle_since = Some(Instant::now());
+                    if cmds.is_empty() {
+                        continue;
+                    }
+                }
+            }
+        } else {
+            idle_since = None;
             match cmd_rx.recv() {
                 Ok(c) => cmds.push(c),
                 Err(_) => return,
@@ -1051,6 +1137,9 @@ fn engine_worker_loop(
                         };
                         engine.select_lane(lane);
                         engine.set_lane_pinned(lane, true);
+                        lane_cacheable[lane] = cache_prompt;
+                        lane_use_tick += 1;
+                        lane_last_used[lane] = lane_use_tick;
                         let _ = engine.tide.scheduler.cache.take_lane_demand(lane);
                         if let Some(d) = &memory {
                             let _ = engine.anticipate(d);

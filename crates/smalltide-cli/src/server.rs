@@ -748,11 +748,15 @@ fn finish_req(
         tel.rescue_disk_reads - req.log_c0.2,
     );
     let ntok = req.generated.len().max(1) as f64;
+    let new_pf = req.prompt_len.saturating_sub(req.reuse_len);
+    let pf_tps = if new_pf > 0 && req.pf_secs > 0.0 { new_pf as f64 / req.pf_secs } else { 0.0 };
     eprintln!(
-        "[req] lane {lane}: finish={} prompt {} (cached {}) -> {} tokens: answer {} chars, thinking {} chars, {} tool call(s) | skipped expert weight {:.1}% | per token: {:.1} rescue loads, {:.1} skipped experts, {:.1} disk reads with the GPU waiting | ends with {:?}",
+        "[req] lane {lane}: finish={} prompt {} (cached {}, prefill {:.0} tok/s in {:.2}s) -> {} tokens: answer {} chars, thinking {} chars, {} tool call(s) | skipped expert weight {:.1}% | per token: {:.1} rescue loads, {:.1} skipped experts, {:.1} disk reads with the GPU waiting | ends with {:?}",
         if req.n_tool_calls > 0 && req.finish_reason == "stop" { "tool_calls" } else { req.finish_reason },
         req.prompt_len,
         req.reuse_len,
+        pf_tps,
+        req.pf_secs,
         req.generated.len(),
         req.log_text,
         req.log_think,
@@ -865,6 +869,7 @@ fn engine_worker_loop(
     let mut last_decode_tok_s: f64 = 0.0;
     let mut last_req_probe: Option<serde_json::Value> = None;
     let mut last_prefill_tok_s: f64 = 0.0;
+    let mut last_prefill_info: Option<(usize, f64, f64)> = None;
     let max_lane_ctx = (0..n_lanes).map(|l| engine.lane_max_seq(l)).max().unwrap_or(0);
     let batch_decode = std::env::var("SMALLTIDE_BATCH_DECODE").map(|v| v != "0").unwrap_or(true);
     let fixed_spec_width = std::env::var("SMALLTIDE_SPEC_WIDTH")
@@ -998,7 +1003,10 @@ fn engine_worker_loop(
                     let busy = !queue.is_empty() || active.iter().any(|a| a.is_some());
                     let m = engine.expert_map(busy, ask.since);
                     let text = |id: u32| tok.decode(&[id]);
-                    let v = crate::expert_map::json(&m, SERVED_MODEL_NAME, "inkling2", &ask, with_text.then_some(&text as &dyn Fn(u32) -> String));
+                    let mut v = crate::expert_map::json(&m, SERVED_MODEL_NAME, "inkling2", &ask, with_text.then_some(&text as &dyn Fn(u32) -> String));
+                    if let Some((toks, tps, pure_tps)) = last_prefill_info {
+                        v["prefill"] = json!({ "tokens": toks, "tok_s": tps, "pure_tok_s": pure_tps });
+                    }
                     let _ = reply_tx.send(v);
                 }
                 EngineCommand::GetStats { reply_tx } => {
@@ -1263,7 +1271,7 @@ fn engine_worker_loop(
                         if let Some(req) = admit(
                             &mut engine, &tok, &mut pc, lane, plan, prompt_ids, is_chat, forced_tool,
                             single_tool_call, max_tokens, sampling, stop_strings, cache_prompt, learn_routing,
-                            drafter_coherent_in, event_tx, &mut last_prefill_tok_s,
+                            drafter_coherent_in, event_tx, &mut last_prefill_tok_s, &mut last_prefill_info,
                             vision.as_ref(), &images, &image_starts,
                         ) {
                             if engine.drafter.is_some() {
@@ -1891,6 +1899,7 @@ fn admit(
     drafter_coherent: bool,
     event_tx: Sender<StreamEvent>,
     last_prefill_tok_s: &mut f64,
+    last_prefill_info: &mut Option<(usize, f64, f64)>,
     vision: Option<&smalltide_model_inkling2::vision::VisionTower>,
     images: &[crate::image::Prepared],
     image_starts: &[usize],
@@ -1912,11 +1921,13 @@ fn admit(
             show(&prompt_ids)
         );
     }
+    let t_restore = Instant::now();
     let rewind = match &plan {
         PrefixPlan::Extend { from } => Ok(*from),
         PrefixPlan::Restore { snap_idx, pos, global } => engine.restore_state(pc.snapshot(*snap_idx), *global).map(|_| *pos),
         PrefixPlan::Reset => engine.reset_sequence().map(|_| 0),
     };
+    let restore_ms = t_restore.elapsed().as_secs_f64() * 1000.0;
     let reuse_len = match rewind {
         Ok(p) => p,
         Err(e) => {
@@ -2011,12 +2022,16 @@ fn admit(
     let mut cuts = vec![reuse_len];
     cuts.extend(points.iter().copied());
     cuts.push(end);
+    let mut snap_ms = 0.0f64;
+    let mut snap_cnt = 0usize;
+    let mut prefill_only_ms = 0.0f64;
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
         if a >= b {
             continue;
         }
         if cache_prompt && points.contains(&a) && !pc.has_snapshot_of(&prompt_ids[..a]) {
+            let t_snap = Instant::now();
             let mut slot = pc.take_payload(a);
             let _ = engine.free_snapshots(pc.drain_pool());
             match engine.snapshot_state_opt(a, &mut slot, drafter_coherent) {
@@ -2030,6 +2045,7 @@ fn admit(
                     };
                     pc.insert_as(lane, a, slot.unwrap(), kind);
                     let _ = engine.free_snapshots(pc.drain_pool());
+                    snap_cnt += 1;
                 }
                 Err(e) => {
                     if let Some(sn) = slot {
@@ -2038,13 +2054,16 @@ fn admit(
                     eprintln!("[prefix-cache] snapshot at {a} failed: {e}");
                 }
             }
+            snap_ms += t_snap.elapsed().as_secs_f64() * 1000.0;
         }
+        let t_cut = Instant::now();
         if let Err(e) = engine.prefill(&prompt_ids[a..b], a, b == end) {
             engine.set_image_rows(Vec::new());
             pc.invalidate(lane);
             let _ = event_tx.send(StreamEvent::Error(engine_error(&format!("prefill error at pos {a}..{b}"), &e.to_string())));
             return None;
         }
+        prefill_only_ms += t_cut.elapsed().as_secs_f64() * 1000.0;
         pc.live[lane].extend_from_slice(&prompt_ids[a..b]);
     }
     engine.set_image_rows(Vec::new());
@@ -2053,6 +2072,17 @@ fn admit(
     pc.stats.prefilled_tokens += new_pf_toks as u64;
     if new_pf_toks > 0 {
         *last_prefill_tok_s = new_pf_toks as f64 / pf_secs.max(1e-6);
+        let pure_tps = new_pf_toks as f64 / (prefill_only_ms / 1000.0).max(1e-6);
+        *last_prefill_info = Some((new_pf_toks, *last_prefill_tok_s, pure_tps));
+        eprintln!(
+            "[prefill] lane {lane}: {new_pf_toks} new tok in {:.2}s ({:.1} tok/s; pure prefill {:.1} tok/s) | restore {:.0} ms, {snap_cnt} snap(s) {:.0} ms, compute {:.0} ms",
+            pf_secs,
+            *last_prefill_tok_s,
+            pure_tps,
+            restore_ms,
+            snap_ms,
+            prefill_only_ms,
+        );
     }
 
     let next_tok = match engine.sample_next_token(&sampling, &[]) {

@@ -1330,6 +1330,7 @@ function counts() {
     ["resident", d.counts.resident, "of " + fmt(d.total_experts), ""],
     ["missed", liveMiss(), "% of the last 64 tokens' picks, not rescued", "pct"],
     ["pace", tps(), "tokens a second", "dec"],
+    ["prefill", d.prefill ? Math.round(d.prefill.tok_s) : null, d.prefill ? "tok/s (" + fmt(d.prefill.tokens) + " tok)" : "tok/s", ""],
     ["disk reads", diskRate(ctr["disk reads"] ?? null), "a second with the GPU waiting · " + fmt(ctr["background reads"] ?? 0) + " more in the background since boot", "warn"],
     ["rescued", ctr["inline rescues"] ?? null, "since boot", ""],
     ["adaptive loads", ctr["experts moved"] ?? null, "since boot", ""],

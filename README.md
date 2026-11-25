@@ -31,7 +31,7 @@ Measured with `bench/bench.py`: median of 3 runs after a warmup (the two games: 
 
 *DFlash 2 (`incoai/Inkling-2-Mini-DFlash2`, `SMALLTIDE_DRAFTER=auto`) runs 5 sliding-window layers in FP8 (~428 MiB VRAM, 0 global KV) with host-RAM selector codebooks and lossless top-16 stochastic rejection sampling, reaching 4.5–4.8 tokens/step on `edit` and `code --thinking`. On synthetic 8K `random` prompts, DSpark's global attention layer still wins; switch anytime via `SMALLTIDE_DRAFTER=dspark` or `dflash2`. `prose` / `code` held 99.0%–99.1% VRAM hit rate (0.30%–0.49% skipped routing weight).*
 
-Reading a prompt (prefill) runs at about 1,750 tokens a second on a cold 11,658-token prompt and about 1,450 on a 58,000-token one.
+Reading a prompt (prefill) runs at about **1,900 tokens a second** on a cold 10.5K-token prompt (`.env.headless`, `PREFILL_CHUNK=1024`, `ATTN_VTILES=all`), ~1,500 tok/s with `PREFILL_CHUNK=512` + `ATTN_VTILES=local`, and ~1,450+ on a 58,000-token one.
 
 **Top-1 agreement with the full model.** Adaptive expert loading skips low-weight experts that are not on the card. Against a reference pass that loads and runs every routed expert, the engine picks the same most likely next token at **95.9%** of positions through draft-verify passes (the path speculative decoding uses) and **96.2%** through single-token steps. Measured with `bench/agreement.py` on four workloads, three prompts each, 1,024 tokens per prompt ([method and how to run it](#top-1-agreement-with-the-full-model)).
 
@@ -243,7 +243,7 @@ Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K 
 
 **Keeping the monitor on the RX 9070 XT (avoiding glitches and interference)**
 
-1. Copy `.env.monitor.example` to `.env.monitor` (`copy .env.monitor.example .env.monitor`) and launch with `.\smalltide.cmd serve .env.monitor`. It uses elastic 128K KV starting at 32K (`SMALLTIDE_KV_INITIAL_TOKENS=32768`), `SMALLTIDE_PREFILL_CHUNK=256`, and `SMALLTIDE_ATTN_VTILES=local` to reclaim VRAM for resident experts while leaving headroom for the desktop. (Use `.env.headless.example` → `.env.headless` for elastic 192K — extendable up to 256K — when the monitor is on the motherboard.)
+1. Copy `.env.monitor.example` to `.env.monitor` (`copy .env.monitor.example .env.monitor`) and launch with `.\smalltide.cmd serve .env.monitor`. It uses elastic 128K KV starting at 32K (`SMALLTIDE_KV_INITIAL_TOKENS=32768`), `SMALLTIDE_PREFILL_CHUNK=512`, and `SMALLTIDE_ATTN_VTILES=local` to reclaim VRAM for resident experts while leaving headroom for the desktop. (Use `.env.headless.example` → `.env.headless` for elastic 192K — extendable up to 256K — when the monitor is on the motherboard.)
 2. **Move your browser / chat client to integrated graphics** if your CPU has an iGPU. Running Edge/Chromium on the 9070 XT alongside HIP compute can cause AMD D3D11/MPO speckled tile glitches inside browser windows and lowers decode tok/s because every streamed token repaints on the same GPU:
    - Open **Windows Settings → System → Display → Graphics**.
    - Select your browser or chat app. If it is not in the list, click **Add desktop app** (or **Browse**) and pick its `.exe` — for Microsoft Edge, `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`.

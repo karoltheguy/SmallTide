@@ -1271,6 +1271,15 @@ fn engine_worker_loop(
                             }
                             let mut req = req;
                             if req.accept(&tok, engine.lane_max_seq(lane)) {
+                                // Run post-prefill expert rebalance AFTER emitting Token 1 to the
+                                // client so it does not inflate TTFT (~50-100 ms faster first token).
+                                let reb_swaps: usize = std::env::var("SMALLTIDE_REBALANCE_SWAPS")
+                                    .ok()
+                                    .and_then(|v| v.trim().parse().ok())
+                                    .unwrap_or(128);
+                                if reb_swaps > 0 {
+                                    let _ = engine.rebalance_after_prefill(reb_swaps);
+                                }
                                 active[lane] = Some(req);
                             } else {
                                 let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
@@ -2044,13 +2053,6 @@ fn admit(
     pc.stats.prefilled_tokens += new_pf_toks as u64;
     if new_pf_toks > 0 {
         *last_prefill_tok_s = new_pf_toks as f64 / pf_secs.max(1e-6);
-    }
-    let reb_swaps: usize = std::env::var("SMALLTIDE_REBALANCE_SWAPS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(128);
-    if reb_swaps > 0 {
-        let _ = engine.rebalance_after_prefill(reb_swaps);
     }
 
     let next_tok = match engine.sample_next_token(&sampling, &[]) {

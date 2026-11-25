@@ -915,7 +915,7 @@ impl<B: ComputeBackend> TideExecutor<B> {
             let e = self.scheduler.cache.entry(id);
             let ram = if self.scheduler.cache.is_ram_ready(id) { Some(e.ram_slot) } else { None };
             let (dst_pool, dst_off) = self.vram_target(id, slot);
-            self.stage_and_upload(id, cls, ram, dst_pool, dst_off, slab_len, false)?;
+            self.stage_and_upload(id, cls, ram, dst_pool, dst_off, slab_len, i + 1 < experts.len())?;
             self.scheduler.telemetry.stage1_sync_rescues += 1;
             self.scheduler.telemetry.stage1_bytes_transferred += slab_len as u64;
             slots.push(slot);

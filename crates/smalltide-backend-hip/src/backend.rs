@@ -416,7 +416,7 @@ impl HipBackend {
         macro_rules! names {
             ($($field:ident),*) => {{ $( if f == k.$field { return stringify!($field); } )* "unknown" }};
         }
-        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, rescue_write_route, rescue_apply_patch, rescue_wait_and_patch, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_x16, gemm_fp8_rows_wmma_x16_m32, gemm_fp8_rows_wmma_x16_m64, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, gemv_multi_wmma, gemv_multi_wmma_m32, gemv_multi_wmma_m64, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, dspark_argmax_final_margin, argmax_rows_part, argmax_rows_reduce, attn_prefill_wmma_split, attn_prefill_wmma_reduce, attn_prefill_wmma_vt, kv_v_tiles_f16, dspark_quant_fold_fp8, dspark_logits_argmax_fp8, dspark_rnn_step, dspark_ctx_store_fp8, dspark_attn_fp8_split, dspark_attn_reduce, dspark_embed_prep, add_rmsnorm_rows, dspark_qk_norm_rope, moe_w2_rows, dflash2_attn_fp8_split, dflash2_conv_prepare, dflash2_conv_finish_add_rmsnorm, topk16_rows_part, topk16_rows_reduce, vit_gemm_bf16, vit_epilogue, vit_ln, vit_rope, vit_attn)
+        names!(noop, rmsnorm_f32, gemv_fp8_e4m3_f32, gemv_nvfp4_f32, gemv_mxfp8_f32, moe_w13_swiglu_indirect, moe_w2_accum_indirect, router_topk8_f32, sconv_k4_decode_f32, kv_store_fp8_decode, flash_decode_fp8_split, flash_decode_fp8_reduce, head_l2_clip_f32, value_norm_no_gamma_f32, gate_attn_sigmoid_mul_f32, attn_res_mix_f32, gemv_f32, rel_table_f32, loop_control_prep_f32, loop_control_apply_f32, vec_add_f32, vec_scale_f32, vec_copy_f32, zero_f32, rescue_write_route, rescue_apply_patch, rescue_wait_and_patch, final_logit_softcap_f32, argmax_partial_f32, gemm_fp8_e4m3_batched_f32, gemm_f32_rows, attn_res_mix_rows_f32, head_l2_clip_rows_f32, sconv_k4_rows_f32, kv_store_fp8_rows, attn_prefill_fp8, router_topk8_rows, loop_control_prep_rows_f32, moe_w13_grouped, moe_w2_grouped, moe_reduce_rows, moe_w13_decode, moe_w2_decode, moe_post_decode, moe_w13_decode3, moe_w2_decode3, gemv_multi, attn_prep_decode, fused_mix_decode, moe_w13_rows, moe_w13_grouped_wmma, moe_w2_grouped_wmma, moe_w13_grouped_wmma2, moe_w2_grouped_wmma2, moe_w13_grouped_wmma_m64, moe_w2_grouped_wmma_m64, f32_to_f16, attn_prefill_wmma, gemm_fp8_rows_wmma, gemm_fp8_rows_wmma_x16, gemm_fp8_rows_wmma_x16_m32, gemm_fp8_rows_wmma_x16_m64, gemm_fp8_rows_wmma_small, gemv_fp8_rows, sconv_rewind, argmax_rows, moe_group_rows, moe_post_rows, gemv_fp8_rows2, moe_group_rows2, gemv_multi_rows, gemv_multi_wmma, gemv_multi_wmma_m32, gemv_multi_wmma_m64, attn_prep_rows, moe_post_sconv_rows, mix_rows, ctrl_prep_multi, ctrl_apply_norm_multi, moe_group_rows3, dspark_mix_rms, dspark_head_norm_rope, dspark_ctx_store, dspark_attn, silu_mul, dspark_z, dspark_cell, dspark_logits_argmax, dspark_argmax_final, dspark_argmax_final_margin, argmax_rows_part, argmax_rows_reduce, attn_prefill_wmma_split, attn_prefill_wmma_reduce, attn_prefill_wmma_vt, kv_v_tiles_f16, dspark_quant_fold_fp8, dspark_logits_argmax_fp8, dspark_rnn_step, dspark_ctx_store_fp8, dspark_attn_fp8_split, dspark_attn_reduce, dspark_embed_prep, add_rmsnorm_rows, dspark_qk_norm_rope, moe_w2_rows, dflash2_attn_fp8_split, dflash2_conv_prepare, dflash2_conv_finish_add_rmsnorm, topk16_rows_part, topk16_rows_reduce, vit_gemm_bf16, vit_epilogue, vit_ln, vit_rope, vit_attn)
     }
 
     /// Enables/disables per-kernel GPU timing (adds 2 timing events per launch).
@@ -2099,10 +2099,10 @@ impl ComputeBackend for HipBackend {
                 if rows <= 32 {
                     return self.launch(self.kernels.gemm_fp8_rows_wmma_x16_m32, (n.div_ceil(32), 1, 1), 64, &mut args16, stream, "launch(gemm_fp8_rows_wmma_x16_m32)");
                 }
-                if rows <= 64 {
-                    return self.launch(self.kernels.gemm_fp8_rows_wmma_x16_m64, (n.div_ceil(32), 1, 1), 64, &mut args16, stream, "launch(gemm_fp8_rows_wmma_x16_m64)");
+                if rows <= 64 || n_rows <= 512 {
+                    return self.launch(self.kernels.gemm_fp8_rows_wmma_x16_m64, (n.div_ceil(32), m.div_ceil(64), 1), 64, &mut args16, stream, "launch(gemm_fp8_rows_wmma_x16_m64)");
                 }
-                return self.launch(self.kernels.gemm_fp8_rows_wmma_x16, (n.div_ceil(64), m.div_ceil(256), 1), 256, &mut args16, stream, "launch(gemm_fp8_rows_wmma_x16)");
+                return self.launch(self.kernels.gemm_fp8_rows_wmma_x16, (n.div_ceil(64), m.div_ceil(64), 1), 64, &mut args16, stream, "launch(gemm_fp8_rows_wmma_x16)");
             }
             return self.launch(self.kernels.gemm_fp8_rows_wmma, (n.div_ceil(64), m.div_ceil(128), 1), 256, &mut args, stream, "launch(gemm_fp8_rows_wmma)");
         }
@@ -2789,11 +2789,17 @@ impl ComputeBackend for HipBackend {
                 self.launch(self.kernels.f32_to_f16, (n.div_ceil(1024), 1, 1), 256, &mut cargs, stream, "launch(f32_to_f16)")?;
                 let mut x16 = self.dev_ptr(out)?;
                 let mut args = [p(&mut a), p(&mut x16), p(&mut c), p(&mut d), p(&mut e), p(&mut st), p(&mut h), p(&mut i), p(&mut gc), p(&mut uc)];
-                self.launch(self.kernels.moe_w13_grouped_wmma2, (gp.n_work as u32, (2 * i).div_ceil(128), 1), 256, &mut args, stream, "launch(moe_w13_grouped_wmma2)")?;
+                let use_m64 = std::env::var_os("SMALLTIDE_MOE_M16").is_none();
+                let (k_w13, n_w13, k_w2, n_w2) = if use_m64 {
+                    (self.kernels.moe_w13_grouped_wmma_m64, "launch(moe_w13_grouped_wmma_m64)", self.kernels.moe_w2_grouped_wmma_m64, "launch(moe_w2_grouped_wmma_m64)")
+                } else {
+                    (self.kernels.moe_w13_grouped_wmma2, "launch(moe_w13_grouped_wmma2)", self.kernels.moe_w2_grouped_wmma2, "launch(moe_w2_grouped_wmma2)")
+                };
+                self.launch(k_w13, (gp.n_work as u32, (2 * i).div_ceil(128), 1), 256, &mut args, stream, n_w13)?;
                 let (mut a2, mut bm, mut c2, mut d2, mut e2, mut f2) = (self.dev_ptr(tmp)?, self.dev_ptr(mid)?, self.dev_ptr(pool)?,
                     self.dev_ptr(work)?, self.dev_ptr(pairs)?, self.dev_ptr(route)?);
                 let mut args = [p(&mut a2), p(&mut bm), p(&mut c2), p(&mut d2), p(&mut e2), p(&mut f2), p(&mut st), p(&mut h), p(&mut i)];
-                self.launch(self.kernels.moe_w2_grouped_wmma2, (gp.n_work as u32, h.div_ceil(128), 1), 256, &mut args, stream, "launch(moe_w2_grouped_wmma2)")?;
+                self.launch(k_w2, (gp.n_work as u32, h.div_ceil(128), 1), 256, &mut args, stream, n_w2)?;
                 if reduce {
                     self.moe_reduce_rows(out, tmp, gp.hidden_size, gp.rows, stream)?;
                 }

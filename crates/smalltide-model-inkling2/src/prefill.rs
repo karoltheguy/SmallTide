@@ -20,6 +20,7 @@ use smalltide_tide::cache::ExpertClass;
 
 const MAX_BLOCKS: usize = 8;
 const MOE_PAIRS_PER_ITEM: usize = 16;
+const MOE_PAIRS_PER_ITEM_M64: usize = 64;
 const DESC_BYTES: usize = 160 * 1024;
 const DESC_RING: usize = 4;
 
@@ -272,6 +273,31 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     /// `need_logits`, the logits of the last token are left in the logits buffer for sampling.
     pub fn prefill(&mut self, tokens: &[u32], pos0: usize, need_logits: bool) -> Result<()> {
         if tokens.is_empty() {
+            return Ok(());
+        }
+        // Fast path for 1-token prefill cuts (e.g. the final `end - 1 .. end` token after the
+        // server's end-of-prompt prefix snapshot): run the fused zero-sync verify path instead of
+        // 48 host-synced `prefill_moe` passes (~15 ms vs ~80-120 ms on TTFT).
+        if tokens.len() == 1
+            && self.image_rows.is_empty()
+            && self.dump.is_none()
+            && self.verify_hist.is_some()
+            && !matches!(self.tide.scheduler.tide_cfg.rescue_policy, smalltide_core::RescuePolicy::Exact)
+        {
+            self.verify_for_sampling(tokens, pos0, false)?;
+            if need_logits {
+                let vocab = self.cfg.unpadded_vocab_size;
+                let s = self.tide.compute_stream;
+                self.backend.vec_copy(
+                    self.scratch.logits,
+                    self.batch_logits.expect("batch logits").slice(0, vocab * 4),
+                    vocab,
+                    s,
+                )?;
+            }
+            self.commit_batch_rows(1);
+            self.post_batch_tide_step()?;
+            self.verify_rewind(1, 1)?;
             return Ok(());
         }
         self.kv_ensure(self.active_lane(), pos0 + tokens.len())?;
@@ -1539,8 +1565,16 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             }
             let mut work: Vec<u32> = Vec::new();
             let mut pairs: Vec<u32> = Vec::new();
+            let pairs_per_item = if std::env::var_os("SMALLTIDE_MOE_SCALAR").is_none()
+                && std::env::var_os("SMALLTIDE_MOE_WMMA1").is_none()
+                && std::env::var_os("SMALLTIDE_MOE_M16").is_none()
+            {
+                MOE_PAIRS_PER_ITEM_M64
+            } else {
+                MOE_PAIRS_PER_ITEM
+            };
             for (slot, prs) in items {
-                for chunk in prs.chunks(MOE_PAIRS_PER_ITEM) {
+                for chunk in prs.chunks(pairs_per_item) {
                     work.extend_from_slice(&[slot, pairs.len() as u32, chunk.len() as u32, 0]);
                     pairs.extend_from_slice(chunk);
                 }

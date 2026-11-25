@@ -51,9 +51,16 @@ prepare_dir() {
 }
 
 CURL_ARGS=(-fL -C - --retry 3 --retry-delay 2)
-if [[ -n "${HF_TOKEN:-}" ]]; then
-    CURL_ARGS+=(-H "Authorization: Bearer $HF_TOKEN")
-fi
+
+# fetch <url> <out>: resumable download. HF_TOKEN goes to curl on stdin (`-H @-`), never on the
+# command line, where any local user could read it from /proc/<pid>/cmdline.
+fetch() {
+    if [[ -n "${HF_TOKEN:-}" ]]; then
+        curl "${CURL_ARGS[@]}" -H @- "$1" -o "$2" <<<"Authorization: Bearer $HF_TOKEN"
+    else
+        curl "${CURL_ARGS[@]}" "$1" -o "$2"
+    fi
+}
 
 prepare_dir "$OUT_DIR"
 
@@ -77,7 +84,7 @@ echo "[Download] Source: https://huggingface.co/thinkingmachines/Inkling-2-Mini 
 for f in "${FILES[@]}"; do
     out="$OUT_DIR/$f"
     echo "[Download] $f -> $out"
-    curl "${CURL_ARGS[@]}" "$BASE/$f" -o "$out" || die "curl failed for $f (exit $?)"
+    fetch "$BASE/$f" "$out" || die "curl failed for $f (exit $?)"
 done
 
 echo "[Download] All Inkling-2-Mini files completed!"
@@ -95,7 +102,7 @@ if [[ "$SKIP_DFLASH2" -eq 0 ]]; then
     for f in config.json model.safetensors; do
         out="$DFLASH2_DIR/$f"
         echo "[Download] $f -> $out"
-        if ! curl "${CURL_ARGS[@]}" "$DFLASH2_BASE/$f" -o "$out"; then
+        if ! fetch "$DFLASH2_BASE/$f" "$out"; then
             echo "[Download] warning: could not download DFlash 2 ($f); SmallTide will fall back to built-in DSpark (mtp.safetensors)." >&2
             break
         fi

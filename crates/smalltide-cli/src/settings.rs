@@ -520,11 +520,11 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
     // Engine buffers (activations, KV, prefill scratch) before the expert pools: on Windows the
     // driver backs allocations beyond the resident budget with system memory, in order.
     let mut engine = Inkling2Engine::new(cfg, dense_gpu, tide, s.max_ctx, kv_pool_pages, s.kv_v_q4).expect("create Inkling2Engine");
-    if let Some(d) = drafter {
-        engine.attach_drafter(d).expect("attach drafter");
-    }
     if extra_lanes > 0 {
         engine.add_lanes(extra_lanes, lane_ctx).expect("allocate lanes");
+    }
+    if let Some(d) = drafter {
+        engine.attach_drafter(d).expect("attach drafter");
     }
     let kv_fmt = if s.kv_v_q4 { "k8v4" } else { "fp8" };
     match engine.kv_pool_info() {

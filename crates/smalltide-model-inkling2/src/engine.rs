@@ -324,8 +324,12 @@ pub struct Inkling2Engine<B: ComputeBackend> {
     pub(crate) rows_decode: bool,
     /// Lanes of the rows of the last batched round (Tide demand bookkeeping per lane).
     batch_lanes: Vec<usize>,
-    /// Speculative verify: per-logical-layer short-conv histories `[k, v, attn, mlp][VERIFY_HIST_ROWS][dim]`.
+    /// Speculative verify: per-logical-layer short-conv histories `[k, v, attn, mlp][verify_hist_rows][dim]`.
     pub(crate) verify_hist: Option<Vec<DeviceBuf>>,
+    /// Row capacity allocated per `(logical_layer, conv_kind)` in `verify_hist`.
+    verify_hist_rows_cap: usize,
+    /// Backing allocation when `verify_hist` did not fit inside `PrefillScratch` aliases.
+    verify_hist_owned: Option<DeviceBuf>,
     /// Per lane: device rewind table (hist, state, dim, 0) x 4 per logical layer.
     rewind_tables: Vec<Option<DeviceBuf>>,
     /// Drafter taps of the last rows forward: `[4][prefill_chunk()][H]` (layer 4 / 22 / 40 outputs,
@@ -596,6 +600,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             rows_decode: false,
             batch_lanes: Vec::new(),
             verify_hist: None,
+            verify_hist_rows_cap: 0,
+            verify_hist_owned: None,
             rewind_tables: Vec::new(),
             taps_buf: None,
             capture_taps: false,
@@ -1265,6 +1271,14 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
             self.lane_max_seq.push(max_seq.max(self.cfg.local_window_size));
         }
         self.backend.sync_stream(s)?;
+        if self.verify_hist.is_some() && self.verify_hist_rows_cap < self.verify_hist_rows() {
+            if let Some(old) = self.verify_hist_owned.take() {
+                let _ = self.backend.free_device(old);
+            }
+            self.verify_hist = None;
+            self.verify_hist_rows_cap = 0;
+            self.enable_speculative_buffers()?;
+        }
         Ok(())
     }
 
@@ -1380,7 +1394,7 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
     pub(crate) fn verify_hist_slice(&self, il: usize, kind: usize) -> DeviceBuf {
         let kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
         let h = self.cfg.hidden_size;
-        let rows = self.verify_hist_rows();
+        let rows = self.verify_hist_rows_cap;
         let (off, dim) = match kind {
             0 => (0, kv),
             1 => (rows * kv, kv),
@@ -1434,7 +1448,8 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
         let h = self.cfg.hidden_size;
         let n_log = self.layer_states.len();
         if self.verify_hist.is_none() {
-            let per_layer_bytes = self.verify_hist_rows() * (2 * kv + 2 * h) * 4;
+            let rows = self.verify_hist_rows();
+            let per_layer_bytes = rows * (2 * kv + 2 * h) * 4;
             // Alias all 48 logical layers' verify_hist across the unused tails of PrefillScratch
             // (for m <= 64, bank/blocks use 0..4.5 MiB, messages 0..2.25 MiB, in_qkv/ctrl_qkv 0..1.69 MiB)
             // -> 0 extra VRAM even at MAX_BATCH_ROWS = 64!
@@ -1466,14 +1481,21 @@ impl<B: ComputeBackend> Inkling2Engine<B> {
                 }
             }
             let vh = if all_aliased {
+                self.verify_hist_owned = None;
                 layer_bufs
             } else {
                 let big = self.backend.alloc_device(n_log * per_layer_bytes)?;
+                self.verify_hist_owned = Some(big);
                 (0..n_log).map(|il| big.slice(il * per_layer_bytes, per_layer_bytes)).collect()
             };
             self.verify_hist = Some(vh);
-            self.taps_buf = Some(self.backend.alloc_device(4 * prefill_chunk() * h * 4)?);
-            self.argmax_rows_buf = Some(self.backend.alloc_device(ARGMAX_FILTER_BUF_BYTES)?);
+            self.verify_hist_rows_cap = rows;
+            if self.taps_buf.is_none() {
+                self.taps_buf = Some(self.backend.alloc_device(4 * prefill_chunk() * h * 4)?);
+            }
+            if self.argmax_rows_buf.is_none() {
+                self.argmax_rows_buf = Some(self.backend.alloc_device(ARGMAX_FILTER_BUF_BYTES)?);
+            }
         }
         Ok(())
     }

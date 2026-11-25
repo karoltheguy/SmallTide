@@ -1,12 +1,17 @@
 # SmallTide
 
-**Adaptive MoE inference for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (30B total / 3.8B active) on a single 16 GB AMD Radeon RX 9070 XT on Windows.**
+**Adaptive native-weight multimodal MoE inference for [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (30B total / 3.8B active, text + vision) on a single 16 GB AMD Radeon RX 9070 XT on Windows.**
 
 ![The live expert map while the server decodes at 66 tokens a second: token routes climbing through the 48 layers, resident experts, rescues and background loads](docs/expert-map.png)
 
 *The live expert map (`http://127.0.0.1:8000/expert-map`) during a decode: each token's route through the 48 layers, the experts that are on the card, and the ones rescued or loaded in the background.*
 
-Inkling-2-Mini's routed experts (~14.7 GB across 3,072 NVFP4 & MXFP8 experts) plus dense weights, KV cache, and drafter (~6+ GB) exceed a 16 GB consumer GPU. SmallTide brings [TideLM](https://github.com/raspy135/tideLM)-style adaptive expert residency and custom RDNA 4 HIP kernels to Windows: it keeps the highest-value experts resident in dedicated GDDR6 VRAM, promotes hot misses asynchronously from host RAM/NVMe, rescues high-weight misses inline on the GPU, and accelerates both greedy and sampled generation with lossless [DFlash 2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) or built-in DSpark speculative decoding.
+Inkling-2-Mini's routed experts (~14.7 GB across 3,072 native NVFP4 & MXFP8 experts) plus dense weights, KV cache, vision tower, and drafter (~7+ GB) exceed a 16 GB consumer GPU. SmallTide runs the **original Hugging Face checkpoint weights with zero GGUF re-quantization** using [TideLM](https://github.com/raspy135/tideLM)-style adaptive expert residency and custom RDNA 4 HIP kernels on Windows:
+
+- **Native precision, no 3-bit compromise:** keeps the highest-value native NVFP4/MXFP8 experts resident in dedicated GDDR6 VRAM, promotes hot misses asynchronously from host RAM/NVMe, and rescues high-weight misses inline on the GPU.
+- **Built-in Vision (0 MB idle VRAM):** full multimodal [image input](#image-input) (PNG/JPEG, OpenAI & Anthropic formats) — the 636 MB vision tower streams layer-by-layer from disk on demand and frees everything immediately after encoding, so vision costs **zero permanent VRAM or RAM**.
+- **Lossless Speculative Decoding & Multi-Lane Batching:** accelerates both greedy and sampled generation with [DFlash 2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) or built-in DSpark (87–126 tok/s single-stream, up to 158–195 tok/s aggregate across concurrent lanes).
+- **Elastic 32K → 128K Unified Paged KV:** starts compact at 32K in VRAM to maximize resident experts, grows dynamically up to 128K on long prompts, and offloads idle long-context lanes to pinned host RAM before shrinking back when the server goes idle.
 
 Pre-built Windows releases embed the compiled `.hsaco` GPU kernels (`gfx1201` and `gfx1200`) inside a single `smalltide-cli.exe` — **no Rust toolchain, no ROCm SDK, and no Python environment required** to install and serve.
 
@@ -157,7 +162,8 @@ Send images as content parts of a user (or tool) message, in the OpenAI format w
 2. **Windows DXGI residency-aware sizing.** On Windows WDDM, `hipMemGetInfo` reports shared system RAM as free VRAM, causing oversized allocations to silently drop ~10× in bandwidth over PCIe. With `SMALLTIDE_POOL_BUDGET=resident` (default), SmallTide queries DXGI's local residency budget and probes copy bandwidth across every 256 MiB window at startup (`fit_pools_to_resident`) so 100% of active expert slots stay on dedicated GDDR6.
 3. **2-Stage Miss Handling + Fused GPU Spin-Wait Rescue.** Non-VRAM experts live warm in host RAM (`SMALLTIDE_RAM_GB=16`: every expert that is not on the card plus the ones most likely to leave it; a stray one is read back in the background) backed by 4 KB-aligned Win32 `FILE_FLAG_NO_BUFFERING` NVMe reads (`experts.stide`). Misses above each zone's gate, up to per-zone budgets of `33/30/35` per step, are copied over PCIe on a dedicated DMA stream and synchronized on-GPU by a fused HIP spin-wait + route-patch kernel (`SMALLTIDE_RESCUE_WAIT=spin`), while the rest are skipped and renormalized. The gates start at `0.07` and are adjusted while decoding so each zone spends about 80% of its budget (`SMALLTIDE_RESCUE_AUTO_GATE=1`). Hot misses promote asynchronously in the background.
 4. **Lossless DFlash 2 & DSpark Speculative Decoding.** SmallTide supports both [`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) (5 sliding-window layers with 2-tap grouped dynamic convolutions and a pairwise candidate path selector, ~428 MiB VRAM in FP8 with zero global KV and host-RAM codebooks) and Inkling-2-Mini's built-in 3-layer DSpark drafter (`mtp.safetensors`). Both draft up to 7 tokens per step with confidence-gated adaptive depth. Verification uses GPU-side top-k/top-p filtering (`smalltide_logits_filter_rows`) and exact lossless rejection sampling (including sparse top-16 proposal distributions `q` for DFlash 2 at `temperature > 0`), accelerating both greedy and stochastic sampling without altering the target distribution.
-5. **Paged K8/V4 Global KV & Prefix Caching.** Global-attention KV (8 target layers + 1 drafter layer) is paged from a shared `SMALLTIDE_KV_TOKENS` pool across lanes with asymmetric **`k8v4`** quantization (`SMALLTIDE_KV_FMT=k8v4`: FP8 E4M3 keys for exact attention scores + per-32-group asymmetric INT4 values, saving ~472 MiB at 128K for +115 more resident experts). Multi-turn conversations restore prefix snapshots (including drafter KV state) from pinned host RAM without re-prefilling.
+5. **Unified Elastic Paged K8/V4 KV & Prefix Caching.** All 40 local sliding-window layers, 8 global layers, and 5 DFlash 2 drafter layers share one unified paged KV pool (`SMALLTIDE_KV_INITIAL_TOKENS=32768` → `SMALLTIDE_KV_TOKENS=131072`) with asymmetric **`k8v4`** global quantization (`SMALLTIDE_KV_FMT=k8v4`: FP8 E4M3 keys + per-32-group asymmetric INT4 values, saving ~472 MiB at 128K). Extra serving lanes cost only **~3.7 MiB VRAM and 0 extra host RAM**. On long prompts, the pool grows dynamically by borrowing tail NVFP4 expert slots; after `SMALLTIDE_KV_IDLE_SHRINK_SECS` (default 5 min) of server idleness, blocking lanes are snapshotted into the pinned host-RAM prefix cache first and the pool shrinks back to 32K, returning all borrowed expert slots to VRAM.
+6. **Zero-Idle-VRAM Streaming Vision.** Unlike static `mmproj` loaders that permanently occupy ~640 MB of VRAM, SmallTide streams Inkling-2-Mini's 636 MB vision tower directly from the checkpoint file one layer at a time during image encoding (~0.3 s for 1024×1024, ~0.8 s for 1920×1080) and immediately frees all temporary buffers (40–240 MB peak). Encoded image tokens are content-hashed into the prefix cache so follow-up turns reuse them without re-encoding.
 
 ---
 
@@ -167,9 +173,10 @@ Edit `.env` and restart `.\smalltide.cmd serve`. Key knobs:
 
 | Setting | Default | What it controls |
 | --- | --- | --- |
-| `SMALLTIDE_MAX_CTX` / `SMALLTIDE_KV_TOKENS` | `131072` | Context length & shared paged global-KV pool (128K default with `k8v4` across 2 lanes; raise to `196608` or lower to `65536` to trade context for experts). |
+| `SMALLTIDE_MAX_CTX` / `SMALLTIDE_KV_TOKENS` | `131072` | Context length & unified paged KV pool ceiling across all lanes (128K default with `k8v4`). |
+| `SMALLTIDE_KV_INITIAL_TOKENS` / `SMALLTIDE_KV_IDLE_SHRINK_SECS` | `32768` / `300` | Elastic KV starting size in VRAM and idle timeout (seconds, `0` = off) before offloading expanded lanes to RAM prefix cache and shrinking back to baseline. |
 | `SMALLTIDE_KV_FMT` | `k8v4` | Global KV format: `k8v4` (FP8 keys + Q4 values, saves ~472 MiB @ 128K) or `fp8` (full FP8 K/V). |
-| `SMALLTIDE_LANES` | `2` | Concurrent serving lanes (each extra lane reserves ~124 MiB of local KV rings + slack page). |
+| `SMALLTIDE_LANES` | `4` | Concurrent serving lanes (all lanes share the unified paged KV pool; each extra lane costs only ~3.7 MiB VRAM and 0 extra host RAM). |
 | `SMALLTIDE_RESCUE_MODE` | `threshold` | `threshold` (balanced), `exact` (copy every miss, bit-exact MoE), or `disabled` (fastest, skip inline misses). |
 | `SMALLTIDE_RESCUE_THRESHOLD` / `..._CORE` | `0.07` / `0.07` | Routing-weight gate for inline rescues (Prelude & Coda / Loop Core). Lower gates rescue more: better fidelity, slower decode (a rescue costs about 0.7 ms). |
 | `SMALLTIDE_RESCUE_BUDGET_PRELUDE` / `_CORE` / `_CODA` | `33` / `30` / `35` | Per-token inline rescue caps per architectural zone. |
@@ -197,7 +204,7 @@ Where the monitor cable goes decides how much of the 16 GB the model gets. A 4K 
 
 | | Monitor on the RX 9070 XT | Monitor on the motherboard |
 | --- | --- | --- |
-| Resident experts (2 lanes, elastic 32K→128K KV, drafter on) | about 1,750–1,900 of 3,072 | about 2,350 of 3,072 |
+| Resident experts (4 lanes, elastic 32K→128K KV, drafter on) | about 1,750–1,900 of 3,072 | about 2,350 of 3,072 |
 | Routing weight they cover | about 91–94% | about 98–99% |
 | Desktop apps and the model | compete for VRAM: when the desktop's share grows, Windows moves part of the model to system RAM and decode drops to a quarter of its speed until the server is restarted | separate: the desktop uses system RAM through the integrated graphics |
 | A rescue that stalls for more than about 2 s | Windows resets the graphics driver (`hipError_t=719`), the server exits | no driver reset was seen (nothing else asks for the card) |

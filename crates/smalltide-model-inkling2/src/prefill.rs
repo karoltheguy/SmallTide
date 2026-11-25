@@ -99,15 +99,18 @@ impl PrefillScratch {
         // Sized to match the unified paged KV local ring (`(window + m).div_ceil(PAGE_POS) + 1`).
         let ring = ((cfg.local_window_size + m).div_ceil(crate::kv_pager::PAGE_POS) + 1)
             * crate::kv_pager::PAGE_POS;
-        // SMALLTIDE_ATTN_VTILES: all (default) | local (no 268 MiB global scratch) | 0 (off).
+        // SMALLTIDE_ATTN_VTILES: all (default) | local (no global scratch) | 0 (off).
+        // Cap global V-tile scratch at 128K positions (256 MiB) so 256K elastic KV does not
+        // permanently burn 512 MiB of expert VRAM; prompts past 128K fall back to on-the-fly V decode.
         let v_tiles = std::env::var("SMALLTIDE_ATTN_VTILES").map(|v| v.trim().to_ascii_lowercase()).unwrap_or_else(|_| "all".into());
         let v_tiles_local = if v_tiles != "0" && ring % 16 == 0 {
             Some(b.alloc_device(ring * cfg.num_key_value_heads * 256)?)
         } else {
             None
         };
-        let v_tiles_global = if v_tiles != "0" && v_tiles != "local" && global_ctx > 0 {
-            Some(b.alloc_device((global_ctx + 16) * cfg.num_key_value_heads * 256)?)
+        let v_tiles_global_cap = global_ctx.min(131_072);
+        let v_tiles_global = if v_tiles != "0" && v_tiles != "local" && v_tiles_global_cap > 0 {
+            Some(b.alloc_device((v_tiles_global_cap + 16) * cfg.num_key_value_heads * 256)?)
         } else {
             None
         };

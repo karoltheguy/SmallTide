@@ -617,6 +617,19 @@ pub fn build_engine(s: &Settings, lanes: usize) -> Loaded {
         ]);
     }
     engine.tide.scheduler.loop_core_gate = std::env::var("SMALLTIDE_RESCUE_THRESHOLD_CORE").ok().and_then(|v| v.trim().parse::<f32>().ok());
+    {
+        let must_tau: f32 = parse("SMALLTIDE_RESCUE_MUST_THRESHOLD", 0.25f32, "a routing share in [0, 1] (0 = off)");
+        engine.tide.scheduler.rescue_must_threshold = (must_tau > 0.0 && must_tau <= 1.0).then_some(must_tau);
+        if let Some(m) = engine.tide.scheduler.rescue_must_threshold {
+            if matches!(s.rescue_policy, RescuePolicy::Threshold(_)) {
+                println!(
+                    "[rescue] must-rescue threshold: {:.2} (missing experts >= {:.0}% routing weight always rescue regardless of budget/auto-gate)",
+                    m,
+                    m * 100.0
+                );
+            }
+        }
+    }
     // Auto gate: each block's gate starts at the value above and is steered so the block spends
     // about SMALLTIDE_RESCUE_AUTO_TARGET of its rescue budget.
     {

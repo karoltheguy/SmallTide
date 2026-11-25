@@ -444,6 +444,88 @@ pub fn run_serve(args: &[String]) {
 }
 
 /// One generation in flight on an engine lane.
+/// Detected degenerate repetition loop in a lane's generated token tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopHit {
+    /// Exact repeating suffix of `period` tokens repeated `repeats` consecutive times.
+    Exact { period: usize, repeats: usize },
+    /// Fuzzy paragraph loop: `pct`% of 8-grams in the last 256 tokens appeared in the prior 768.
+    Fuzzy { pct: usize },
+}
+
+fn loop_detect_enabled() -> bool {
+    std::env::var("SMALLTIDE_LOOP_DETECT")
+        .map(|v| {
+            let t = v.trim();
+            t != "0" && !t.eq_ignore_ascii_case("false") && !t.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(true)
+}
+
+/// Checks the tail of `tokens` for either an exact periodic loop (`1..=256` tokens, covering
+/// single-token spam up to 1-paragraph repeats) or a fuzzy near-exact paragraph loop (8-gram
+/// recycling across a rolling 1,024-token window).
+fn detect_loop(tokens: &[u32], in_thinking: bool) -> Option<LoopHit> {
+    let n = tokens.len();
+    if n < 16 {
+        return None;
+    }
+    let last = tokens[n - 1];
+    // 1. Exact consecutive periodic repeats up to 256 tokens (covers 1-paragraph loops).
+    let max_p = (n / 3).min(256);
+    for p in 1..=max_p {
+        let need = match p {
+            1 => 24,
+            2..=7 => 8,
+            8..=31 => 4,
+            _ => 3,
+        };
+        let span = p * need;
+        if n < span || tokens[n - 1 - p] != last {
+            continue;
+        }
+        if tokens[n - span..n - p] == tokens[n - span + p..n] {
+            return Some(LoopHit::Exact { period: p, repeats: need });
+        }
+    }
+    // 2. Fuzzy paragraph loop: check every 16 tokens once we have >= 512 tokens.
+    if n >= 512 && n % 16 == 0 {
+        const TAIL: usize = 256;
+        const NG: usize = 8;
+        let prior_start = n.saturating_sub(1024);
+        let prior = &tokens[prior_start..n - TAIL];
+        let tail = &tokens[n - TAIL..n];
+        let hash8 = |w: &[u32]| -> u64 {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for &x in w {
+                h ^= x as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h
+        };
+        let mut prior_set = std::collections::HashSet::with_capacity(prior.len());
+        for w in prior.windows(NG) {
+            prior_set.insert(hash8(w));
+        }
+        let mut matched = 0usize;
+        let mut distinct = std::collections::HashSet::new();
+        for w in tail.windows(NG) {
+            let h = hash8(w);
+            if prior_set.contains(&h) {
+                matched += 1;
+                distinct.insert(h);
+            }
+        }
+        let total = TAIL - NG + 1;
+        let pct = (matched * 100) / total;
+        let thresh = if in_thinking { 60 } else { 75 };
+        if pct >= thresh && distinct.len() >= 16 {
+            return Some(LoopHit::Fuzzy { pct });
+        }
+    }
+    None
+}
+
 struct ActiveReq {
     lane: usize,
     /// Fold this request's routing into the routing history when it ends.
@@ -486,6 +568,11 @@ struct ActiveReq {
     log_w0: (f64, f64),
     /// (sync rescues, skipped misses, disk reads) telemetry at admission.
     log_c0: (u64, u64, u64),
+    /// Loop detection state (exact 1..=256 period + fuzzy 8-gram paragraph overlap).
+    loop_detect: bool,
+    loop_scan_start: usize,
+    thinking_loop_exited: bool,
+    pending_thinking_exit: Option<LoopHit>,
 }
 
 impl ActiveReq {
@@ -572,6 +659,22 @@ impl ActiveReq {
         };
         if !self.emit(evs) {
             return false;
+        }
+        if self.loop_detect && self.pending_thinking_exit.is_none() {
+            let in_thinking = self.is_chat && self.parser.in_thinking();
+            if let Some(hit) = detect_loop(&self.generated[self.loop_scan_start..], in_thinking) {
+                if in_thinking && !self.thinking_loop_exited {
+                    self.pending_thinking_exit = Some(hit);
+                } else {
+                    eprintln!(
+                        "[loop-detect] lane {}: stopped on {hit:?} at {} generated tokens",
+                        self.lane,
+                        self.generated.len()
+                    );
+                    self.finish_reason = "stop";
+                    return false;
+                }
+            }
         }
         if self.generated.len() % 64 == 0 && self.event_tx.send(StreamEvent::Heartbeat).is_err() {
             self.finish_reason = "stop";
@@ -1177,6 +1280,78 @@ fn engine_worker_loop(
                         }
                     }
                 }
+            }
+        }
+
+        // 2b. Thinking-loop escape: if any active lane tripped the loop detector inside
+        // `<|content_thinking|>`, inject `<|end_message|><|message_model|><|content_text|>` so
+        // the model exits the thinking loop cleanly and writes a final answer instead of looping.
+        for l in 0..n_lanes {
+            let Some(hit) = active[l].as_mut().and_then(|r| r.pending_thinking_exit.take()) else {
+                continue;
+            };
+            let req = active[l].as_mut().unwrap();
+            let bridge = [
+                req.next_tok,
+                chat_format::TOK_END_MESSAGE,
+                chat_format::TOK_MESSAGE_MODEL,
+                chat_format::TOK_CONTENT_TEXT,
+            ];
+            let end_pos = req.pos + bridge.len();
+            eprintln!(
+                "[loop-detect] lane {l}: thinking loop ({hit:?}) at {} generated tokens — force-exiting thinking block",
+                req.generated.len()
+            );
+            req.thinking_loop_exited = true;
+            req.loop_scan_start = req.generated.len();
+            req.sampling.repetition_penalty = req.sampling.repetition_penalty.max(1.12);
+            drafter_pos[l] = None;
+            let ok_kv = end_pos < engine.lane_max_seq(l)
+                && matches!(engine.kv_reserve(l, end_pos), Ok(true));
+            for lost in engine.take_lost_lanes() {
+                pc.invalidate(lost);
+            }
+            let mut done = !ok_kv;
+            if !done {
+                for &ctl in &bridge[1..] {
+                    let evs = req.parser.feed(ctl, b"", true);
+                    if !req.emit(evs) {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if !done {
+                engine.select_lane(l);
+                if let Err(e) = engine.prefill(&bridge, req.pos, true) {
+                    let _ = req.event_tx.send(StreamEvent::Error(engine_error("thinking-exit prefill error", &e.to_string())));
+                    pc.invalidate(l);
+                    done = true;
+                } else {
+                    pc.live[l].extend_from_slice(&bridge);
+                    req.pos = end_pos;
+                    match engine.sample_next_token(&req.sampling, &req.generated) {
+                        Ok(t) => {
+                            req.next_tok = t;
+                            if !req.accept(&tok, engine.lane_max_seq(l)) {
+                                done = true;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = req.event_tx.send(StreamEvent::Error(engine_error("thinking-exit sample error", &e.to_string())));
+                            done = true;
+                        }
+                    }
+                }
+            }
+            if done {
+                let mut req = active[l].take().unwrap();
+                if !ok_kv {
+                    req.finish_reason = "stop";
+                }
+                let (tps, probe) = finish_req(&mut engine, &mut pc, &mut lane_demand, req);
+                last_decode_tok_s = tps;
+                last_req_probe = Some(probe);
             }
         }
 
@@ -1916,6 +2091,10 @@ fn admit(
             let t = engine.telemetry();
             (t.stage1_sync_rescues, t.stage1_skipped_tail_misses, t.rescue_disk_reads)
         },
+        loop_detect: loop_detect_enabled(),
+        loop_scan_start: 0,
+        thinking_loop_exited: false,
+        pending_thinking_exit: None,
     })
 }
 
@@ -2649,5 +2828,60 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                 &json!({"error": {"message": format!("unknown route {method} {path}"), "type": "invalid_request_error"}}),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod loop_detect_tests {
+    use super::{detect_loop, LoopHit};
+
+    #[test]
+    fn catches_single_token_and_short_phrase_loops() {
+        let single = vec![42u32; 24];
+        assert_eq!(detect_loop(&single, false), Some(LoopHit::Exact { period: 1, repeats: 24 }));
+        assert_eq!(detect_loop(&vec![42u32; 12], false), None);
+
+        let phrase = vec![1u32, 2, 3, 4];
+        let mut seq = Vec::new();
+        for _ in 0..8 {
+            seq.extend_from_slice(&phrase);
+        }
+        assert_eq!(detect_loop(&seq, false), Some(LoopHit::Exact { period: 4, repeats: 8 }));
+        let idx = seq.len() - 4;
+        seq[idx] = 99;
+        assert_eq!(detect_loop(&seq, false), None);
+    }
+
+    #[test]
+    fn catches_exact_one_paragraph_loop() {
+        let para: Vec<u32> = (1000..1120).collect(); // 120-token paragraph
+        let mut seq = vec![10, 20, 30];
+        seq.extend_from_slice(&para);
+        seq.extend_from_slice(&para);
+        assert_eq!(detect_loop(&seq, true), None); // 2 copies: not yet
+        seq.extend_from_slice(&para);
+        assert_eq!(detect_loop(&seq, true), Some(LoopHit::Exact { period: 120, repeats: 3 }));
+    }
+
+    #[test]
+    fn catches_fuzzy_mutated_paragraph_loop_and_ignores_normal_text() {
+        // 120-token paragraph repeated with a few mutated tokens each pass (no exact period).
+        let base: Vec<u32> = (5000..5120).collect();
+        let mut seq: Vec<u32> = Vec::new();
+        for rep in 0..6u32 {
+            let mut p = base.clone();
+            p[0] = 90_000 + rep;
+            p[60] = 91_000 + rep;
+            seq.extend_from_slice(&p);
+        }
+        // Align length to a multiple of 16 (>= 512) where fuzzy check runs.
+        let n = (seq.len() / 16) * 16;
+        let hit = detect_loop(&seq[..n], true);
+        assert!(matches!(hit, Some(LoopHit::Fuzzy { pct }) if pct >= 60), "got {hit:?}");
+
+        // Distinct non-repeating tokens must never trigger.
+        let normal: Vec<u32> = (0..1024).collect();
+        assert_eq!(detect_loop(&normal, true), None);
+        assert_eq!(detect_loop(&normal, false), None);
     }
 }

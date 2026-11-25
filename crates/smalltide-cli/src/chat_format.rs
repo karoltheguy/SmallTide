@@ -899,6 +899,11 @@ impl AnswerParser {
         p
     }
 
+    /// True while the parser is inside a `<|content_thinking|>` block.
+    pub fn in_thinking(&self) -> bool {
+        self.body == Body::Thinking
+    }
+
     fn flush_streams(&mut self, out: &mut Vec<AnswerEvent>) {
         let t = self.text.finish();
         if !t.is_empty() {

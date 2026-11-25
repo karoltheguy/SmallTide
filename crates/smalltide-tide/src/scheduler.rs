@@ -205,6 +205,11 @@ pub struct TideScheduler {
     /// Threshold gate for loop-core layers (their experts run once per loop pass), if it differs
     /// from the policy's gate.
     pub loop_core_gate: Option<f32>,
+    /// Under `RescuePolicy::Threshold`, any missing expert whose normalized routing share is at
+    /// least this threshold is *always* rescued regardless of `rescue_zone_budgets` or `auto_gate`
+    /// (capped only by the layer's rescue ring size). Prevents dropping dominant domain/language
+    /// experts on sudden topic shifts. `None` (or `<= 0` / `> 1`) disables.
+    pub rescue_must_threshold: Option<f32>,
     /// Steers the gates towards a share of the budgets (off by default); set it with
     /// `set_auto_gate` so the steered gates start from the configured ones.
     auto_gate: AutoGate,
@@ -254,6 +259,7 @@ impl TideScheduler {
             rescue_budget: 4,
             rescue_zone_budgets: None,
             loop_core_gate: None,
+            rescue_must_threshold: None,
             auto_gate: AutoGate::default(),
             rescues_this_token: 0,
             rescues_by_zone: [0; 3],
@@ -1045,19 +1051,32 @@ impl TideScheduler {
         ]
     }
 
+    /// Active MUST-rescue threshold (`(0, 1]`), if configured.
+    pub fn must_rescue_threshold(&self) -> Option<f32> {
+        self.rescue_must_threshold.filter(|&v| v > 0.0 && v <= 1.0)
+    }
+
     /// `RescuePolicy::Threshold`: this layer's zone has used up its rescue budget for the current
     /// token / verify step. Other zones (e.g. Coda) keep their own independent budget.
+    /// Returns `false` when `rescue_must_threshold` is active so remaining layers still check
+    /// for dominant misses that bypass the budget.
     pub fn rescue_budget_spent_for_layer(&self, layer: PhysicalLayerId, verify_rows: usize) -> bool {
         if !matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_)) {
+            return false;
+        }
+        if self.must_rescue_threshold().is_some() {
             return false;
         }
         let z = self.zone_of(layer);
         self.rescues_by_zone[z] >= self.effective_zone_budgets(verify_rows)[z]
     }
 
-    /// True only once all 3 zones have exhausted their rescue budgets.
+    /// True only once all 3 zones have exhausted their rescue budgets (and no MUST-rescue is active).
     pub fn rescue_budget_spent(&self) -> bool {
         if !matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_)) {
+            return false;
+        }
+        if self.must_rescue_threshold().is_some() {
             return false;
         }
         let lim = self.effective_zone_budgets(1);
@@ -1100,25 +1119,52 @@ impl TideScheduler {
                 self.rescue_tracker.cur.zones[zone].budget = zone_cap.min(u16::MAX as usize) as u16;
             }
         }
-        let threshold_pick: Option<usize> = match self.tide_cfg.rescue_policy {
-            RescuePolicy::Threshold(_) if self.rescues_by_zone[zone] < zone_cap => {
-                let tau = zone_gate;
-                topk_ids
-                .iter()
-                .zip(topk_weights.iter())
-                .enumerate()
-                .filter(|(_, (&e, &w))| {
-                    let id = ExpertId { layer, expert: e };
-                    w * inv_total_w >= tau && self.cache.entry(id).vram_slot.is_missing()
-                })
-                .max_by(|a, b| a.1 .1.total_cmp(b.1 .1))
-                .map(|(i, _)| i)
+        let must_tau = self.must_rescue_threshold();
+        if matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_))
+            && self.rescues_by_zone[zone] >= zone_cap
+        {
+            self.note_zone_budget_capped_layer(layer);
+        }
+        let mut selected_picks: Vec<usize> = Vec::new();
+        if matches!(self.tide_cfg.rescue_policy, RescuePolicy::Threshold(_)) {
+            if let Some(m_tau) = must_tau {
+                let mut must_idxs: Vec<(usize, f32)> = topk_ids
+                    .iter()
+                    .zip(topk_weights.iter())
+                    .enumerate()
+                    .filter_map(|(i, (&e, &w))| {
+                        let id = ExpertId { layer, expert: e };
+                        let nw = w * inv_total_w;
+                        (nw >= m_tau && self.cache.entry(id).vram_slot.is_missing()).then_some((i, nw))
+                    })
+                    .collect();
+                must_idxs.sort_by(|a, b| b.1.total_cmp(&a.1));
+                for (i, _) in must_idxs.into_iter().take(crate::runtime::DEFAULT_SCRATCH_RING_SLOTS) {
+                    selected_picks.push(i);
+                }
             }
-            _ => None,
-        };
-        if threshold_pick.is_some() {
-            self.rescues_this_token += 1;
-            self.rescues_by_zone[zone] += 1;
+            if self.rescues_by_zone[zone] + selected_picks.len() < zone_cap
+                && selected_picks.len() < crate::runtime::DEFAULT_SCRATCH_RING_SLOTS
+            {
+                let tau = zone_gate;
+                if let Some((i, _)) = topk_ids
+                    .iter()
+                    .zip(topk_weights.iter())
+                    .enumerate()
+                    .filter(|(i, (&e, &w))| {
+                        !selected_picks.contains(i)
+                            && w * inv_total_w >= tau
+                            && self.cache.entry(ExpertId { layer, expert: e }).vram_slot.is_missing()
+                    })
+                    .max_by(|a, b| a.1 .1.total_cmp(b.1 .1))
+                {
+                    selected_picks.push(i);
+                }
+            }
+        }
+        if !selected_picks.is_empty() {
+            self.rescues_this_token += selected_picks.len();
+            self.rescues_by_zone[zone] += selected_picks.len();
         }
 
         for (k, (&exp, &w)) in topk_ids.iter().zip(topk_weights.iter()).enumerate() {
@@ -1151,7 +1197,7 @@ impl TideScheduler {
             }
             let should_sync_rescue = match self.tide_cfg.rescue_policy {
                 RescuePolicy::Exact => true,
-                RescuePolicy::Threshold(_) => threshold_pick == Some(k),
+                RescuePolicy::Threshold(_) => selected_picks.contains(&k),
                 RescuePolicy::Disabled => false,
             };
 
@@ -1297,12 +1343,16 @@ impl TideScheduler {
             let zone = self.zone_of(layer);
             let zone_cap = self.effective_zone_budgets(m)[zone];
             let tau = self.effective_zone_gate(zone);
+            let must_tau = self.must_rescue_threshold();
             if !self.rescue_tracker.step_is_prefill {
                 self.rescue_tracker.step_active = true;
                 self.rescue_tracker.cur.verify_rows = m.max(1);
                 self.rescue_tracker.cur.zones[zone].budget = zone_cap.min(u16::MAX as usize) as u16;
             }
-            if self.rescues_by_zone[zone] < zone_cap {
+            if self.rescues_by_zone[zone] >= zone_cap {
+                self.note_zone_budget_capped_layer(layer);
+            }
+            if self.rescues_by_zone[zone] < zone_cap || must_tau.is_some() {
                 // Aggregate (effective_max_share, weighted_sum_share) per unique missing expert.
                 // In speculative draft-verify passes, row 0 is always committed while tail rows are
                 // progressively more likely to be rejected, so discount tail rows by survival weight
@@ -1332,15 +1382,27 @@ impl TideScheduler {
                         }
                     }
                 }
-                miss_stats.retain(|s| s.1 >= tau || (decay && s.2 >= tau * 1.25));
-                miss_stats.sort_by(|a, b| b.2.total_cmp(&a.2));
+                let ring_cap = crate::runtime::DEFAULT_SCRATCH_RING_SLOTS;
+                // Partition into MUST-rescues (bypassing both budget & auto-gate) and budgeted misses.
+                let mut must_stats: Vec<(ExpertId, f32, f32)> = Vec::new();
+                let mut budget_stats: Vec<(ExpertId, f32, f32)> = Vec::new();
+                for s in miss_stats {
+                    if must_tau.is_some_and(|mt| s.1 >= mt) {
+                        must_stats.push(s);
+                    } else if s.1 >= tau || (decay && s.2 >= tau * 1.25) {
+                        budget_stats.push(s);
+                    }
+                }
+                must_stats.sort_by(|a, b| b.2.total_cmp(&a.2));
+                must_stats.truncate(ring_cap);
+                budget_stats.sort_by(|a, b| b.2.total_cmp(&a.2));
                 // 1/layer in Loop Core (36 passes); scale Prelude & Coda up to 3/layer when budget > 12.
                 // With the auto gate the block's budget is the limit: the gate is what keeps the
                 // block near its share of the budget, and 1-3 a layer would leave picks above the
                 // gate skipped with budget to spare. A layer still takes no more than the rescue
                 // ring holds (a ninth rescue would push out the layer's first).
                 let max_per_layer = if self.auto_gate.enabled {
-                    crate::runtime::DEFAULT_SCRATCH_RING_SLOTS
+                    ring_cap
                 } else if zone == 1 {
                     1
                 } else if m >= 4 {
@@ -1348,9 +1410,11 @@ impl TideScheduler {
                 } else {
                     zone_cap.div_ceil(6).clamp(1, 2)
                 };
-                let rem_budget = zone_cap.saturating_sub(self.rescues_by_zone[zone]);
-                let take = max_per_layer.min(rem_budget);
-                for (id, max_share, _sum_share) in miss_stats.into_iter().take(take) {
+                let rem_budget = zone_cap.saturating_sub(self.rescues_by_zone[zone] + must_stats.len());
+                let rem_layer = max_per_layer.saturating_sub(must_stats.len());
+                let take_budget = rem_layer.min(rem_budget);
+                must_stats.extend(budget_stats.into_iter().take(take_budget));
+                for (id, max_share, _sum_share) in must_stats {
                     self.event_share = max_share;
                     let mut rescued_ok = false;
                     if self.cache.should_promote_instead_of_scratch(id) {
@@ -2307,5 +2371,49 @@ mod tests {
         // Exact and Disabled ignore it.
         sched.tide_cfg.rescue_policy = RescuePolicy::Exact;
         assert_eq!(sched.effective_zone_gate(0), 0.0);
+    }
+
+    #[test]
+    fn test_must_rescue_bypasses_budget_and_auto_gate() {
+        let model_cfg = Inkling2Config::default();
+        let mut tide_cfg = TideConfig::default();
+        // High gate (0.45) + tiny zone budget (0) — normal threshold would rescue nothing.
+        tide_cfg.rescue_policy = RescuePolicy::Threshold(0.45);
+        let mut sched = TideScheduler::new(model_cfg, tide_cfg, 64 << 20, 4usize << 30);
+        sched.cache.configure_scratch_ring(16, 4, 8);
+        sched.rescue_zone_budgets = Some([0, 0, 0]);
+        sched.rescue_must_threshold = Some(0.25);
+        sched.set_auto_gate(AutoGate { enabled: true, min_gate: 0.45, max_gate: 0.50, ..AutoGate::default() });
+        sched.begin_token();
+
+        // With MUST-rescue enabled, budget-spent fast-skip must stay false so layers still check.
+        let layer = PhysicalLayerId(20); // Coda
+        assert!(!sched.rescue_budget_spent_for_layer(layer, 1));
+        assert!(!sched.rescue_budget_spent_for_layer(layer, 4));
+
+        // Single-token decode: two dominant misses (0.35, 0.28) bypass budget=0 and gate=0.45,
+        // while a 0.20 miss stays skipped.
+        let ids = [1u16, 2, 3, 4, 5, 6, 7, 8];
+        let ws = [0.35f32, 0.28, 0.20, 0.05, 0.04, 0.03, 0.03, 0.02];
+        let plan = sched.plan_layer_dispatch(layer, &ids, &ws);
+        let rescued_ids: Vec<u16> = plan.rescued_experts.iter().map(|r| r.expert.expert).collect();
+        assert_eq!(rescued_ids, vec![1, 2]);
+
+        // Speculative verify: dominant misses (0.30, 0.26) across rows still rescue when budget=0,
+        // while 0.18 stays skipped.
+        sched.begin_token();
+        let layer2 = PhysicalLayerId(21);
+        let rows_ids = [
+            [10u16, 11, 12, 13, 14, 15, 16, 17],
+            [10, 18, 12, 13, 14, 15, 16, 17],
+        ];
+        let rows_ws = [
+            [0.30f32, 0.18, 0.10, 0.10, 0.10, 0.08, 0.07, 0.07],
+            [0.26f32, 0.28, 0.10, 0.10, 0.08, 0.06, 0.06, 0.06],
+        ];
+        let (_ops, _wait, rescued) = sched.plan_verify_layer_dispatch(layer2, &rows_ids, &rows_ws);
+        let mut r_exps: Vec<u16> = rescued.into_iter().map(|e| e.expert).collect();
+        r_exps.sort_unstable();
+        assert_eq!(r_exps, vec![10, 18]);
     }
 }

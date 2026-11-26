@@ -32,13 +32,14 @@ thinking (`reasoning_content`) and leave `content` empty.
 docker run -d --name smalltide --restart unless-stopped \
   --device /dev/kfd --device /dev/dri --group-add video \
   --security-opt seccomp=unconfined \
-  -p 8000:8000 \
+  -p 127.0.0.1:8000:8000 \
   -v smalltide-data:/data \
   ghcr.io/karoltheguy/smalltide:latest
 docker logs -f smalltide
 ```
 
-With rootless Podman, replace `--group-add video` with `--group-add keep-groups` so the container
+`-p 127.0.0.1:8000:8000` keeps the server on this machine; use `-p 8000:8000` to open it to your
+network (read [Network access](#network-access) first). With rootless Podman, replace `--group-add video` with `--group-add keep-groups` so the container
 keeps your access to the GPU devices. On SELinux hosts such as Fedora, also add
 `--security-opt label=disable`.
 
@@ -53,16 +54,25 @@ docker compose -f docker/compose.yaml logs -f
 docker compose -f docker/compose.yaml down           # stop (the data volume is kept)
 ```
 
-Settings come from the shell or from `docker/.env`:
+Compose reads its settings from the shell or from `docker/.env`. Start from the example, which
+lists and explains every variable:
+
+```bash
+cp docker/.env.example docker/.env
+```
 
 | Variable | Default | |
 |---|---|---|
 | `SMALLTIDE_CONFIG` | `headless` | See [Options](#options) |
-| `SMALLTIDE_DATA` | `smalltide-data` volume | An absolute host directory for `.env` and the model |
-| `SMALLTIDE_GROUP` | `video` | `keep-groups` for rootless Podman |
+| `SMALLTIDE_BIND` | `127.0.0.1` | `0.0.0.0` opens the port to your network (see [Network access](#network-access)) |
 | `SMALLTIDE_PORT` | `8000` | Host port |
+| `SMALLTIDE_DATA` | `smalltide-data` volume | An absolute host directory for the engine `.env` and the model |
+| `SMALLTIDE_GROUP` | `video` | `keep-groups` for rootless Podman |
 | `SMALLTIDE_IMAGE` | `ghcr.io/karoltheguy/smalltide:latest` | Image to run |
 | `HF_TOKEN` | | Optional, for higher Hugging Face rate limits |
+
+`docker/.env` configures Compose only. The engine's own settings live in the `.env` inside the data
+volume (see [Options](#options)).
 
 For example, rootless Podman with the monitor on the Radeon card:
 
@@ -85,8 +95,8 @@ loginctl enable-linger "$USER"   # keep it running when you are logged out
 ```
 
 For a system-wide service, copy it to `/etc/containers/systemd/` and drop `--user`. Edit the file
-to change the config (`Environment=SMALLTIDE_CONFIG=...`), the port, or to mount a model you
-already have. It is marked for `podman auto-update`: with `podman-auto-update.timer` enabled, new
+to change the config (`Environment=SMALLTIDE_CONFIG=...`), to open the port to your network (the
+commented `PublishPort=` line), or to mount a model you already have. It is marked for `podman auto-update`: with `podman-auto-update.timer` enabled, new
 images are pulled and the service restarted automatically.
 
 ## Options
@@ -103,6 +113,17 @@ in the volume and restart the container.
 To keep the model on a specific disk, bind-mount a directory instead of the named volume:
 `-v /path/to/smalltide:/data`. Experts are read with O_DIRECT, so on btrfs the downloader turns off
 compression for the model directory.
+
+## Network access
+
+All three ways publish the port on `127.0.0.1` by default, so only this machine can reach the
+server. The API has **no authentication**: anyone who can reach it can run the model, change the
+engine settings (`POST /v1/tide/config`) and feed the routing priors. Before opening it to your
+network:
+
+- only do it on a network you trust, or put it behind a reverse proxy that checks credentials
+  (Caddy, nginx, Traefik) and keep the container itself on `127.0.0.1`;
+- with Docker, do not count on the host firewall: Docker's port rules bypass firewalld and ufw.
 
 ## Other commands
 

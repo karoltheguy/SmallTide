@@ -3,12 +3,9 @@
 #   docker compose -f docker/compose.yaml up -d            # pull the published image
 #   docker compose -f docker/compose.yaml up -d --build    # or build it from this checkout
 #
-# Settings come from the shell or from a .env file next to this one (docker/.env), for example:
-#   SMALLTIDE_CONFIG=monitor       monitor plugged into the Radeon card (default: headless)
-#   SMALLTIDE_DATA=/path/to/dir    keep .env and the model in a host directory (default: a named volume)
-#   SMALLTIDE_GROUP=keep-groups    rootless Podman (default: video)
-#   SMALLTIDE_PORT=8000            host port
-#   HF_TOKEN=...                   optional, for higher Hugging Face rate limits
+# Settings come from the shell or from docker/.env: cp docker/.env.example docker/.env
+# (every variable is listed there). The server listens on 127.0.0.1 only unless SMALLTIDE_BIND says
+# otherwise: the API has no authentication.
 
 name: smalltide
 
@@ -29,7 +26,7 @@ services:
       - seccomp=unconfined
       - label=disable # SELinux hosts (Fedora, RHEL); ignored elsewhere
     ports:
-      - "${SMALLTIDE_PORT:-8000}:8000"
+      - "${SMALLTIDE_BIND:-127.0.0.1}:${SMALLTIDE_PORT:-8000}:8000"
     environment:
       SMALLTIDE_CONFIG: ${SMALLTIDE_CONFIG:-headless}
       HF_TOKEN: ${HF_TOKEN:-}

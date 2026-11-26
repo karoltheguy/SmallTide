@@ -19,7 +19,10 @@ AddDevice=/dev/dri
 GroupAdd=keep-groups
 SecurityLabelDisable=true
 SeccompProfile=unconfined
-PublishPort=8000:8000
+# This machine only. The API has no authentication: to open it to your network, use the second
+# line instead, and only on a trusted network or behind a reverse proxy that checks credentials.
+PublishPort=127.0.0.1:8000:8000
+#PublishPort=8000:8000
 # .env, the model (about 21 GB, downloaded on first start) and the routing priors.
 Volume=smalltide-data:/data
 # To use a model you already have, mount its parent directory (the one holding Inkling-2-Mini):

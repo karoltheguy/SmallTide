@@ -8,3 +8,4 @@ weights
 .env
 .env.headless
 .env.monitor
+docker/.env

@@ -38,13 +38,20 @@ check_devices() {
     [[ -d /dev/dri ]] || die "/dev/dri is missing: start the container with --device /dev/kfd --device /dev/dri"
 }
 
-# Absolute model directory: $SMALLTIDE_MODEL_DIR, else the last SMALLTIDE_MODEL_DIR in .env.
+# setting <key> [env-file]: the value smalltide-cli will use. A real environment variable wins,
+# else the first non-empty `KEY=value` in the env file (default .env), like settings::load_dotenv.
+setting() {
+    local key="$1" file="${2:-.env}"
+    if [[ -n "${!key:-}" ]]; then printf '%s\n' "${!key}"; return; fi
+    [[ -f "$file" ]] || return 0
+    sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\{0,1\}$key[[:space:]]*=[[:space:]]*//p" "$file" \
+        | sed 's/[[:space:]]\+#.*$//; s/^["'\'']//; s/["'\'']$//' | grep -m 1 . || true
+}
+
+# Absolute model directory.
 model_dir() {
-    local dir="${SMALLTIDE_MODEL_DIR:-}"
-    if [[ -z "$dir" ]]; then
-        dir="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\{0,1\}SMALLTIDE_MODEL_DIR[[:space:]]*=[[:space:]]*//p' .env \
-            | sed 's/[[:space:]]\+#.*$//; s/^["'\'']//; s/["'\'']$//' | tail -n 1)"
-    fi
+    local dir
+    dir="$(setting SMALLTIDE_MODEL_DIR)"
     dir="${dir:-models/Inkling-2-Mini}"
     if [[ "$dir" == /* ]]; then printf '%s\n' "$dir"; else printf '%s\n' "$DATA/$dir"; fi
 }
@@ -80,6 +87,15 @@ case "$command" in
         fi
         check_devices
         [[ $# -gt 0 ]] || set -- .env
+        # 0.0.0.0 is IPv4 only, but rootless Podman forwards a host connection to ::1 (where
+        # `localhost` often resolves) into the container over IPv6, which then gets reset.
+        # [::] also accepts IPv4 on Linux, so it keeps the meaning "all interfaces".
+        host="$(setting SMALLTIDE_HOST "$1")"
+        # (/proc files report size 0, so read them rather than test with -s)
+        if [[ "${host:-0.0.0.0}" == 0.0.0.0 ]] && grep -q . /proc/net/if_inet6 2>/dev/null \
+              && [[ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null)" == 0 ]]; then
+            export SMALLTIDE_HOST='[::]'
+        fi
         log "Starting the server: http://<host>:8000/v1 (expert map at /expert-map)"
         exec "$CLI" serve "$@"
         ;;

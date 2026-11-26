@@ -2258,7 +2258,13 @@ fn handle_client(mut stream: TcpStream, cmd_tx: Sender<EngineCommand>) {
                         }
                     }
                     kept["tokens_shown"] = false.into();
-                    *LAST.lock().unwrap() = Some(kept);
+                    let mut last = LAST.lock().unwrap();
+                    if kept["states"].is_null() {
+                        if let Some(prev) = last.as_ref() {
+                            kept["states"] = prev["states"].clone();
+                        }
+                    }
+                    *last = Some(kept);
                     write_json_response(&mut stream, "200 OK", &v);
                 }
                 Err(_) => match LAST.lock().unwrap().clone() {

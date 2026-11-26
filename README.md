@@ -94,7 +94,7 @@ The RX 9070 GRE is `gfx1201` as well and loads the same kernels as the RX 9070 X
 
 ## Quick Start (Pre-built Release — No SDKs Needed)
 
-1. **Download and extract** `smalltide-v0.1.0-windows-x64-gfx1201.zip` from [GitHub Releases](../../releases).
+1. **Download and extract** `smalltide-v0.1.1-windows-x64-gfx1201.zip` from [GitHub Releases](../../releases).
 2. **Choose your display setup (monitor on the card vs. motherboard / iGPU):** this is the main decision that determines how much of the 16 GB card the model gets and which config you use:
    - **Monitor on the motherboard / CPU iGPU (recommended for best speed):** plug your monitor into the motherboard's video output and reboot. The RX 9070 XT then holds nothing but the model (~2,350–2,550 of 3,072 experts resident with elastic 32K→192K KV, ~98–99% hit rate, zero desktop interference). The numbers in [Measured Performance](#measured-performance-rx-9070-xt-16-gb-windows-11) were taken this way. Use **`.env.headless`** (`SMALLTIDE_RAM_GB=10`).
    - **Monitor plugged into the RX 9070 XT:** Windows and desktop apps hold 3 to 5 GB of VRAM (~1,750 experts resident, ~90% routing weight). Use **`.env.monitor`**, and assign your browser / chat client to integrated graphics in Windows Settings to avoid Edge/Chrome tile glitches and streaming interference.

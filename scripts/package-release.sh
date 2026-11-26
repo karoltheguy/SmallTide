@@ -81,6 +81,22 @@ for f in smalltide.sh .env.headless.example .env.monitor.example README.md LICEN
 done
 chmod 755 "$STAGE_DIR/smalltide.sh"
 
+# Build provenance, so a downloaded bundle says which toolchain produced its kernels
+commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+[[ -n "$commit" ]] || commit="${GITHUB_SHA:-unknown}"
+hip_version="$(hipcc --version 2>/dev/null | sed -n 's/^HIP version: //p' | head -n1 || true)"
+{
+    echo "SmallTide v$VERSION"
+    echo "Commit       : $commit"
+    echo "Built        : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "GPU kernels  : $ARCH"
+    echo "HIP (hipcc)  : ${hip_version:-not found, kernels may be empty}"
+    echo "Rust         : $(rustc --version 2>/dev/null || echo unknown)"
+    echo
+    echo "Runtime needs: an AMD RDNA 4 GPU and the ROCm HIP runtime (libamdhip64.so)."
+    echo "Check with   : ./smalltide.sh probe"
+} > "$STAGE_DIR/BUILD_INFO"
+
 # Resumable model downloader (curl only)
 install -m 755 scripts/download_inkling2.sh "$STAGE_DIR/scripts/download_inkling2.sh"
 

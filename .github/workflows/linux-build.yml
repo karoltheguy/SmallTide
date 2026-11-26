@@ -28,8 +28,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
-      # ROCm development image: hipcc (HIP 7.2.4, AMD clang 22) and libamdhip64.so preinstalled.
-      image: rocm/dev-ubuntu-24.04:7.2.4
+      # ROCm development image (latest release): hipcc and libamdhip64.so preinstalled.
+      image: rocm/dev-ubuntu-24.04:10.2.0-full
     env:
       # Read by crates/smalltide-backend-hip/build.rs (validated there: names like gfx1201 only).
       SMALLTIDE_HIP_ARCH: ${{ inputs.archs }}
@@ -88,8 +88,9 @@ jobs:
             echo "| SHA256 | \`$(cut -d' ' -f1 "$bundle.sha256")\` |"
             echo "| Kernels | \`$SMALLTIDE_HIP_ARCH\` |"
             echo "| Toolchain | $(rustc --version), HIP $(hipcc --version | sed -n 's/^HIP version: //p') |"
+            echo "| Build image HIP libs | \`$(cd /opt/rocm/lib 2>/dev/null && ls libamdhip64.so* 2>/dev/null | tr '\n' ' ')\` |"
             echo ""
-            echo "Not run on a GPU here: run \`./smalltide.sh probe\` on the target machine. It needs the ROCm HIP runtime (libamdhip64.so)."
+            echo "Informational: this runner has no GPU, so the kernels were built but not executed. On the target machine, \`./smalltide.sh probe\` gives a quick hardware check (needs the ROCm HIP runtime, libamdhip64.so)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload bundle

@@ -1,0 +1,10 @@
+.git
+target
+dist
+models
+weights
+**/*.safetensors
+**/*.stide
+.env
+.env.headless
+.env.monitor

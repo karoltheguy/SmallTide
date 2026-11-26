@@ -141,6 +141,27 @@ To keep the model on a specific disk, bind-mount a directory instead of the name
 `-v /path/to/smalltide:/data`. Experts are read with O_DIRECT, so on btrfs the downloader turns off
 compression for the model directory.
 
+### More than one GPU
+
+The engine picks the discrete AMD card with the most VRAM, whether or not that VRAM is free. If
+another workload already fills that card, the start fails with `upload dense GPU: ... hipMalloc
+failed with hipError_t=2` (out of memory). To pick the card yourself, set its HIP device index (0,
+1, ...) in `docker/.env`:
+
+```bash
+SMALLTIDE_HIP_DEVICE=1
+```
+
+The startup log shows the chosen card's VRAM total, so you can check you got the right one;
+`rocm-smi --showproductname` on the host usually lists the cards in the same order. The other way
+is `HIP_VISIBLE_DEVICES=1`, which hides every other card from the container. Use one or the other,
+not both: with `HIP_VISIBLE_DEVICES` set, the remaining card becomes index 0.
+
+If the cards have the same VRAM size, the engine cannot match the chosen card to its amdgpu VRAM
+counters, so the pool sizing falls back to HIP's free memory figure, which leaves out what other
+programs use on that card. If you see out of memory errors after startup, raise
+`SMALLTIDE_RESIDENT_MARGIN_MB` or cap `SMALLTIDE_NVFP4_SLOTS`.
+
 ## Network access
 
 All three ways publish the port on `127.0.0.1` by default, so only this machine can reach the

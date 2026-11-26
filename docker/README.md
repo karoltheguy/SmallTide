@@ -39,9 +39,10 @@ docker logs -f smalltide
 ```
 
 `-p 127.0.0.1:8000:8000` keeps the server on this machine; use `-p 8000:8000` to open it to your
-network (read [Network access](#network-access) first). With rootless Podman, replace `--group-add video` with `--group-add keep-groups` so the container
-keeps your access to the GPU devices. On SELinux hosts such as Fedora, also add
-`--security-opt label=disable`.
+network (read [Network access](#network-access) first). With rootless Podman, replace
+`--group-add video` with `--group-add keep-groups` so the container keeps your access to the GPU
+devices. On SELinux hosts such as Fedora, also add `--security-opt label=disable`. To change
+settings, add `--env-file docker/.env` (see [Configuration](#configuration)).
 
 ### Docker Compose
 
@@ -54,30 +55,13 @@ docker compose -f docker/compose.yaml logs -f
 docker compose -f docker/compose.yaml down           # stop (the data volume is kept)
 ```
 
-Compose reads its settings from the shell or from `docker/.env`. Start from the example, which
-lists and explains every variable:
+Compose reads `docker/.env` (see [Configuration](#configuration)). For example, rootless Podman
+with the monitor on the Radeon card:
 
 ```bash
 cp docker/.env.example docker/.env
-```
-
-| Variable | Default | |
-|---|---|---|
-| `SMALLTIDE_CONFIG` | `headless` | See [Options](#options) |
-| `SMALLTIDE_BIND` | `127.0.0.1` | `0.0.0.0` opens the port to your network (see [Network access](#network-access)) |
-| `SMALLTIDE_PORT` | `8000` | Host port |
-| `SMALLTIDE_DATA` | `smalltide-data` volume | An absolute host directory for the engine `.env` and the model |
-| `SMALLTIDE_GROUP` | `video` | `keep-groups` for rootless Podman |
-| `SMALLTIDE_IMAGE` | `ghcr.io/karoltheguy/smalltide:latest` | Image to run |
-| `HF_TOKEN` | | Optional, for higher Hugging Face rate limits |
-
-`docker/.env` configures Compose only. The engine's own settings live in the `.env` inside the data
-volume (see [Options](#options)).
-
-For example, rootless Podman with the monitor on the Radeon card:
-
-```bash
-SMALLTIDE_GROUP=keep-groups SMALLTIDE_CONFIG=monitor podman-compose -f docker/compose.yaml up -d
+# in docker/.env: SMALLTIDE_GROUP=keep-groups and SMALLTIDE_CONFIG=monitor
+podman-compose -f docker/compose.yaml up -d
 ```
 
 ### Podman Quadlet (systemd service)
@@ -96,19 +80,48 @@ loginctl enable-linger "$USER"   # keep it running when you are logged out
 
 For a system-wide service, copy it to `/etc/containers/systemd/` and drop `--user`. Edit the file
 to change the config (`Environment=SMALLTIDE_CONFIG=...`), to open the port to your network (the
-commented `PublishPort=` line), or to mount a model you already have. It is marked for `podman auto-update`: with `podman-auto-update.timer` enabled, new
-images are pulled and the service restarted automatically.
+commented `PublishPort=` line), to load engine settings from a file (the commented
+`EnvironmentFile=` line, see [Configuration](#configuration)), or to mount a model you already
+have. It is marked for `podman auto-update`: with `podman-auto-update.timer` enabled, new images are
+pulled and the service restarted automatically.
 
-## Options
+## Configuration
 
-| Variable | Default | |
-|---|---|---|
-| `SMALLTIDE_CONFIG` | `headless` | Template for a new `/data/.env`: `headless` (monitor on the motherboard or another GPU) or `monitor` (monitor plugged into the Radeon card) |
-| `SMALLTIDE_AUTO_SETUP` | `1` | `0` stops instead of downloading the model on first start |
-| `HF_TOKEN` | | Optional, for higher Hugging Face rate limits |
+You need no file to start: the image carries both engine templates and creates the engine `.env`
+in the data volume on first start. To change anything, use one settings file on your side:
 
-Pass them with `-e`, for example `-e SMALLTIDE_CONFIG=monitor`. To tune the engine, edit `.env`
-in the volume and restart the container.
+```bash
+cp docker/.env.example docker/.env
+```
+
+[`.env.example`](.env.example) lists and explains everything you can set, in two parts:
+
+- **Container settings**, which decide how the container is started:
+
+  | Variable | Default | |
+  |---|---|---|
+  | `SMALLTIDE_CONFIG` | `headless` | Engine template for the first start: `headless` (monitor on the motherboard or another GPU) or `monitor` (monitor plugged into the Radeon card) |
+  | `SMALLTIDE_BIND` | `127.0.0.1` | `0.0.0.0` opens the port to your network (see [Network access](#network-access)) |
+  | `SMALLTIDE_PUBLISH_PORT` | `8000` | Port on this machine |
+  | `SMALLTIDE_DATA` | `smalltide-data` volume | An absolute host directory for the engine `.env` and the model |
+  | `SMALLTIDE_GROUP` | `video` | `keep-groups` for rootless Podman |
+  | `SMALLTIDE_IMAGE` | `ghcr.io/karoltheguy/smalltide:latest` | Image to run |
+  | `SMALLTIDE_AUTO_SETUP` | `1` | `0` stops instead of downloading the model on first start |
+  | `HF_TOKEN` | | Optional, for higher Hugging Face rate limits |
+
+  `SMALLTIDE_BIND`, `SMALLTIDE_PUBLISH_PORT`, `SMALLTIDE_DATA`, `SMALLTIDE_GROUP` and
+  `SMALLTIDE_IMAGE` are read by Compose; with `docker run` or the quadlet, use the matching flags or
+  lines instead.
+
+- **Engine settings**: any key of the engine `.env`, such as the VRAM margin left for the desktop
+  (`SMALLTIDE_RESIDENT_MARGIN_MB`), the context length (`SMALLTIDE_MAX_CTX`) or the RAM tier
+  (`SMALLTIDE_RAM_GB`). The example lists the most useful ones; the full list is in the main
+  README under "Tuning `.env`". A value set here wins over the same key in the engine `.env`, which
+  keeps supplying the defaults for everything you leave out.
+
+How the file reaches the container: Compose reads `docker/.env` by itself, `docker run` takes
+`--env-file docker/.env`, and the quadlet takes `EnvironmentFile=`. Restart the container after a
+change (`docker compose -f docker/compose.yaml up -d` recreates it).
 
 `SMALLTIDE_CONFIG` only picks the template on first start; once `/data/.env` exists it is ignored.
 The `monitor` template trades some context (131,072 tokens instead of 196,608) and rescue budget for

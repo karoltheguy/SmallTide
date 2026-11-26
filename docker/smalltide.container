@@ -30,6 +30,9 @@ Volume=smalltide-data:/data
 # headless (monitor on the motherboard or another GPU) or monitor (monitor on the Radeon card).
 Environment=SMALLTIDE_CONFIG=headless
 #Environment=HF_TOKEN=...
+# Engine settings (VRAM margin, context, ...) from a file laid out like docker/.env.example;
+# they override the same keys in the .env inside the volume. %h is your home directory.
+#EnvironmentFile=%h/.config/smalltide/smalltide.env
 # Lets `podman auto-update` pull new images (enable podman-auto-update.timer).
 AutoUpdate=registry
 HealthCmd=python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"

@@ -17,7 +17,7 @@ set -euo pipefail
 
 APP=/opt/smalltide
 CLI="$APP/smalltide-cli"
-DATA="${SMALLTIDE_DATA:-/data}"
+DATA=/data
 
 log() { echo "[smalltide] $*"; }
 die() { echo "[smalltide] error: $*" >&2; exit 1; }

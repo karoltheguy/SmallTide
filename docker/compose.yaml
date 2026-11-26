@@ -3,8 +3,9 @@
 #   docker compose -f docker/compose.yaml up -d            # pull the published image
 #   docker compose -f docker/compose.yaml up -d --build    # or build it from this checkout
 #
-# Settings come from the shell or from docker/.env: cp docker/.env.example docker/.env
-# (every variable is listed there). The server listens on 127.0.0.1 only unless SMALLTIDE_BIND says
+# Settings come from docker/.env (cp docker/.env.example docker/.env) or the shell: the container
+# settings below, plus any engine setting (VRAM, context, ...), which overrides the same key in the
+# .env inside the data volume. The server listens on 127.0.0.1 only unless SMALLTIDE_BIND says
 # otherwise: the API has no authentication.
 
 name: smalltide
@@ -26,7 +27,11 @@ services:
       - seccomp=unconfined
       - label=disable # SELinux hosts (Fedora, RHEL); ignored elsewhere
     ports:
-      - "${SMALLTIDE_BIND:-127.0.0.1}:${SMALLTIDE_PORT:-8000}:8000"
+      - "${SMALLTIDE_BIND:-127.0.0.1}:${SMALLTIDE_PUBLISH_PORT:-8000}:8000"
+    # Passes docker/.env into the container, so engine settings in it reach smalltide-cli.
+    env_file:
+      - path: .env
+        required: false
     environment:
       SMALLTIDE_CONFIG: ${SMALLTIDE_CONFIG:-headless}
       HF_TOKEN: ${HF_TOKEN:-}

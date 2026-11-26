@@ -28,14 +28,30 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
-      # ROCm development image (latest release): hipcc and libamdhip64.so preinstalled.
-      image: rocm/dev-ubuntu-24.04:10.2.0-full
+      # Plain Ubuntu plus only the ROCm compiler packages (next step): the full ROCm dev image is
+      # 9.5 GB compressed, too close to a runner's free disk.
+      image: ubuntu:24.04
     env:
       # Read by crates/smalltide-backend-hip/build.rs (validated there: names like gfx1201 only).
       SMALLTIDE_HIP_ARCH: ${{ inputs.archs }}
       CARGO_TERM_COLOR: always
+      # ROCm release (TheRock packages); same repository as docker/Dockerfile.
+      ROCM: "10.2"
+      ROCM_PATH: /opt/rocm/core-10.2
 
     steps:
+      - name: Install ROCm compiler
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl
+          install -d /etc/apt/keyrings
+          curl -fsSL https://stable.repo.amd.com/rocm/gpg/packages.gpg -o /etc/apt/keyrings/amdrocm.asc
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.asc] https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main" \
+            > /etc/apt/sources.list.d/rocm.list
+          apt-get update
+          apt-get install -y --no-install-recommends "amdrocm-runtime-dev$ROCM" build-essential pkg-config
+          echo "$ROCM_PATH/bin" >> "$GITHUB_PATH"
+
       - name: Check out
         uses: actions/checkout@v4
 
@@ -88,7 +104,7 @@ jobs:
             echo "| SHA256 | \`$(cut -d' ' -f1 "$bundle.sha256")\` |"
             echo "| Kernels | \`$SMALLTIDE_HIP_ARCH\` |"
             echo "| Toolchain | $(rustc --version), HIP $(hipcc --version | sed -n 's/^HIP version: //p') |"
-            echo "| Build image HIP libs | \`$(cd /opt/rocm/lib 2>/dev/null && ls libamdhip64.so* 2>/dev/null | tr '\n' ' ')\` |"
+            echo "| HIP runtime libs | \`$(cd "$ROCM_PATH/lib" 2>/dev/null && ls libamdhip64.so* 2>/dev/null | tr '\n' ' ')\` |"
             echo ""
             echo "Informational: this runner has no GPU, so the kernels were built but not executed. On the target machine, \`./smalltide.sh probe\` gives a quick hardware check (needs the ROCm HIP runtime, libamdhip64.so)."
           } >> "$GITHUB_STEP_SUMMARY"

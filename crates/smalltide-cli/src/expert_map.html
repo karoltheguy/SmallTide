@@ -211,7 +211,7 @@ th { color: var(--muted); font-variant: small-caps; letter-spacing: .04em; } th:
 </aside>
 
 <footer>
-  <span>Read from /v1/expert-map <span id="rate">five times a second</span> · <span id="status" role="status">connecting</span> · <span id="fps"></span></span>
+  <span>Read from /v1/expert-map <span id="rate">twice a second</span> · <span id="status" role="status">connecting</span> · <span id="fps"></span></span>
   <span id="sel" aria-live="polite"></span>
 </footer>
 </div>
@@ -230,8 +230,9 @@ const $ = id => document.getElementById(id);
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const fmt = n => Number(n).toLocaleString("en-US");
 const STATE_TEXT = ["not loaded", "resident", "in the hot-read ring", "being read from disk"];
-// Polls: five a second, each asking only for the routes and events it has not seen; the usage rows every 2 s.
-const POLL_MS = 200, DEMAND_EVERY = 10, LOG_MAX = 400, EVENT_LINES_PER_POLL = 8;
+// Polls: twice a second while serving (every 2 s while idle), asking only for new compact routes/events,
+// omitting unchanged state rows via states_hash, and refreshing usage rows every 10 s while busy.
+const POLL_MS = 500, IDLE_POLL_MS = 2000, DEMAND_MS = 10000, LOG_MAX = 400, EVENT_LINES_PER_POLL = 8;
 // Engine event kinds (event_kinds)
 const EV = { HOT: 1, RESCUE: 2, ADAPT: 3, PRELOAD: 4, PREDICT: 5, DROPPED: 6 };
 // Motion: a token's route grows through the layers over GROW_MS, a little behind real time (its own spacing
@@ -245,8 +246,8 @@ const GROW_MS = 700, HOLD_MS = 1800, ROUTE_DELAY = 260, REPLAY_MS = 320, MAX_ROU
 const SYN_MAX = 30000, MAX_DROPS = 600, MAX_GLOWS = 400;
 const STAT_MS = 500, LIT_MS = 9000, READ_LIT_MS = 3500, DROP_MS = 650, NOTE_MS = 7000, MAX_NOTES = 5, PING_MS = 900;
 
-let data = null, demandRows = null, key = "", paused = false, timer = 0, polls = 0;
-let lastRouteSeq = 0, lastEventSeq = 0, firstPoll = true, bytes = 0, bootId = null;
+let data = null, stateRows = null, lastStatesHash = "", demandRows = null, lastDemandAt = 0, key = "", paused = false, timer = 0, polls = 0;
+let lastRouteSeq = 0, lastEventSeq = 0, firstPoll = true, bytes = 0, wasBusy = null, bootId = null;
 let geom = null, order = [], A = null, B = null, raf = 0, lastFrame = 0, lastDraw = 0;
 let hover = -1, hoverRC = null;
 let routes = [];          // {seq, t (wall ms), start (perf ms), lane, pos, token, k, ex, sh, miss, nMiss, top, fed}
@@ -453,10 +454,23 @@ function addRoutes(d, now) {
     if (r.seq <= lastRouteSeq) continue;
     lastRouteSeq = r.seq;
     const k = r.k, n = R * k;
-    if (!r.experts || r.experts.length !== n) continue;
-    const ex = Int32Array.from(r.experts), sh = Float32Array.from(r.share, v => v / 1000), miss = new Uint8Array(n);
-    let nMiss = 0;
-    for (let j = 0; j < n; j++) { miss[j] = r.missed.charCodeAt(j) === 49; nMiss += miss[j]; }
+    let ex, sh, miss, nMiss = 0;
+    if (typeof r.p === "string") {
+      const raw = atob(r.p);
+      if (raw.length !== n * 2) continue;
+      ex = new Int32Array(n); sh = new Float32Array(n); miss = new Uint8Array(n);
+      for (let j = 0; j < n; j++) {
+        ex[j] = raw.charCodeAt(2 * j);
+        const sb = raw.charCodeAt(2 * j + 1);
+        miss[j] = (sb & 128) ? 1 : 0;
+        nMiss += miss[j];
+        sh[j] = (sb & 127) / 127;
+      }
+    } else {
+      if (!r.experts || r.experts.length !== n) continue;
+      ex = Int32Array.from(r.experts); sh = Float32Array.from(r.share, v => v / 1000); miss = new Uint8Array(n);
+      for (let j = 0; j < n; j++) { miss[j] = r.missed.charCodeAt(j) === 49; nMiss += miss[j]; }
+    }
     // each row's two heaviest picks: the fibres it leaves
     const top = new Int32Array(2 * R);
     for (let row = 0; row < R; row++) {
@@ -1551,10 +1565,14 @@ function table() {
 function status(text, bad) { const s = $("status"); s.textContent = text; s.className = bad ? "bad" : ""; }
 async function poll() {
   if (paused || document.hidden) return;
-  const wantDemand = !demandRows || polls % DEMAND_EVERY === 0;
+  const wantDemand = !demandRows || (data && data.busy && (performance.now() - lastDemandAt >= DEMAND_MS));
   polls++;
   try {
-    const q = "?since=" + lastRouteSeq + "&events_since=" + lastEventSeq + "&demand=" + (wantDemand ? 1 : 0);
+    const q = "?since=" + lastRouteSeq + "&events_since=" + lastEventSeq
+      + "&demand=" + (wantDemand ? 1 : 0)
+      + "&routes=" + (layersOn.routes ? 1 : 0)
+      + "&compact=1"
+      + (lastStatesHash ? "&states_hash=" + lastStatesHash : "");
     const r = await fetch("/v1/expert-map" + q, { headers: key ? { Authorization: "Bearer " + key } : {}, cache: "no-store" });
     if (r.status === 401) { $("keyform").hidden = false; status("waiting for an API key", true); return; }
     $("keyform").hidden = true;
@@ -1563,17 +1581,22 @@ async function poll() {
       try { msg = (await r.json()).error.message; } catch (e) {}
       status(msg, true); return;
     }
-    const text = await r.text(); bytes = bytes * 0.8 + text.length * 0.2;
+    const text = await r.text();
     const d = JSON.parse(text);
+    bytes = (wasBusy === null || wasBusy !== !!d.busy) ? text.length : (bytes * 0.75 + text.length * 0.25);
+    wasBusy = !!d.busy;
     const shape = data && (data.experts_per_layer !== d.experts_per_layer || data.layers.length !== d.layers.length);
     const first = !data || shape;
-    if (shape) { A = null; B = null; firstPoll = true; lastRouteSeq = 0; lastEventSeq = 0; band = null; }
+    if (shape) { A = null; B = null; firstPoll = true; lastRouteSeq = 0; lastEventSeq = 0; stateRows = null; lastStatesHash = ""; band = null; }
+    if (d.states) stateRows = d.states;
+    else if (stateRows) d.states = stateRows;
+    if (d.states_hash && stateRows) lastStatesHash = d.states_hash;
     // The server restarted under an open page: its route and event numbers start again from 0, so ask from 0
     // (this answer was filtered by the old numbers and holds nothing new).
     const restarted = d.boot != null && bootId !== null && d.boot !== bootId;
     if (d.boot != null) bootId = d.boot;
-    if (restarted) { lastRouteSeq = 0; lastEventSeq = 0; }
-    if (d.demand) demandRows = d.demand; else if (!d.has_demand) demandRows = null;
+    if (restarted) { lastRouteSeq = 0; lastEventSeq = 0; lastStatesHash = ""; }
+    if (d.demand) { demandRows = d.demand; lastDemandAt = performance.now(); } else if (!d.has_demand) demandRows = null;
     data = d;
     if (first) { caption0(d); renderRescue(); layout(); buildFocal(); }
     const now = performance.now();
@@ -1584,7 +1607,7 @@ async function poll() {
     if (first) { buildSignals(); footer(); caption(); }
     firstPoll = false;
     counts(); renderRescue(); updateFocal();
-    if (polls % 5 === 1) table();
+    if (polls % 4 === 1) table();
     for (const k of SIG_KEYS) if (SIG[k].nEl) SIG[k].nEl.textContent = SIG[k].n();
     for (const b of document.querySelectorAll("[data-view=demand],[data-order=demand]")) b.disabled = !demandRows;
     $("what").textContent = d.model + ", " + (d.sparks > 1 ? "on " + d.sparks + " GPUs" : "on one GPU") + " — " + (d.physical_layers && d.physical_layers < d.layers.length
@@ -1592,7 +1615,9 @@ async function poll() {
       : d.layers.length + " layers of " + d.experts_per_layer + " experts");
     $("locktext").textContent = d.tokens_shown ? "token text shown" : "token text needs the key";
     $("tokkey").hidden = !!d.tokens_shown;
-    $("rate").textContent = "five times a second (" + (bytes / 1024).toFixed(0) + " KB each)";
+    const pollSec = (d.busy ? POLL_MS : IDLE_POLL_MS) / 1000;
+    const avgKb = bytes / 1024;
+    $("rate").textContent = (d.busy ? "twice a second" : "every 2 s, idle") + " (" + avgKb.toFixed(1) + " KB each · " + (avgKb / pollSec).toFixed(1) + " KB/s)";
     status(d.stale ? "the engine is mid-step" : d.busy ? "serving" : "idle", false);
     if (!routes.length && polls === 4) logLine([["d", "no routes yet: they come with decoded tokens (and need the async hot reads)"]], Date.now());
     flushLog();
@@ -1606,7 +1631,8 @@ async function loop() {
   const t0 = performance.now();
   await poll();
   clearTimeout(timer);
-  timer = setTimeout(loop, Math.max(20, POLL_MS - (performance.now() - t0)));
+  const waitMs = (data && !data.busy) ? IDLE_POLL_MS : POLL_MS;
+  timer = setTimeout(loop, Math.max(50, waitMs - (performance.now() - t0)));
 }
 
 // ---------------------------------------------------------------- hover, turning, zoom

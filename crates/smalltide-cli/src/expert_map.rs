@@ -64,22 +64,30 @@ fn boot_id() -> u64 {
 }
 
 /// What a page asks for, from the query: `since` the last route it holds and `events_since` the last event (only
-/// newer ones are sent: a page polls five times a second), `demand=0` (the usage rows left out, a fast poll's).
+/// newer ones are sent), `demand=0` (leave out usage rows), `routes=0` (leave out route payloads while advancing
+/// `route_seq`), `compact=1` (base64-pack route picks when `experts <= 256`), and `states_hash=<hex>` (omit
+/// `states` when unchanged).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Ask {
     pub since: u64,
     pub events_since: u64,
     pub demand: bool,
+    pub routes: bool,
+    pub compact: bool,
+    pub states_hash: u64,
 }
 
 impl Ask {
     pub fn parse(query: &str) -> Ask {
-        let mut a = Ask { demand: true, ..Ask::default() };
+        let mut a = Ask { demand: true, routes: true, ..Ask::default() };
         for (k, v) in query.split('&').filter_map(|kv| kv.split_once('=')) {
             match k {
                 "since" => a.since = v.parse().unwrap_or(0),
                 "events_since" => a.events_since = v.parse().unwrap_or(0),
                 "demand" => a.demand = v != "0",
+                "routes" => a.routes = v != "0",
+                "compact" => a.compact = v == "1",
+                "states_hash" => a.states_hash = u64::from_str_radix(v, 16).unwrap_or(0),
                 _ => {}
             }
         }
@@ -87,8 +95,33 @@ impl Ask {
     }
 }
 
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    if h == 0 { 1 } else { h }
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TAB: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let v = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TAB[((v >> 18) & 63) as usize] as char);
+        out.push(TAB[((v >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { TAB[((v >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TAB[(v & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
 /// The snapshot as the page reads it. `boot`: changes when the server restarts (see `boot_id`). `states`: a string a layer, a digit an expert (0 not loaded,
-/// 1 resident, 2 in the hot-read ring, 3 being read); `demand`: the same shape in base 36, an
+/// 1 resident, 2 in the hot-read ring, 3 being read; null when `ask.states_hash` matches `states_hash`); `demand`: the same shape in base 36, an
 /// expert's share of its layer's routing history (0 none, z the layer's most used; null when not asked for,
 /// `has_demand` says whether the engine keeps one). `events`: the engine's recent residency events after
 /// `events_since`, oldest first, each [seq, age ms, row, expert, kind, share in thousandths, victim row,
@@ -96,7 +129,8 @@ impl Ask {
 /// missed pick (its share of the token's routing weight), an inline rescue, an adaptation, a preload.
 /// `routes`: the decoded tokens' routing after `since`, oldest first, each {seq, age_ms, lane, pos, token (its
 /// text, to a keyed request only: it is the conversation's; else null), k, experts [row * k + pick], share
-/// (thousandths, the same order), missed (a digit a pick: 1 when it was not resident and not rescued, so the pass skipped it)}.
+/// (thousandths, the same order), missed (a digit a pick: 1 when it was not resident and not rescued, so the pass skipped it)}
+/// — or when `compact=1` and `experts <= 256`, `p`: base64 of 2 bytes per pick (`[expert_u8, (missed<<7)|share_0_127]`).
 pub fn json(m: &ExpertMap, model: &str, engine: &str, ask: &Ask, token: Option<&dyn Fn(u32) -> String>) -> serde_json::Value {
     let c = m.counts();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -106,18 +140,44 @@ pub fn json(m: &ExpertMap, model: &str, engine: &str, ask: &Ask, token: Option<&
         serde_json::json!([e.seq, ((now - e.at) * 1000.0).max(0.0).round() as i64, row(e.layer), e.expert, e.kind,
                            (e.share * 1000.0).round() as i64, vr, vx])
     }).collect();
-    let routes: Vec<serde_json::Value> = m.routes.iter().filter(|r| r.seq > ask.since && r.picks.len() == m.layers.len() * r.topk as usize).map(|r| {
-        serde_json::json!({
-            "seq": r.seq, "age_ms": ((now - r.at) * 1000.0).max(0.0).round() as i64, "lane": r.lane, "pos": r.pos,
-            "token": token.map(|f| f(r.token)), "k": r.topk,
-            "experts": r.picks.iter().map(|p| p.0).collect::<Vec<_>>(),
-            "share": r.picks.iter().map(|p| (p.1 * 1000.0).round() as i64).collect::<Vec<_>>(),
-            "missed": r.picks.iter().map(|p| if p.2 { '1' } else { '0' }).collect::<String>(),
-        })
-    }).collect();
+    let pack_routes = ask.compact && m.experts <= 256;
+    let routes: Vec<serde_json::Value> = if !ask.routes {
+        Vec::new()
+    } else {
+        m.routes.iter().filter(|r| r.seq > ask.since && r.picks.len() == m.layers.len() * r.topk as usize).map(|r| {
+            let age_ms = ((now - r.at) * 1000.0).max(0.0).round() as i64;
+            if pack_routes {
+                let mut raw = Vec::with_capacity(r.picks.len() * 2);
+                for &(ex, sh, miss) in &r.picks {
+                    let s7 = (sh.clamp(0.0, 1.0) * 127.0).round() as u8;
+                    raw.push(ex as u8);
+                    raw.push((if miss { 0x80 } else { 0 }) | (s7 & 0x7f));
+                }
+                serde_json::json!({
+                    "seq": r.seq, "age_ms": age_ms, "lane": r.lane, "pos": r.pos,
+                    "token": token.map(|f| f(r.token)), "k": r.topk,
+                    "p": base64_encode(&raw),
+                })
+            } else {
+                serde_json::json!({
+                    "seq": r.seq, "age_ms": age_ms, "lane": r.lane, "pos": r.pos,
+                    "token": token.map(|f| f(r.token)), "k": r.topk,
+                    "experts": r.picks.iter().map(|p| p.0).collect::<Vec<_>>(),
+                    "share": r.picks.iter().map(|p| (p.1 * 1000.0).round() as i64).collect::<Vec<_>>(),
+                    "missed": r.picks.iter().map(|p| if p.2 { '1' } else { '0' }).collect::<String>(),
+                })
+            }
+        }).collect()
+    };
     let resident_per_layer: Vec<usize> =
         m.state.chunks(m.experts.max(1)).map(|r| r.iter().filter(|&&s| s == smalltide_tide::expert_map::RESIDENT).count()).collect();
     let counters: serde_json::Map<String, serde_json::Value> = m.counters.iter().map(|&(k, v)| (k.to_string(), v.into())).collect();
+    let states_hash = fnv1a_64(&m.state);
+    let states_val = if ask.states_hash != 0 && ask.states_hash == states_hash {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(m.state_rows())
+    };
     serde_json::json!({
         "version": 3,
         "boot": boot_id(),
@@ -137,7 +197,8 @@ pub fn json(m: &ExpertMap, model: &str, engine: &str, ask: &Ask, token: Option<&
         "arena_slots": m.slots,
         "spare_slots": m.spare,
         "counters": counters,
-        "states": m.state_rows(),
+        "states": states_val,
+        "states_hash": format!("{states_hash:016x}"),
         "has_demand": m.demand.is_some(),
         "demand": if ask.demand { serde_json::json!(m.demand_rows()) } else { serde_json::Value::Null },
         "events": events,
@@ -153,12 +214,55 @@ pub fn json(m: &ExpertMap, model: &str, engine: &str, ask: &Ask, token: Option<&
 
 #[cfg(test)]
 mod tests {
-    use super::Ask;
+    use super::{base64_encode, json, Ask};
+    use smalltide_tide::expert_map::{ExpertMap, MapRoute};
 
     #[test]
     fn the_query_asks() {
-        assert_eq!(Ask::parse(""), Ask { since: 0, events_since: 0, demand: true });
-        assert_eq!(Ask::parse("since=41&events_since=7&demand=0"), Ask { since: 41, events_since: 7, demand: false });
-        assert_eq!(Ask::parse("since=x&demand=1&other"), Ask { since: 0, events_since: 0, demand: true });
+        assert_eq!(Ask::parse(""), Ask { since: 0, events_since: 0, demand: true, routes: true, compact: false, states_hash: 0 });
+        assert_eq!(
+            Ask::parse("since=41&events_since=7&demand=0&routes=0&compact=1&states_hash=0123abcd"),
+            Ask { since: 41, events_since: 7, demand: false, routes: false, compact: true, states_hash: 0x0123abcd }
+        );
+        assert_eq!(Ask::parse("since=x&demand=1&other"), Ask { since: 0, events_since: 0, demand: true, routes: true, compact: false, states_hash: 0 });
+    }
+
+    #[test]
+    fn compact_routes_and_unchanged_states_shrink_payload() {
+        let m = ExpertMap {
+            world: 1,
+            busy: true,
+            layers: vec![0, 1],
+            physical: vec![0, 1],
+            experts: 128,
+            slots: 64,
+            spare: 4,
+            state: vec![1; 256],
+            demand: None,
+            counters: vec![],
+            events: vec![],
+            routes: vec![MapRoute {
+                seq: 1,
+                at: 0.0,
+                lane: 0,
+                pos: 5,
+                token: 42,
+                topk: 2,
+                picks: vec![(3, 0.5, false), (127, 1.0, true), (0, 0.0, false), (64, 0.25, true)],
+            }],
+            rescue: None,
+        };
+        let full = json(&m, "m", "e", &Ask::parse("compact=1"), None);
+        assert!(full["states"].is_array());
+        let sh = full["states_hash"].as_str().unwrap().to_string();
+        assert_eq!(sh.len(), 16);
+        let p = full["routes"][0]["p"].as_str().unwrap();
+        let expected = base64_encode(&[3, 64, 127, 0x80 | 127, 0, 0, 64, 0x80 | 32]);
+        assert_eq!(p, expected);
+
+        let unchanged = json(&m, "m", "e", &Ask::parse(&format!("compact=1&routes=0&states_hash={sh}")), None);
+        assert!(unchanged["states"].is_null());
+        assert_eq!(unchanged["routes"].as_array().unwrap().len(), 0);
+        assert_eq!(unchanged["route_seq"].as_u64().unwrap(), 1);
     }
 }

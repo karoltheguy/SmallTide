@@ -1,0 +1,47 @@
+# SmallTide with Docker Compose or podman-compose. See docker/README.md.
+#
+#   docker compose -f docker/compose.yaml up -d            # pull the published image
+#   docker compose -f docker/compose.yaml up -d --build    # or build it from this checkout
+#
+# Settings come from the shell or from a .env file next to this one (docker/.env), for example:
+#   SMALLTIDE_CONFIG=monitor       monitor plugged into the Radeon card (default: headless)
+#   SMALLTIDE_DATA=/path/to/dir    keep .env and the model in a host directory (default: a named volume)
+#   SMALLTIDE_GROUP=keep-groups    rootless Podman (default: video)
+#   SMALLTIDE_PORT=8000            host port
+#   HF_TOKEN=...                   optional, for higher Hugging Face rate limits
+
+name: smalltide
+
+services:
+  smalltide:
+    image: ${SMALLTIDE_IMAGE:-ghcr.io/karoltheguy/smalltide:latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: smalltide
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - ${SMALLTIDE_GROUP:-video}
+    security_opt:
+      - seccomp=unconfined
+      - label=disable # SELinux hosts (Fedora, RHEL); ignored elsewhere
+    ports:
+      - "${SMALLTIDE_PORT:-8000}:8000"
+    environment:
+      SMALLTIDE_CONFIG: ${SMALLTIDE_CONFIG:-headless}
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${SMALLTIDE_DATA:-smalltide-data}:/data
+    # First start downloads about 21 GB before the server listens.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60m
+      retries: 3
+
+volumes:
+  smalltide-data:

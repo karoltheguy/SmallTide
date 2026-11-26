@@ -110,6 +110,20 @@ images are pulled and the service restarted automatically.
 Pass them with `-e`, for example `-e SMALLTIDE_CONFIG=monitor`. To tune the engine, edit `.env`
 in the volume and restart the container.
 
+`SMALLTIDE_CONFIG` only picks the template on first start; once `/data/.env` exists it is ignored.
+The `monitor` template trades some context (131,072 tokens instead of 196,608) and rescue budget for
+VRAM headroom for the desktop. To switch templates later, remove the old file and restart with the
+new value:
+
+```bash
+docker exec smalltide rm /data/.env
+docker rm -f smalltide   # then run it again with -e SMALLTIDE_CONFIG=monitor
+```
+
+With Compose, change `SMALLTIDE_CONFIG` in `docker/.env` and run `up -d` again after the `rm`; with
+the quadlet, edit `Environment=SMALLTIDE_CONFIG=`, then `systemctl --user daemon-reload` and
+`systemctl --user restart smalltide` after the `rm`.
+
 To keep the model on a specific disk, bind-mount a directory instead of the named volume:
 `-v /path/to/smalltide:/data`. Experts are read with O_DIRECT, so on btrfs the downloader turns off
 compression for the model directory.

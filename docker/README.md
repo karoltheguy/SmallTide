@@ -8,6 +8,8 @@ R9700). It ships the ROCm HIP runtime (10.2 by default), so the host only needs:
 
 No ROCm install on the host, no Rust, no build.
 
+Tested on an RX 9070 XT (16 GB, Fedora, Podman) and a Radeon AI PRO R9700 (32 GB, Docker Compose).
+
 ## Run
 
 Pick one of the three ways below. In every case, the first start creates `/data/.env`, checks the
@@ -161,6 +163,32 @@ If the cards have the same VRAM size, the engine cannot match the chosen card to
 counters, so the pool sizing falls back to HIP's free memory figure, which leaves out what other
 programs use on that card. If you see out of memory errors after startup, raise
 `SMALLTIDE_RESIDENT_MARGIN_MB` or cap `SMALLTIDE_NVFP4_SLOTS`.
+
+### System RAM
+
+The engine keeps two things in host RAM: the RAM tier for experts that do not fit on the card
+(`SMALLTIDE_RAM_GB`, 10 GB in both templates) and the prompt prefix cache, which grows with long
+conversations (about 4.2 GB when full with the headless template). Most of the cache is page-locked
+for the GPU, so it barely shows in the process's memory in `ps` or `docker stats`. If the host runs
+out, the kernel kills the server: the container exits with code 137 and restarts, while `docker
+inspect` still reports `OOMKilled=false`, because the whole host ran out, not the container's
+limit. The kernel log shows it:
+
+```bash
+sudo journalctl -k -b | grep -iE "out of memory|killed process"
+```
+
+To use less RAM, set lower values in `docker/.env`:
+
+```bash
+SMALLTIDE_RAM_GB=0               # only when every expert fits on the card (32 GB R9700)
+SMALLTIDE_PREFIX_TOKENS=65536    # prefix cache: about 2 GB when full
+SMALLTIDE_PREFIX_SNAPSHOTS=6
+```
+
+The startup log tells you whether the card holds every expert: `[priors] resident set covers 100.0%
+of the expected routing mass per token`. Below 100%, keep a few GB of RAM tier, or experts that
+miss the card are read from disk.
 
 ## Network access
 

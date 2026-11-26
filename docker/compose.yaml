@@ -12,7 +12,7 @@ name: smalltide
 
 services:
   smalltide:
-    image: ${SMALLTIDE_IMAGE:-ghcr.io/karoltheguy/smalltide:latest}
+    image: ${SMALLTIDE_IMAGE:-ghcr.io/raspy135/smalltide:latest}
     build:
       context: ..
       dockerfile: docker/Dockerfile

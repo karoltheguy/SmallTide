@@ -11,7 +11,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Container]
-Image=ghcr.io/karoltheguy/smalltide:latest
+Image=ghcr.io/raspy135/smalltide:latest
 ContainerName=smalltide
 AddDevice=/dev/kfd
 AddDevice=/dev/dri

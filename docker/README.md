@@ -34,7 +34,7 @@ docker run -d --name smalltide --restart unless-stopped \
   --security-opt seccomp=unconfined \
   -p 127.0.0.1:8000:8000 \
   -v smalltide-data:/data \
-  ghcr.io/karoltheguy/smalltide:latest
+  ghcr.io/raspy135/smalltide:latest
 docker logs -f smalltide
 ```
 
@@ -105,7 +105,7 @@ cp docker/.env.example docker/.env
   | `SMALLTIDE_PUBLISH_PORT` | `8000` | Port on this machine |
   | `SMALLTIDE_DATA` | `smalltide-data` volume | An absolute host directory for the engine `.env` and the model |
   | `SMALLTIDE_GROUP` | `video` | `keep-groups` for rootless Podman |
-  | `SMALLTIDE_IMAGE` | `ghcr.io/karoltheguy/smalltide:latest` | Image to run |
+  | `SMALLTIDE_IMAGE` | `ghcr.io/raspy135/smalltide:latest` | Image to run |
   | `SMALLTIDE_AUTO_SETUP` | `1` | `0` stops instead of downloading the model on first start |
   | `HF_TOKEN` | | Optional, for higher Hugging Face rate limits |
 
@@ -156,7 +156,7 @@ network:
 
 ```bash
 docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
-  --security-opt seccomp=unconfined -v smalltide-data:/data ghcr.io/karoltheguy/smalltide probe
+  --security-opt seccomp=unconfined -v smalltide-data:/data ghcr.io/raspy135/smalltide probe
 
 docker exec smalltide smalltide-entrypoint run -p "Hello" -n 64
 docker exec smalltide smalltide-entrypoint bench --only prose --runs 1
@@ -175,4 +175,4 @@ docker build -f docker/Dockerfile --build-arg ROCM=10.1 --build-arg ARCH=gfx1201
 ```
 
 The GitHub Actions workflow **Container** (manual) builds the image and pushes it to
-`ghcr.io/<owner>/smalltide` (the repository owner, so `karoltheguy` for this fork) with the tags `latest`, `<version>` and `<version>-rocm<rocm>`.
+`ghcr.io/<owner>/smalltide` (the repository owner, `raspy135`; a fork publishes under its own owner) with the tags `latest`, `<version>` and `<version>-rocm<rocm>`.

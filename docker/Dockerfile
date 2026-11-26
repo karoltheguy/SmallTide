@@ -56,10 +56,10 @@ ARG ROCM
 LABEL org.opencontainers.image.title="SmallTide" \
       org.opencontainers.image.description="Adaptive MoE inference for Inkling-2-Mini on AMD RDNA 4, with the ROCm ${ROCM} HIP runtime"
 
-# HIP runtime only (no compiler, no math libraries); python3 for bench.py, btrfs-progs so the
+# HIP runtime only (no compiler, no math libraries); tini as init; python3 for bench.py, btrfs-progs so the
 # downloader can turn off compression on btrfs volumes (experts are read with O_DIRECT).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends "amdrocm-runtime${ROCM}" python3 btrfs-progs \
+ && apt-get install -y --no-install-recommends "amdrocm-runtime${ROCM}" python3 btrfs-progs tini \
  && rm -rf /var/lib/apt/lists/* \
  && echo "/opt/rocm/core-${ROCM}/lib" > /etc/ld.so.conf.d/rocm.conf \
  && ldconfig \
@@ -72,5 +72,6 @@ COPY docker/entrypoint.sh /usr/local/bin/smalltide-entrypoint
 WORKDIR /data
 VOLUME /data
 EXPOSE 8000
-ENTRYPOINT ["smalltide-entrypoint"]
+# tini as PID 1 forwards stop signals (the server has no handler of its own, and PID 1 ignores them).
+ENTRYPOINT ["tini", "--", "smalltide-entrypoint"]
 CMD ["serve"]
